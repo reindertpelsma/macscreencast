@@ -160,13 +160,8 @@ def vnc_apple_dh(sock: socket.socket, username: str, password: str) -> bool:
 # VNC ZRLE decoder
 # ---------------------------------------------------------------------------
 
-def _decode_zrle_rect(
-    fb: np.ndarray,
-    zd: zlib.Decompress,
-    x: int, y: int, w: int, h: int,
-    zdata: bytes,
-    rs: int, gs: int, bs: int,
-) -> None:
+def _decode_zrle_rect(fb, zd, x, y, w, h, zdata, rs, gs, bs):
+    # fb: np.ndarray, zd: zlib decompress object
     """Decode a ZRLE-encoded rectangle into the framebuffer (in-place).
 
     screensharingd uses little-endian 32-bit pixels: rs=16, gs=8, bs=0.
@@ -295,24 +290,23 @@ class VNCBridge:
     def __init__(self, cfg: argparse.Namespace):
         self._cfg = cfg
         self._lock = threading.Lock()
-        self._sock: socket.socket | None = None
-        self._fb: np.ndarray | None = None
-        self._zd: zlib.Decompress | None = None
-        self._jpeg: bytes | None = None
-        self._input_q: list[bytes] = []
-        self._clipboard_q: list[str] = []  # clipboard text to send to VNC
+        self._sock = None
+        self._fb = None
+        self._zd = None
+        self._jpeg = None
+        self._input_q = []
+        self._clipboard_q = []
         self._W = self._H = 0
         self._rs = self._gs = self._bs = 0
 
-        # Clipboard text received from server (sent to connected browsers)
-        self.server_clipboard: str | None = None
+        self.server_clipboard = None
         self.server_clipboard_seq = 0
 
     # ------------------------------------------------------------------
     # Public API (thread-safe)
     # ------------------------------------------------------------------
 
-    def jpeg_frame(self) -> bytes | None:
+    def jpeg_frame(self):
         with self._lock:
             return self._jpeg
 
