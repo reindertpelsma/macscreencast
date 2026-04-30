@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  LaunchAgent template for auto-starting mac-vnc-stream at login.
+
+  1. Replace PYTHON_PATH with: which python3  (or the full path to your venv python)
+  2. Replace SERVER_PATH with the full path to server.py
+  3. Set your VNC_PASS (or MACOS_USER/MACOS_PASS for full control)
+  4. Copy to ~/Library/LaunchAgents/com.macvncstream.server.plist
+  5. launchctl load ~/Library/LaunchAgents/com.macvncstream.server.plist
+-->
+<dict>
+  <key>Label</key>
+  <string>com.macvncstream.server</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>PYTHON_PATH</string>
+    <string>SERVER_PATH/server.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>VNC_PASS</key>
+    <string>your_vnc_password_here</string>
+    <!-- For full control (type-30), also set these and remove VNC_PASS:
+    <key>MACOS_USER</key>
+    <string>your_macos_username</string>
+    <key>MACOS_PASS</key>
+    <string>your_macos_password</string>
+    -->
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/macvncstream.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/macvncstream.log</string>
+</dict>
+</plist>

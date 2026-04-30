@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.env
+*.log
+venv/
+.venv/
+*.plist
+!launchagent.plist.template
+.DS_Store
