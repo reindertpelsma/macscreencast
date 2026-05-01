@@ -624,12 +624,15 @@ class AdaptiveController:
         self._last_fast = 0.0
         factor = 0.5 if severe else 0.75
         if self.bitrate > self._min_br:
+            # Save congestion point before reducing — this is the network ceiling (SSTHRESH).
+            # On recovery, ramp fast back to here, probe slowly above.
+            self._peak_bitrate = self.bitrate
             self.bitrate = max(self._min_br, int(self.bitrate * factor))
             self.jpeg_quality = max(10, int(self.jpeg_quality * factor))
         elif self.fps > self._min_fps:
-            # Bitrate already floored — reduce fps as last resort
             self.fps = max(self._min_fps, self.fps * factor)
-        log.debug("backoff: fps=%.1f br=%dk severe=%s", self.fps, self.bitrate // 1000, severe)
+        log.debug("backoff: fps=%.1f br=%dk peak=%dk severe=%s",
+                  self.fps, self.bitrate // 1000, self._peak_bitrate // 1000, severe)
 
     def on_lag(self, age_ms, write_buf=0):
         # 50ms tolerance = expected 1-frame-in-buffer baseline on any link.
@@ -699,14 +702,16 @@ class AdaptiveController:
             if self.fps < self.max_fps:
                 self.fps = self.max_fps
             elif self.bitrate < self._max_br:
-                # Current bitrate is stable — record as peak before probing higher
-                self._peak_bitrate = max(self._peak_bitrate, self.bitrate)
-                if self.bitrate < 5_000_000:
+                # Below peak: ramp fast (we know the network handled it before).
+                # Above peak: probe carefully (uncharted territory).
+                if self.bitrate < self._peak_bitrate * 0.85:
                     factor = 1.5
-                elif self.bitrate < 20_000_000:
+                elif self.bitrate < self._peak_bitrate:
                     factor = 1.25
-                else:
+                elif self.bitrate < 20_000_000:
                     factor = 1.10
+                else:
+                    factor = 1.05
                 self.bitrate = min(self._max_br, int(self.bitrate * factor))
                 self.jpeg_quality = min(95, self.jpeg_quality + 5)
             log.debug("fresh: fps=%.1f br=%dk peak=%dk", self.fps, self.bitrate//1000, self._peak_bitrate//1000)
@@ -892,7 +897,8 @@ async def client_session(ws, cfg, bridge):
         _pipe_enc_seq = -1      # _fb_seq captured when current pipe was started
         _was_static = False     # True when screen has been unchanged this static period
         _static_since = 0.0     # monotonic time when current static period started
-        _refreshed_kf = False   # keyframe refresh already sent this static period
+        _refresh_br = 0         # bitrate at which last I-frame quality refresh was sent
+        _refresh_t = 0.0        # monotonic time of last I-frame quality refresh
         try:
             while True:
                 now = time.monotonic()
@@ -942,32 +948,40 @@ async def client_session(ws, cfg, bridge):
                     if not _was_static:
                         _was_static = True
                         _static_since = now
-                        _refreshed_kf = False
-                    elif not _refreshed_kf and now - _static_since > 5.0:
-                        # 5s idle: force an I-frame refresh at current quality ceiling so
-                        # text and fine detail sharpen up after the congestion ramp-up.
-                        _refreshed_kf = True
+                        _refresh_br = 0   # allow first refresh at any bitrate
+                        _refresh_t = 0.0
+                    else:
                         fps_s, br_s, jq_s = ctrl.snapshot()
-                        fb_s, cms_s = bridge.get_current_frame()
-                        if fb_s is not None:
-                            encoder.set_bitrate(br_s)
-                            try:
-                                payload_s, is_kf_s, codec_s = await loop.run_in_executor(
-                                    None, encoder.encode_keyframe, fb_s, cms_s, 95)
-                                if payload_s:
-                                    seq_num += 1
-                                    hdr_s = _hdr(seq_num, int(time.time() * 1000),
-                                                 codec_s, True, len(payload_s))
-                                    await ws.send(hdr_s + payload_s)
-                                    log.debug("static kf refresh: %dkbps", br_s // 1000)
-                            except Exception as e:
-                                log.debug("kf refresh err: %s", e)
+                        # Send a quality-improving I-frame refresh when:
+                        #   • idle for >3s (initial settle)
+                        #   • cooldown elapsed (3s between refreshes)
+                        #   • bitrate improved >25% since last refresh (real headroom gain)
+                        if (now - _static_since > 3.0 and
+                                now - _refresh_t > 3.0 and
+                                br_s > _refresh_br * 1.25):
+                            _refresh_br = br_s
+                            _refresh_t = now
+                            fb_s, cms_s = bridge.get_current_frame()
+                            if fb_s is not None:
+                                encoder.set_bitrate(br_s)
+                                try:
+                                    payload_s, is_kf_s, codec_s = await loop.run_in_executor(
+                                        None, encoder.encode_keyframe, fb_s, cms_s, 95)
+                                    if payload_s:
+                                        seq_num += 1
+                                        hdr_s = _hdr(seq_num, int(time.time() * 1000),
+                                                     codec_s, True, len(payload_s))
+                                        await ws.send(hdr_s + payload_s)
+                                        log.debug("quality refresh: %dkbps", br_s // 1000)
+                                except Exception as e:
+                                    log.debug("kf refresh err: %s", e)
                     await asyncio.sleep(min(interval, 1.0 / 60.0))
                     continue
 
-                # Screen just changed after a static period — jump to peak bitrate immediately
+                # Screen just changed — jump to peak bitrate immediately
                 if _was_static:
                     _was_static = False
+                    _refresh_br = 0
                     ctrl.on_screen_active()
                     last_send_time = time.monotonic() - interval  # skip rate-limit delay
 
