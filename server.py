@@ -565,8 +565,8 @@ class AdaptiveController:
         self._last_slow = 0.0
         self._last_fast = 0.0
         self._lock = threading.Lock()
-        self._ping_samples = []     # initial samples for fallback baseline
-        self._ping_baseline = 0.0   # fallback EWA baseline (used before metric WS connects)
+        self._ping_smooth = 0.0     # EWA-smoothed video ping RTT (jitter suppression)
+        self._ping_history = []     # last 4 smoothed samples for gradient computation
         self._metric_rtt = 0.0      # EWA of unloaded metric-channel RTT; 0 = not measured yet
 
     @property
@@ -603,27 +603,41 @@ class AdaptiveController:
             self._backoff(severe)
 
     def on_ping_rtt(self, rtt_ms):
-        """Video-channel RTT. Ping queues behind video frames so RTT includes queuing delay.
-        When metric RTT is known: congestion = video_rtt - metric_rtt > threshold (link-agnostic).
-        When metric channel not yet connected: fall back to baseline comparison."""
+        """Two-signal congestion detection via video-channel RTT.
+
+        Signal 1 — gradient (primary): RTT rising means a buffer is FORMING right now.
+        Fires early, before the queue is large, and requires no baseline or metric channel.
+        Link-agnostic: RTT going up is RTT going up regardless of absolute value.
+
+        Signal 2 — delta vs metric (secondary): RTT stable but elevated above the unloaded
+        metric channel means a STATIC buffer exists. This catches the case where the gradient
+        already fired and settled, or where we joined mid-congestion. A static buffer is an
+        unstable equilibrium; slight backoff drains it quickly."""
         with self._lock:
-            if self._metric_rtt > 0:
-                # delta isolates queuing delay from link latency — valid across roaming/jitter
-                delta = rtt_ms - self._metric_rtt
+            # Smooth to suppress per-sample jitter before computing gradient
+            self._ping_smooth = (self._ping_smooth * 0.6 + rtt_ms * 0.4
+                                 if self._ping_smooth > 0 else rtt_ms)
+            s = self._ping_smooth
+            self._ping_history.append(s)
+            if len(self._ping_history) > 4:
+                self._ping_history.pop(0)
+
+            # Signal 1: gradient — buffer FORMING
+            gradient_fired = False
+            if len(self._ping_history) >= 3:
+                prev_mean = sum(self._ping_history[:-1]) / len(self._ping_history[:-1])
+                gradient = s - prev_mean
+                if gradient > 15:       # rising >15ms per 2s sample = queue building
+                    self._backoff(gradient > 40)
+                    gradient_fired = True
+                    log.debug("ping gradient=%.1fms rtt=%.1fms", gradient, s)
+
+            # Signal 2: delta — buffer STATIC (only when gradient hasn't already fired)
+            if not gradient_fired and self._metric_rtt > 0:
+                delta = s - self._metric_rtt
                 if delta > 40:
                     self._backoff(delta > 150)
-            else:
-                # Metric channel not yet up — baseline fallback
-                if self._ping_baseline == 0.0:
-                    self._ping_samples.append(rtt_ms)
-                    if len(self._ping_samples) >= 5:
-                        self._ping_baseline = sum(self._ping_samples) / len(self._ping_samples)
-                    return
-                threshold = self._ping_baseline * 2.5 + 40
-                if rtt_ms > threshold:
-                    self._backoff(rtt_ms > threshold * 2)
-                else:
-                    self._ping_baseline = self._ping_baseline * 0.9 + rtt_ms * 0.1
+                    log.debug("ping delta=%.1fms rtt=%.1fms metric=%.1fms", delta, s, self._metric_rtt)
 
     def on_metric_rtt(self, rtt_ms):
         """RTT on the unloaded metric channel — pure link latency, no video queuing.
