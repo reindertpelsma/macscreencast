@@ -278,6 +278,15 @@ class VNCBridge:
         with self._lock:
             self._clip_q.append(text)
 
+    def send_key_reset(self):
+        """Release modifier keys and clear mouse buttons — guards against stuck state on reconnect."""
+        with self._lock:
+            # Release Shift/Ctrl/Alt/Meta (both sides)
+            for ks in [0xFFE1, 0xFFE2, 0xFFE3, 0xFFE4, 0xFFE9, 0xFFEA, 0xFFE7, 0xFFE8]:
+                self._input_q.append(struct.pack("!BBxxI", 4, 0, ks))
+            # Pointer with all buttons released
+            self._input_q.append(struct.pack("!BBHH", 5, 0, self._last_ptr_x, self._last_ptr_y))
+
     def _flush_input(self):
         with self._lock:
             msgs = self._input_q[:]
@@ -652,6 +661,9 @@ async def client_session(ws, cfg, bridge):
     else:
         log.warning("VNC not ready"); return
 
+    # Release any modifier keys / mouse buttons left over from a previous session.
+    bridge.send_key_reset()
+
     ctrl = AdaptiveController(cfg)
     # Start with JPEG until client reports WebCodecs capability and supported codecs.
     # target_codec is updated when the client sends its caps (codec negotiation).
@@ -707,7 +719,10 @@ async def client_session(ws, cfg, bridge):
                 try:
                     ev = json.loads(raw)
                     t = ev.get("t")
-                    if t == "caps":
+                    if t == "reset":
+                        cur_buttons = 0
+                        bridge.send_key_reset()
+                    elif t == "caps":
                         has_webcodecs = bool(ev.get("webcodecs", False))
                         client_codecs = ev.get("codecs", [])
                         w, h = int(ev.get("w", 1920)), int(ev.get("h", 1080))
@@ -741,11 +756,19 @@ async def client_session(ws, cfg, bridge):
                         bridge.send_pointer(cur_buttons, int(ev.get("x",0)), int(ev.get("y",0)))
                     elif t == "sc":
                         x, y = int(ev.get("x",0)), int(ev.get("y",0))
-                        dx, dy = float(ev.get("dx",0)), float(ev.get("dy",0))
-                        btn = (8 if dy<0 else 16) if abs(dy)>=abs(dx) else (32 if dx<0 else 64)
-                        bridge.send_pointer(btn, x, y)
-                        await asyncio.sleep(0.05)
-                        bridge.send_pointer(0, x, y)
+                        # dy/dx are pre-normalized click counts with sign by the browser
+                        dx, dy = int(ev.get("dx",0)), int(ev.get("dy",0))
+                        evts = []
+                        if dy: evts.append((8 if dy < 0 else 16, abs(dy)))   # up/down
+                        if dx: evts.append((32 if dx < 0 else 64, abs(dx)))  # left/right
+                        async def _scroll(evts=evts, sx=x, sy=y):
+                            for btn, n in evts:
+                                for _ in range(n):
+                                    bridge.send_pointer(btn, sx, sy)
+                                    bridge.send_pointer(0, sx, sy)
+                                    if n > 1:
+                                        await asyncio.sleep(0.012)
+                        asyncio.create_task(_scroll())
                     elif t in ("kd","ku"):
                         k = ev.get("k",""); code = ev.get("code","")
                         ks = KEYSYM.get(code) or KEYSYM.get(k) or (ord(k) if len(k)==1 else None)
@@ -765,6 +788,9 @@ async def client_session(ws, cfg, bridge):
                     pass
         except Exception:
             pass
+        finally:
+            cur_buttons = 0
+            bridge.send_key_reset()
 
     async def frame_sender():
         nonlocal seq_num, last_fb_seq, last_send_time, no_lag_since
@@ -1166,6 +1192,7 @@ function connect(){
   ws.binaryType='arraybuffer';
   ws.onopen=()=>{
     wsOpen=true;
+    send({t:'reset'});  // release any stuck keys/buttons from previous session
     st.textContent='connected';
     startLagReporter();
     ki.focus();
@@ -1183,7 +1210,7 @@ function connect(){
     }
   };
   ws.onclose=()=>{
-    wsOpen=false;hud.textContent='disconnected';
+    wsOpen=false;mBtn=0;hud.textContent='disconnected';
     st.textContent='reconnecting…';
     setTimeout(connect,2000);
   };
@@ -1227,16 +1254,21 @@ canvas.addEventListener('mousedown',e=>{
   send({t:'md',b:e.button,x:vx,y:vy});
   e.preventDefault();ki.focus();
 });
-canvas.addEventListener('mouseup',e=>{
+// window-level mouseup catches releases that happen outside the canvas (drag-out, right-click menus, etc.)
+window.addEventListener('mouseup',e=>{
+  if(!(mBtn&(1<<e.button)))return;
   mBtn&=~(1<<e.button);cur.classList.remove('dn');
   const[vx,vy]=toVNC(e.clientX,e.clientY);
   send({t:'mu',b:e.button,x:vx,y:vy});
-  e.preventDefault();
 });
 canvas.addEventListener('contextmenu',e=>e.preventDefault());
 canvas.addEventListener('wheel',e=>{
   const[vx,vy]=toVNC(e.clientX,e.clientY);
-  send({t:'sc',x:vx,y:vy,dx:e.deltaX,dy:e.deltaY});
+  // Normalize to integer click-counts: deltaMode 0=pixels, 1=lines(×40), 2=page(×800)
+  const mul=e.deltaMode===1?40:e.deltaMode===2?800:1;
+  const norm=v=>v===0?0:Math.sign(v)*Math.max(1,Math.min(8,Math.round(Math.abs(v*mul)/80)));
+  const cy=norm(e.deltaY),cx=norm(e.deltaX);
+  if(cy||cx)send({t:'sc',x:vx,y:vy,dy:cy,dx:cx});
   e.preventDefault();
 },{passive:false});
 
@@ -1287,6 +1319,13 @@ canvas.addEventListener('click',()=>ki.focus());
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
+// Release stuck keys/buttons when the tab regains focus (e.g. after Alt+Tab)
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden&&wsOpen)send({t:'reset'});
+});
+window.addEventListener('blur',()=>{
+  if(wsOpen)send({t:'reset'});
+});
 canvas.width=imgW;canvas.height=imgH;resize();connect();
 </script></body></html>
 """
