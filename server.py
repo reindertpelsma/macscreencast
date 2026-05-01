@@ -14,6 +14,9 @@ import numpy as np
 log = logging.getLogger("macvnc")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+# Per-session queues for server→browser JS eval (debug channel)
+_dbg_eval_sessions: set = set()
+
 # ---------------------------------------------------------------------------
 # PyAV (optional — JPEG fallback if unavailable)
 # ---------------------------------------------------------------------------
@@ -52,7 +55,26 @@ def _encode_jpeg(rgb, quality):
 # codec: 0=jpeg  1=h264  2=h265
 # flags: bit0=keyframe
 # ---------------------------------------------------------------------------
-CODEC_JPEG, CODEC_H264, CODEC_H265 = 0, 1, 2
+CODEC_JPEG, CODEC_H264, CODEC_H265, CODEC_AV1 = 0, 1, 2, 3
+
+# Ordered best→fallback. Server tries these in order; first one that both sides
+# support AND the server can hardware-encode is used.
+_CODEC_PREFERENCE = [CODEC_AV1, CODEC_H265, CODEC_H264]
+_CLIENT_CODEC_MAP = {
+    "av1": CODEC_AV1,
+    "h265": CODEC_H265, "hevc": CODEC_H265,
+    "h264": CODEC_H264, "avc": CODEC_H264,
+}
+
+def _select_codec(client_codecs):
+    """Given the client's supported codec list (ordered best→worst), return the
+    best CODEC_* constant we should target.  Caller still needs to verify that
+    an encoder for that codec can actually be opened on this machine."""
+    client_set = {_CLIENT_CODEC_MAP[c] for c in client_codecs if c in _CLIENT_CODEC_MAP}
+    for c in _CODEC_PREFERENCE:
+        if c in client_set:
+            return c
+    return CODEC_H264
 
 def _hdr(seq, capture_ms, codec, keyframe, plen):
     return struct.pack(">IQBBI", seq, capture_ms, codec, 1 if keyframe else 0, plen)
@@ -61,7 +83,11 @@ def _hdr(seq, capture_ms, codec, keyframe, plen):
 # VNC helpers
 # ---------------------------------------------------------------------------
 KEYSYM = {
-    "BackSpace":0xFF08,"Tab":0xFF09,"Return":0xFF0D,"Escape":0xFF1B,
+    # X11 names (used internally / legacy)
+    "BackSpace":0xFF08,"Return":0xFF0D,
+    # Browser e.key values (modern browsers)
+    "Backspace":0xFF08,"Enter":0xFF0D,
+    "Tab":0xFF09,"Escape":0xFF1B,
     "Delete":0xFFFF,"Insert":0xFF63,"Home":0xFF50,"End":0xFF57,
     "PageUp":0xFF55,"PageDown":0xFF56,
     "ArrowLeft":0xFF51,"ArrowUp":0xFF52,"ArrowRight":0xFF53,"ArrowDown":0xFF54,
@@ -196,6 +222,12 @@ class VNCBridge:
         self._clip_q = []
         self.server_clipboard = None
         self.server_clipboard_seq = 0
+        self._fbu_count = 0   # VNC FramebufferUpdates with actual pixels received
+        self._last_ptr_x = 0
+        self._last_ptr_y = 0
+        self._hover_after_ms = 0  # schedule a delayed nudge at this epoch-ms
+        self._cached_fb = None    # copy made at last _fb_seq change
+        self._cached_seq = -1     # seq corresponding to _cached_fb
 
     @property
     def dimensions(self):
@@ -209,13 +241,37 @@ class VNCBridge:
                 return None, known_seq, 0
             return self._fb.copy(), self._fb_seq, self._fb_ms
 
+    def get_current_frame(self):
+        """Always returns the latest frame (continuous stream mode).
+
+        Caches the copy so we only memcpy 6MB when VNC sends new pixels (~1fps on
+        idle) rather than on every encoder call (60fps). Cuts steady-state CPU ~10%.
+        """
+        with self._lock:
+            if self._fb is None:
+                return None, 0
+            if self._fb_seq != self._cached_seq:
+                self._cached_fb = self._fb.copy()
+                self._cached_seq = self._fb_seq
+            return self._cached_fb, int(time.time() * 1000)
+
     def send_pointer(self, buttons, x, y):
         with self._lock:
+            self._last_ptr_x = x
+            self._last_ptr_y = y
             self._input_q.append(struct.pack("!BBHH", 5, buttons, x, y))
 
     def send_key(self, down, keysym):
         with self._lock:
             self._input_q.append(struct.pack("!BBxxI", 4, int(down), keysym))
+            if not down:
+                # screensharingd batches damage and only flushes on pointer events.
+                # Immediate nudge to x+1 triggers first damage scan; the 30ms delayed
+                # nudge returns to x (two distinct movement events, maximising coverage
+                # of fast renders AND slower terminal async renders).
+                lx, ly = self._last_ptr_x, self._last_ptr_y
+                self._input_q.append(struct.pack("!BBHH", 5, 0, lx + 1, ly))
+                self._hover_after_ms = int(time.time() * 1000) + 30
 
     def send_clipboard(self, text):
         with self._lock:
@@ -280,14 +336,48 @@ class VNCBridge:
                     self._zd = zlib.decompressobj()
                 self._sock = s
                 s.send(struct.pack("!BBHi", 2, 0, 1, 16))   # SetEncodings: ZRLE
-                s.send(struct.pack("!BBHHHH", 3, 0, 0, 0, W, H))  # FramebufferUpdateRequest
+                # _FBU_INC: ask screensharingd for changed tiles only (efficient, used when active)
+                # _FBU_FULL: force screensharingd to send the complete current screen,
+                #   bypassing its damage-detection entirely — used when it goes quiet.
+                #   H.264 P-frames handle the static-content case (≈0 bits for no change).
+                _FBU_INC  = struct.pack("!BBHHHH", 3, 1, 0, 0, W, H)
+                _FBU_FULL = struct.pack("!BBHHHH", 3, 0, 0, 0, W, H)
+                s.send(_FBU_FULL)  # full initial request
+                _pending_req = True
+                _last_req_ms  = int(time.time() * 1000)
+                _last_fbu_ms  = _last_req_ms  # last time ANY FBU was received
                 while True:
                     self._flush_input()
-                    r, _, _ = select.select([s], [], [], 0.05)
+                    r, _, _ = select.select([s], [], [], 0.010)  # 10ms: flush input every 10ms
                     if not r:
+                        now_ms   = int(time.time() * 1000)
+                        stale_ms = now_ms - _last_fbu_ms
+                        if not _pending_req:
+                            # Choose request type: if screensharingd has been quiet for >50ms,
+                            # force a full refresh so we own the update cadence, not it.
+                            req = _FBU_FULL if stale_ms > 50 else _FBU_INC
+                            s.send(req)
+                            _pending_req = True
+                            _last_req_ms = now_ms
+                        elif stale_ms > 50 and now_ms - _last_req_ms >= 50:
+                            # Pending incremental request has been sitting unanswered for 50ms+
+                            # and the framebuffer is stale — screensharingd's damage detection
+                            # missed the update. Override with a forced full refresh.
+                            s.send(_FBU_FULL)
+                            _last_req_ms = now_ms
+                        # Delayed nudge from key event: return cursor to (x, y) 30ms after
+                        # key-up, giving the terminal time to render before we re-scan.
+                        if self._hover_after_ms > 0 and now_ms >= self._hover_after_ms:
+                            self._hover_after_ms = 0
+                            lx, ly = self._last_ptr_x, self._last_ptr_y
+                            try:
+                                s.send(struct.pack("!BBHH", 5, 0, lx, ly))
+                            except Exception:
+                                pass
                         continue
                     mt = _recv(s, 1)[0]
                     if mt == 0:  # FramebufferUpdate
+                        _pending_req = False
                         _recv(s, 1)
                         nr = struct.unpack("!H", _recv(s, 2))[0]
                         with self._lock:
@@ -309,10 +399,19 @@ class VNCBridge:
                                         self._fb[ry:ry+rh,rx:rx+rw,1]=arr[:,:,gs//8]
                                         self._fb[ry:ry+rh,rx:rx+rw,2]=arr[:,:,bs//8]
                         now_ms = int(time.time() * 1000)
-                        with self._lock:
-                            self._fb_seq += 1
-                            self._fb_ms = now_ms
-                        s.send(struct.pack("!BBHHHH", 3, 1, 0, 0, W, H))
+                        if nr > 0:
+                            with self._lock:
+                                self._fb_seq += 1
+                                self._fb_ms = now_ms
+                                self._fbu_count += 1
+                        _last_fbu_ms = now_ms  # received FBU; reset staleness clock
+                        # Immediately re-request for active content (video, animations).
+                        # For a stale screen this is still an incremental=1; the escalation
+                        # to incremental=0 happens in the timeout branch if screensharingd
+                        # doesn't respond within 50ms.
+                        s.send(_FBU_INC)
+                        _pending_req = True
+                        _last_req_ms = now_ms
                     elif mt == 2:
                         pass  # Bell
                     elif mt == 3:  # ServerCutText
@@ -347,16 +446,26 @@ class EncoderPipeline:
         import fractions
         if not _AV_OK or self.target_codec == CODEC_JPEG:
             return
+        # VideoToolbox VBR options: constant_bit_rate=0 lets the encoder use more
+        # bits for complex scenes and fewer for static content — better quality
+        # consistency than CBR at the same average bitrate.
+        _vt_opts = {"realtime": "1", "allow_sw": "1", "constant_bit_rate": "0"}
         candidates = {
             CODEC_H264: [
-                ("h264_videotoolbox", {"realtime": "1", "allow_sw": "1"}),
-                ("libx264", {"preset": "ultrafast", "tune": "zerolatency",
-                             "x264-params": "bframes=0:rc-lookahead=0"}),
+                ("h264_videotoolbox", _vt_opts),
+                ("libx264", {"preset": "fast", "tune": "zerolatency",
+                             "x264-params": "bframes=0:rc-lookahead=0:aq-mode=1"}),
             ],
             CODEC_H265: [
-                ("hevc_videotoolbox", {"realtime": "1", "allow_sw": "1"}),
-                ("libx265", {"preset": "ultrafast", "tune": "zerolatency",
-                             "x265-params": "bframes=0:rc-lookahead=0"}),
+                ("hevc_videotoolbox", _vt_opts),
+                ("libx265", {"preset": "fast", "tune": "zerolatency",
+                             "x265-params": "bframes=0:rc-lookahead=0:aq-mode=1"}),
+            ],
+            CODEC_AV1: [
+                ("av1_videotoolbox", {"realtime": "1", "allow_sw": "0"}),
+                ("libsvtav1", {"preset": "10",
+                               "svtav1-params": "film-grain=0:irefresh-type=2"}),
+                ("libaom-av1", {"cpu-used": "10", "usage": "realtime"}),
             ],
         }
         for name, opts in candidates.get(self.target_codec, []):
@@ -367,6 +476,9 @@ class EncoderPipeline:
                 cc.pix_fmt = "yuv420p"
                 cc.bit_rate = bitrate
                 cc.time_base = fractions.Fraction(1, 1000)
+                # Large GOP: one I-frame per 5 seconds at max fps. Static screens
+                # produce near-zero P-frames; a short GOP would flood with large I-frames.
+                cc.gop_size = 300
                 cc.options = opts
                 cc.open()
                 # Warm up hardware encoder — first frame is buffered, discard it
@@ -379,7 +491,7 @@ class EncoderPipeline:
                 log.info("Encoder: %s %dx%d @%dkbps", name, cc.width, cc.height, bitrate//1000)
                 return
             except Exception as e:
-                log.warning("Codec %s failed: %s", name, e)
+                log.debug("Codec %s failed: %s", name, e)
         log.warning("No video codec available — JPEG fallback")
 
     def set_bitrate(self, bitrate):
@@ -422,9 +534,9 @@ class AdaptiveController:
     _RESPONSIVE_FPS = 20.0   # minimum fps for 50ms input reaction
 
     def __init__(self, cfg):
-        self.fps = float(cfg.fps)
+        self.fps = float(cfg.max_fps)  # start at ceiling; adaptive controller reduces on congestion
         self.max_fps = float(cfg.max_fps)
-        self.bitrate = 5_000_000
+        self.bitrate = 2_000_000  # 2Mbps start — static screens use near-zero bits; ramps up via on_fresh
         self.jpeg_quality = 65
         self.client_w = 1920
         self.client_h = 1080
@@ -447,14 +559,22 @@ class AdaptiveController:
             self.client_w = max(1, w)
             self.client_h = max(1, h)
 
+    # Bytes in the asyncio write buffer that we treat as real congestion.
+    # A single 30KB I-frame transiently in the transport buffer is NOT congestion.
+    _WB_THRESH = 131072   # 128KB: ~4 large I-frames queued before we act
+
     def on_lag(self, age_ms, write_buf=0):
+        # Ignore sub-100ms ages (normal encode+network pipeline latency) and
+        # transient write-buffer spikes smaller than one GOP worth of data.
+        if age_ms < 100 and write_buf < self._WB_THRESH:
+            return
         with self._lock:
             now = time.monotonic()
             if now - self._last_slow < 0.3:
                 return
             self._last_slow = now
             self._last_fast = 0.0  # reset fresh streak
-            severe = age_ms > 500 or write_buf > 65536
+            severe = age_ms > 500 or write_buf > 524288  # 512KB = truly severe
             factor = 0.5 if severe else 0.75
             if self.fps > self._RESPONSIVE_FPS:
                 new_fps = max(self._RESPONSIVE_FPS, self.fps * factor)
@@ -510,14 +630,15 @@ async def client_session(ws, cfg, bridge):
         log.warning("VNC not ready"); return
 
     ctrl = AdaptiveController(cfg)
-    # Start with JPEG until client reports WebCodecs capability
+    # Start with JPEG until client reports WebCodecs capability and supported codecs.
+    # target_codec is updated when the client sends its caps (codec negotiation).
     target_codec = CODEC_H264 if cfg.codec == "h264" else CODEC_H265
     encoder = EncoderPipeline(CODEC_JPEG, W, H, ctrl.bitrate)  # JPEG until caps received
     has_webcodecs = False
 
     seq_num = 0
     last_fb_seq = 0
-    last_send_time = 0.0
+    last_send_time = time.monotonic()
     lag_history = []        # recent age_ms values from client
     no_lag_since = time.monotonic()
 
@@ -538,7 +659,7 @@ async def client_session(ws, cfg, bridge):
     loop = asyncio.get_event_loop()
 
     async def input_reader():
-        nonlocal has_webcodecs, no_lag_since
+        nonlocal has_webcodecs, no_lag_since, target_codec
         cur_buttons = 0
         try:
             async for raw in ws:
@@ -549,8 +670,15 @@ async def client_session(ws, cfg, bridge):
                     t = ev.get("t")
                     if t == "caps":
                         has_webcodecs = bool(ev.get("webcodecs", False))
+                        client_codecs = ev.get("codecs", [])
                         w, h = int(ev.get("w", 1920)), int(ev.get("h", 1080))
                         ctrl.on_resolution(w, h)
+                        # Negotiate codec: pick best that client supports.
+                        # If the client sent an explicit codec list, use that to override
+                        # the server's configured default. If the client only said
+                        # webcodecs=true without a list, keep the configured default.
+                        if client_codecs and has_webcodecs:
+                            target_codec = _select_codec(client_codecs)
                         _upgrade_encoder()
                     elif t == "resolution":
                         ctrl.on_resolution(int(ev.get("w",1920)), int(ev.get("h",1080)))
@@ -592,6 +720,8 @@ async def client_session(ws, cfg, bridge):
                             bridge.send_key(True,  0x76)
                             bridge.send_key(False, 0x76)
                             bridge.send_key(False, KEYSYM["MetaLeft"])
+                    elif t == "dbg_result":
+                        log.info("DBG[%s]: %s", ev.get("id","?"), ev.get("result",""))
                 except Exception:
                     pass
         except Exception:
@@ -601,22 +731,44 @@ async def client_session(ws, cfg, bridge):
         nonlocal seq_num, last_fb_seq, last_send_time, no_lag_since
         known_clip = bridge.server_clipboard_seq
         last_encoder_codec = encoder.actual_codec
+        _t_diag = time.monotonic(); _n_diag = 0; _n_drop = 0; _n_nosend = 0
+        _last_vnc_fbu = bridge._fbu_count
+        # Pipelined encode: start encoding during the rate-limit sleep so that
+        # encode time doesn't add to the frame interval.
+        _pipe_task = None   # concurrent encode future
+        _pipe_cap_ms = 0    # cap_ms captured when pipe_task was started
         try:
             while True:
                 now = time.monotonic()
+                if now - _t_diag >= 5.0:
+                    dt = now - _t_diag; _t_diag = now
+                    _vnc_n = bridge._fbu_count
+                    _vnc_fps = (_vnc_n - _last_vnc_fbu) / dt; _last_vnc_fbu = _vnc_n
+                    _fb_age = int(time.time() * 1000) - bridge._fb_ms
+                    log.info("DIAG: sent=%d/%.1fs=%.1ffps drop_wb=%d nosend=%d ctrl_fps=%.1f vnc=%.1ffps fb_age=%dms",
+                             _n_diag, dt, _n_diag/dt, _n_drop, _n_nosend, ctrl.fps, _vnc_fps, _fb_age)
+                    _n_diag = _n_drop = _n_nosend = 0
                 fps, bitrate, jq = ctrl.snapshot()
                 interval = 1.0 / max(1.0, fps)
 
-                # Detect encoder codec switch (JPEG→H.264) — force re-encode current frame
+                # Detect encoder codec switch (JPEG→H.264) — drain in-flight encode first
                 current_codec = encoder.actual_codec
                 if current_codec != last_encoder_codec:
                     last_encoder_codec = current_codec
-                    last_fb_seq = 0  # reset so we re-encode even on static screen
+                    if _pipe_task is not None:
+                        try: await _pipe_task
+                        except Exception: pass
+                        _pipe_task = None
 
                 # Write buffer check — immediate local backpressure
                 wb = _get_wbuf(ws)
                 if wb > 0:
                     ctrl.on_lag(0, wb)
+                    _n_drop += 1
+                    if _pipe_task is not None:
+                        try: await _pipe_task
+                        except Exception: pass
+                        _pipe_task = None
                     await asyncio.sleep(0.01)
                     continue
 
@@ -624,46 +776,76 @@ async def client_session(ws, cfg, bridge):
                 if no_lag_since > 0 and (now - no_lag_since) > 2.0:
                     ctrl.on_fresh()
 
-                # Rate limit
-                elapsed = now - last_send_time
-                if elapsed < interval:
-                    await asyncio.sleep(interval - elapsed)
-                    continue
+                # Pipeline: start encode NOW so it runs concurrently with the rate-limit sleep.
+                # Encode takes ~4.5ms; sleep is ~16.7ms — encode finishes well before we wake.
+                if _pipe_task is None:
+                    fb, cap_ms = bridge.get_current_frame()
+                    if fb is not None:
+                        encoder.set_bitrate(bitrate)
+                        _pipe_cap_ms = cap_ms
+                        _pipe_task = loop.run_in_executor(None, encoder.encode, fb, cap_ms, jq)
 
-                # Get framebuffer (only encode if changed)
-                fb, fb_seq, cap_ms = bridge.get_frame_if_newer(last_fb_seq)
-                if fb is None:
-                    await asyncio.sleep(interval * 0.5)
-                    continue
-                last_fb_seq = fb_seq
+                # Rate limit using deadline: last_send_time advances by interval each frame
+                # so encode + send time is absorbed and doesn't compound into the next sleep.
+                target = last_send_time + interval
+                to_sleep = target - time.monotonic()
+                if to_sleep > 0.001:
+                    await asyncio.sleep(to_sleep)
+                    wb = _get_wbuf(ws)
+                    if wb > 0:
+                        ctrl.on_lag(0, wb)
+                        _n_drop += 1
+                        if _pipe_task is not None:
+                            try: await _pipe_task
+                            except Exception: pass
+                            _pipe_task = None
+                        continue
 
-                # Update encoder bitrate
-                encoder.set_bitrate(bitrate)
-
-                # Encode in thread (CPU-bound)
-                try:
-                    payload, is_kf, codec_byte = await loop.run_in_executor(
-                        None, encoder.encode, fb, cap_ms, jq)
-                except Exception as e:
-                    log.debug("encode err: %s", e); continue
+                # Collect encode result — encode ran during sleep, so this is near-instant
+                if _pipe_task is None:
+                    fb, cap_ms = bridge.get_current_frame()
+                    if fb is None:
+                        await asyncio.sleep(0.01)
+                        continue
+                    encoder.set_bitrate(bitrate)
+                    try:
+                        payload, is_kf, codec_byte = await loop.run_in_executor(
+                            None, encoder.encode, fb, cap_ms, jq)
+                    except Exception as e:
+                        log.debug("encode err: %s", e); continue
+                else:
+                    cap_ms = _pipe_cap_ms
+                    try:
+                        payload, is_kf, codec_byte = await _pipe_task
+                    except Exception as e:
+                        log.debug("encode err: %s", e)
+                        _pipe_task = None; continue
+                    _pipe_task = None
 
                 if payload is None:
+                    _n_nosend += 1
+                    last_send_time = target
                     continue
 
-                # Check again after encoding (encoding takes time)
                 if _get_wbuf(ws) > 0:
                     ctrl.on_lag(0, _get_wbuf(ws))
-                    continue  # drop this frame
+                    _n_drop += 1
+                    continue
 
-                last_send_time = time.monotonic()
+                last_send_time = target
+                _n_diag += 1
                 seq_num += 1
-                hdr = _hdr(seq_num, cap_ms, codec_byte, is_kf, len(payload))
+                # Use current wall-clock time for cap_ms in the header — the browser
+                # uses this to measure transport age. The encoder's PTS (cap_ms passed
+                # to encode()) can be older (encode-start time) without affecting the
+                # lag reporter. This keeps age_ms ≈ SSH-tunnel RTT / 2 ≈ 18ms,
+                # not encode_interval + SSH_latency, preventing false congestion signals.
+                hdr = _hdr(seq_num, int(time.time() * 1000), codec_byte, is_kf, len(payload))
                 try:
                     await ws.send(hdr + payload)
                 except Exception as e:
                     log.debug("send err: %s", e); break
 
-                # Push Mac clipboard to client
                 sc = bridge.server_clipboard_seq
                 if sc != known_clip and bridge.server_clipboard:
                     known_clip = sc
@@ -674,9 +856,28 @@ async def client_session(ws, cfg, bridge):
         except Exception as e:
             log.debug("sender exit: %s", e)
         finally:
+            if _pipe_task is not None:
+                try: await _pipe_task
+                except Exception: pass
             encoder.close()
 
-    await asyncio.gather(frame_sender(), input_reader())
+    dbg_q: asyncio.Queue = asyncio.Queue()
+    _dbg_eval_sessions.add(dbg_q)
+    _dbg_seq = [0]
+
+    async def dbg_sender():
+        while True:
+            js = await dbg_q.get()
+            _dbg_seq[0] += 1
+            try:
+                await ws.send(json.dumps({"t": "eval", "js": js, "id": _dbg_seq[0]}))
+            except Exception:
+                break
+
+    try:
+        await asyncio.gather(frame_sender(), input_reader(), dbg_sender())
+    finally:
+        _dbg_eval_sessions.discard(dbg_q)
     log.info("client disconnect: %s", ws.remote_address)
 
 # ---------------------------------------------------------------------------
@@ -741,11 +942,39 @@ function setDim(w,h){
 let useVideo=typeof VideoDecoder!=='undefined';
 let decoder=null,decoderCodec=-1;
 
+// Codec byte → WebCodecs codec string
+const CODEC_STRINGS={
+  1:'avc1.640028',       // H.264 High Profile Level 4.0
+  2:'hev1.1.6.L93.B0',  // H.265 Main Profile
+  3:'av01.0.08M.08',    // AV1 Main Profile Level 4.0
+};
+
+// Probe which codecs the browser can decode via WebCodecs (hardware preferred).
+// Returns ordered list best→worst, e.g. ['h265','h264'].
+async function probeSupportedCodecs(){
+  if(!useVideo)return[];
+  const probes=[
+    {name:'h265',codec:'hev1.1.6.L93.B0'},
+    {name:'h264',codec:'avc1.640028'},
+    {name:'av1', codec:'av01.0.08M.08'},
+  ];
+  const out=[];
+  for(const p of probes){
+    try{
+      const r=await VideoDecoder.isConfigSupported(
+        {codec:p.codec,hardwareAcceleration:'prefer-hardware'});
+      if(r.supported)out.push(p.name);
+    }catch(e){}
+  }
+  return out.length>0?out:['h264'];
+}
+
 function initDecoder(codec){
   if(!useVideo)return;
   if(decoder&&decoderCodec===codec)return;
   if(decoder){try{decoder.close()}catch(e){}}
-  const cs=codec===1?'avc1.640028':'hev1.1.6.L93.B0';
+  const cs=CODEC_STRINGS[codec];
+  if(!cs){console.warn('Unknown codec byte',codec);useVideo=false;return;}
   try{
     decoder=new VideoDecoder({
       output:frame=>{
@@ -832,11 +1061,20 @@ function connect(){
   ws.onopen=()=>{
     wsOpen=true;
     st.textContent='connected';
-    // Report capabilities and resolution
-    send({t:'caps',webcodecs:typeof VideoDecoder!=='undefined',
-          w:window.innerWidth,h:window.innerHeight});
     startLagReporter();
     ki.focus();
+    // Probe codec support async; send caps once probing is done so server picks
+    // the best codec this browser can actually decode (H.265 > H.264 > JPEG).
+    const haswc=typeof VideoDecoder!=='undefined';
+    if(haswc){
+      probeSupportedCodecs().then(codecs=>{
+        send({t:'caps',webcodecs:true,codecs,
+              w:window.innerWidth,h:window.innerHeight});
+      });
+    }else{
+      send({t:'caps',webcodecs:false,codecs:[],
+            w:window.innerWidth,h:window.innerHeight});
+    }
   };
   ws.onclose=()=>{
     wsOpen=false;hud.textContent='disconnected';
@@ -856,6 +1094,10 @@ function connect(){
             navigator.clipboard.writeText(msg.text).catch(()=>{});
           st.textContent='📋 '+msg.text.substring(0,50);
           setTimeout(()=>{st.textContent='';},3000);
+        }else if(msg.t==='eval'){
+          let result='';
+          try{result=String(eval(msg.js))}catch(e){result='ERR:'+String(e);}
+          send({t:'dbg_result',id:msg.id,result});
         }
       }catch(e){}
     }
@@ -962,7 +1204,22 @@ def make_http_handler(cfg, bridge):
     async def handler(connection, request):
         from websockets.http11 import Response
         from websockets.datastructures import Headers
-        if not _check_token(request.path, cfg.password):
+        path = request.path
+
+        # Debug eval endpoint: GET /dbg?js=<url-encoded-JS>  (localhost only)
+        if path.startswith("/dbg"):
+            from urllib.parse import parse_qs
+            qs = parse_qs(path.split("?", 1)[1] if "?" in path else "")
+            js = qs.get("js", [""])[0]  # parse_qs already URL-decodes values
+            n = 0
+            if js:
+                for q in list(_dbg_eval_sessions):
+                    q.put_nowait(js)
+                    n += 1
+            body = ("sent to %d session(s)\n" % n).encode()
+            return Response(200, "OK", Headers([("Content-Type","text/plain")]), body)
+
+        if not _check_token(path, cfg.password):
             return Response(403, "Forbidden",
                             Headers([("Content-Type","text/plain")]), b"Invalid token.\n")
         if request.headers.get("Upgrade","").lower() != "websocket":
