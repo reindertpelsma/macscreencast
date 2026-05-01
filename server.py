@@ -228,6 +228,7 @@ class VNCBridge:
         self._hover_after_ms = 0  # schedule a delayed nudge at this epoch-ms
         self._cached_fb = None    # copy made at last _fb_seq change
         self._cached_seq = -1     # seq corresponding to _cached_fb
+        self._fb_hash = 0         # content hash for static-screen detection
 
     @property
     def dimensions(self):
@@ -400,10 +401,19 @@ class VNCBridge:
                                         self._fb[ry:ry+rh,rx:rx+rw,2]=arr[:,:,bs//8]
                         now_ms = int(time.time() * 1000)
                         if nr > 0:
+                            # Only increment _fb_seq when pixels actually changed.
+                            # Forced full-screen FBU requests (incremental=0) return the same
+                            # pixels on a static screen; sampling a few hundred pixels is
+                            # enough to detect real changes without a full 6MB comparison.
+                            sh = max(1, H // 32)
+                            sw = max(1, W // 32)
+                            new_hash = hash(fb[::sh, ::sw, 0].tobytes())
                             with self._lock:
-                                self._fb_seq += 1
-                                self._fb_ms = now_ms
                                 self._fbu_count += 1
+                                if new_hash != self._fb_hash:
+                                    self._fb_hash = new_hash
+                                    self._fb_seq += 1
+                                    self._fb_ms = now_ms
                         _last_fbu_ms = now_ms  # received FBU; reset staleness clock
                         # Immediately re-request for active content (video, animations).
                         # For a stale screen this is still an incremental=1; the escalation
@@ -478,7 +488,7 @@ class EncoderPipeline:
                 cc.time_base = fractions.Fraction(1, 1000)
                 # Large GOP: one I-frame per 5 seconds at max fps. Static screens
                 # produce near-zero P-frames; a short GOP would flood with large I-frames.
-                cc.gop_size = 300
+                cc.gop_size = 99999
                 cc.options = opts
                 cc.open()
                 # Warm up hardware encoder — first frame is buffered, discard it
@@ -532,59 +542,71 @@ class EncoderPipeline:
 # ---------------------------------------------------------------------------
 class AdaptiveController:
     _RESPONSIVE_FPS = 20.0   # minimum fps for 50ms input reaction
+    _WB_THRESH = 131072      # 128KB asyncio write buffer before we act
 
     def __init__(self, cfg):
-        self.fps = float(cfg.max_fps)  # start at ceiling; adaptive controller reduces on congestion
+        self.fps = float(cfg.max_fps)
         self.max_fps = float(cfg.max_fps)
-        self.bitrate = 2_000_000  # 2Mbps start — static screens use near-zero bits; ramps up via on_fresh
+        self.bitrate = 2_000_000
         self.jpeg_quality = 65
         self.client_w = 1920
         self.client_h = 1080
         self._min_br = 200_000
-        self._max_br = 80_000_000
+        self._max_br = 50_000_000   # 50Mbps cap — plenty for any screenshare quality
         self._last_slow = 0.0
         self._last_fast = 0.0
         self._lock = threading.Lock()
+        self._ping_samples = []     # initial RTT samples for baseline
+        self._ping_baseline = 0.0   # EWA baseline RTT in ms; 0 = not yet established
 
     @property
     def frame_interval(self):
         return 1.0 / max(1.0, self.fps)
-
-    def _ceiling(self):
-        # ~0.07 bits/pixel/frame is visually sufficient for H.264
-        return min(self._max_br, int(self.client_w * self.client_h * 0.07 * self.fps))
 
     def on_resolution(self, w, h):
         with self._lock:
             self.client_w = max(1, w)
             self.client_h = max(1, h)
 
-    # Bytes in the asyncio write buffer that we treat as real congestion.
-    # A single 30KB I-frame transiently in the transport buffer is NOT congestion.
-    _WB_THRESH = 131072   # 128KB: ~4 large I-frames queued before we act
+    def _backoff(self, severe):
+        """Reduce quality. Must be called with _lock held; enforces 300ms debounce."""
+        now = time.monotonic()
+        if now - self._last_slow < 0.3:
+            return
+        self._last_slow = now
+        self._last_fast = 0.0
+        factor = 0.5 if severe else 0.75
+        if self.fps > self._RESPONSIVE_FPS:
+            new_fps = max(self._RESPONSIVE_FPS, self.fps * factor)
+            self.bitrate = max(self._min_br, int(self.bitrate * new_fps / self.fps))
+            self.fps = new_fps
+        else:
+            self.bitrate = max(self._min_br, int(self.bitrate * factor))
+        self.jpeg_quality = max(10, int(self.jpeg_quality * factor))
+        log.debug("backoff: fps=%.1f br=%dk severe=%s", self.fps, self.bitrate // 1000, severe)
 
     def on_lag(self, age_ms, write_buf=0):
-        # Ignore sub-100ms ages (normal encode+network pipeline latency) and
-        # transient write-buffer spikes smaller than one GOP worth of data.
         if age_ms < 100 and write_buf < self._WB_THRESH:
             return
+        severe = age_ms > 500 or write_buf > 524288
         with self._lock:
-            now = time.monotonic()
-            if now - self._last_slow < 0.3:
+            self._backoff(severe)
+
+    def on_ping_rtt(self, rtt_ms):
+        """WebSocket ping RTT as third congestion signal. Ping queues behind video
+        frames, so rising RTT means the send buffer is forming before TCP notices."""
+        with self._lock:
+            if self._ping_baseline == 0.0:
+                self._ping_samples.append(rtt_ms)
+                if len(self._ping_samples) >= 5:
+                    self._ping_baseline = sum(self._ping_samples) / len(self._ping_samples)
                 return
-            self._last_slow = now
-            self._last_fast = 0.0  # reset fresh streak
-            severe = age_ms > 500 or write_buf > 524288  # 512KB = truly severe
-            factor = 0.5 if severe else 0.75
-            if self.fps > self._RESPONSIVE_FPS:
-                new_fps = max(self._RESPONSIVE_FPS, self.fps * factor)
-                # scale bitrate proportionally so per-frame budget stays stable
-                self.bitrate = max(self._min_br, int(self.bitrate * new_fps / self.fps))
-                self.fps = new_fps
+            threshold = self._ping_baseline * 2.5 + 40
+            if rtt_ms > threshold:
+                self._backoff(rtt_ms > threshold * 2)
             else:
-                self.bitrate = max(self._min_br, int(self.bitrate * factor))
-            self.jpeg_quality = max(10, int(self.jpeg_quality * factor))
-            log.debug("slow: fps=%.1f br=%dk age=%dms", self.fps, self.bitrate//1000, int(age_ms))
+                # Slowly decay baseline toward current RTT
+                self._ping_baseline = self._ping_baseline * 0.9 + rtt_ms * 0.1
 
     def on_fresh(self):
         with self._lock:
@@ -592,13 +614,14 @@ class AdaptiveController:
             if now - self._last_fast < 2.0:
                 return
             self._last_fast = now
-            ceiling = self._ceiling()
-            if self.bitrate < ceiling * 0.9:
-                self.bitrate = min(ceiling, int(self.bitrate * 1.15))
-                self.jpeg_quality = min(85, self.jpeg_quality + 2)
-            elif self.fps < self.max_fps:
+            # Priority: fps to max first (responsiveness), then gentle bitrate probe (+10%).
+            # on_lag / on_ping_rtt will backtrack if the probe causes congestion.
+            if self.fps < self.max_fps:
                 self.fps = min(self.max_fps, self.fps + 2.0)
-            log.debug("fast: fps=%.1f br=%dk", self.fps, self.bitrate//1000)
+            elif self.bitrate < self._max_br:
+                self.bitrate = min(self._max_br, int(self.bitrate * 1.10))
+                self.jpeg_quality = min(85, self.jpeg_quality + 2)
+            log.debug("fresh: fps=%.1f br=%dk", self.fps, self.bitrate // 1000)
 
     def snapshot(self):
         with self._lock:
@@ -751,8 +774,10 @@ async def client_session(ws, cfg, bridge):
         _last_vnc_fbu = bridge._fbu_count
         # Pipelined encode: start encoding during the rate-limit sleep so that
         # encode time doesn't add to the frame interval.
-        _pipe_task = None   # concurrent encode future
-        _pipe_cap_ms = 0    # cap_ms captured when pipe_task was started
+        _pipe_task = None       # concurrent encode future
+        _pipe_cap_ms = 0        # cap_ms captured when pipe_task was started
+        _last_encoded_seq = -1  # _fb_seq of last successfully sent frame
+        _pipe_enc_seq = -1      # _fb_seq captured when current pipe was started
         try:
             while True:
                 now = time.monotonic()
@@ -788,6 +813,14 @@ async def client_session(ws, cfg, bridge):
                     await asyncio.sleep(0.01)
                     continue
 
+                # Static-screen skip: framebuffer content unchanged and no encode in flight.
+                # The content hash in VNCBridge._run only advances _fb_seq on real pixel changes,
+                # so equal seqs mean zero new information — decoder keeps displaying last frame.
+                cur_fb_seq = bridge._fb_seq
+                if cur_fb_seq == _last_encoded_seq and _pipe_task is None:
+                    await asyncio.sleep(interval)
+                    continue
+
                 # Fresh streak → try to speed up
                 if no_lag_since > 0 and (now - no_lag_since) > 2.0:
                     ctrl.on_fresh()
@@ -799,6 +832,7 @@ async def client_session(ws, cfg, bridge):
                     if fb is not None:
                         encoder.set_bitrate(bitrate)
                         _pipe_cap_ms = cap_ms
+                        _pipe_enc_seq = cur_fb_seq
                         _pipe_task = loop.run_in_executor(None, encoder.encode, fb, cap_ms, jq)
 
                 # Rate limit using deadline: last_send_time advances by interval each frame
@@ -819,6 +853,7 @@ async def client_session(ws, cfg, bridge):
 
                 # Collect encode result — encode ran during sleep, so this is near-instant
                 if _pipe_task is None:
+                    _pipe_enc_seq = bridge._fb_seq
                     fb, cap_ms = bridge.get_current_frame()
                     if fb is None:
                         await asyncio.sleep(0.01)
@@ -849,6 +884,7 @@ async def client_session(ws, cfg, bridge):
                     continue
 
                 last_send_time = target
+                _last_encoded_seq = _pipe_enc_seq
                 _n_diag += 1
                 seq_num += 1
                 # Use current wall-clock time for cap_ms in the header — the browser
@@ -890,8 +926,30 @@ async def client_session(ws, cfg, bridge):
             except Exception:
                 break
 
+    async def ping_monitor():
+        """RFC 6455 WebSocket pings as congestion signal.
+        Ping frames queue behind video data frames, so rising RTT means the
+        TCP send buffer is building — earlier warning than JS age_ms reports."""
+        while True:
+            await asyncio.sleep(2.0)
+            t0 = time.monotonic()
+            try:
+                pong_waiter = await ws.ping()
+                await asyncio.wait_for(pong_waiter, timeout=10.0)
+                rtt_ms = (time.monotonic() - t0) * 1000
+                ctrl.on_ping_rtt(rtt_ms)
+                log.debug("ping rtt=%.1fms baseline=%.1fms", rtt_ms, ctrl._ping_baseline)
+            except asyncio.TimeoutError:
+                log.warning("ping timeout %s — closing stale connection", ws.remote_address)
+                try: await ws.close()
+                except Exception: pass
+                break
+            except Exception as e:
+                log.debug("ping err: %s", e)
+                break
+
     try:
-        await asyncio.gather(frame_sender(), input_reader(), dbg_sender())
+        await asyncio.gather(frame_sender(), input_reader(), dbg_sender(), ping_monitor())
     finally:
         _dbg_eval_sessions.discard(dbg_q)
     log.info("client disconnect: %s", ws.remote_address)
