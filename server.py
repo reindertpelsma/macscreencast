@@ -909,7 +909,10 @@ HTML = r"""<!DOCTYPE html>
 html,body{width:100%;height:100%;background:#111;overflow:hidden}
 canvas{display:block;position:absolute;image-rendering:pixelated}
 #hud{position:fixed;top:6px;right:10px;color:#0f0;font:11px monospace;
-  background:rgba(0,0,0,.7);padding:2px 8px;border-radius:3px;pointer-events:none;z-index:9}
+  background:rgba(0,0,0,.7);padding:2px 8px;border-radius:3px;z-index:9;
+  cursor:pointer;user-select:none}
+#hud.dim{opacity:0.25}
+#hud.hide{opacity:0;pointer-events:none}
 #cur{position:fixed;width:12px;height:12px;border:2px solid #fff;border-radius:50%;
   pointer-events:none;transform:translate(-50%,-50%);box-shadow:0 0 4px #000;z-index:9}
 #cur.dn{border-color:#ff0}
@@ -932,6 +935,18 @@ const st=document.getElementById('st'),ki=document.getElementById('ki');
 
 let imgW=1920,imgH=1080,scaleX=1,scaleY=1,ox=0,oy=0;
 let ws,wsOpen=false,mBtn=0,fc=0,lastFpsT=performance.now();
+
+// Metrics
+let rxBytes=0,rxBps=0;         // WebSocket receive bandwidth
+let codecName='';               // current codec name
+let ageWindow=[];               // rolling 5s frame-age samples [{ts,age}]
+let worstAge5s=0;               // worst-case frame age in last 5s
+let hudMode=0;                  // 0=full 1=dim 2=hidden (cycles on click)
+
+hud.addEventListener('click',()=>{
+  hudMode=(hudMode+1)%3;
+  hud.className=hudMode===1?'dim':hudMode===2?'hide':'';
+});
 
 // ---------------------------------------------------------------------------
 // Layout
@@ -1021,8 +1036,11 @@ function startLagReporter(){
   },500);
 }
 
+const CODEC_NAMES={0:'jpeg',1:'h264',2:'h265',3:'av1'};
+
 function handleBinary(buf){
   if(buf.byteLength<18)return;
+  rxBytes+=buf.byteLength;  // bandwidth tracking
   const v=new DataView(buf);
   const seq=v.getUint32(0);
   // capture_ms as two uint32 (avoids BigInt on older browsers)
@@ -1031,7 +1049,15 @@ function handleBinary(buf){
   const codec=v.getUint8(12),flags=v.getUint8(13);
   const payload=buf.slice(18);
   const age=Date.now()-capMs;
-  if(age>0)lagSamples.push(age);
+  codecName=CODEC_NAMES[codec]||'?';
+  if(age>0){
+    lagSamples.push(age);
+    // Rolling 5s worst-case age window
+    const now=Date.now();
+    ageWindow.push({ts:now,age});
+    ageWindow=ageWindow.filter(e=>now-e.ts<5000);
+    worstAge5s=ageWindow.length?Math.max(...ageWindow.map(e=>e.age)):0;
+  }
 
   if(codec===0||!useVideo){
     // JPEG path
@@ -1057,8 +1083,14 @@ function handleBinary(buf){
 
 function updateFps(){
   const now=performance.now();
-  if(now-lastFpsT>=1000){
-    hud.textContent=fc+' fps  '+imgW+'×'+imgH;
+  const dt=(now-lastFpsT)/1000;
+  if(dt>=1){
+    rxBps=rxBytes*8/dt;  // bits per second
+    rxBytes=0;
+    const bw=rxBps>=1e6?(rxBps/1e6).toFixed(1)+'Mbps':(rxBps/1e3).toFixed(0)+'Kbps';
+    const lag=worstAge5s>0?'lag:'+worstAge5s+'ms ':'';
+    const codec=codecName?codecName+' ':'';
+    hud.textContent=fc+'fps '+codec+bw+' '+lag+imgW+'×'+imgH;
     fc=0;lastFpsT=now;
   }
 }
