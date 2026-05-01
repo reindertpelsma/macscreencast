@@ -18,12 +18,21 @@
   <array>
     <string>PYTHON_PATH</string>
     <string>SERVER_PATH/server.py</string>
+    <!-- Codec: h264 (default, VideoToolbox on Apple Silicon), h265, or jpeg -->
+    <string>--codec</string>
+    <string>h264</string>
+    <!-- Maximum fps when bandwidth allows (default 60) -->
+    <string>--max-fps</string>
+    <string>60</string>
   </array>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>VNC_PASS</key>
     <string>your_vnc_password_here</string>
+    <!-- Optional web UI access token — visit http://localhost:6081/?token=SECRET -->
+    <!-- <key>MVS_PASSWORD</key>
+    <string>your_web_token_here</string> -->
     <!-- For full control (type-30), also set these and remove VNC_PASS:
     <key>MACOS_USER</key>
     <string>your_macos_username</string>

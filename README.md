@@ -1,30 +1,30 @@
 # mac-vnc-stream
 
-**A high-performance macOS remote desktop that runs in your browser, accessible over SSH.**
+**A low-bandwidth macOS remote desktop that streams H.264/H.265 to your browser over SSH.**
 
 No third-party accounts. No cloud relay. No extra macOS permissions. Just a Python script, an SSH tunnel, and a browser.
 
 ```
 ssh -L 6081:localhost:6081 user@your-mac
-open http://localhost:6081
+open "http://localhost:6081/?token=YOUR_WEB_TOKEN"
 ```
-
-![20fps demo placeholder](docs/demo.gif)
 
 ---
 
 ## Why this exists
 
-The standard solution — noVNC over websockify — runs at **2fps** on macOS. The bottleneck is the browser decoding ZRLE frames in JavaScript: each frame takes 400–500ms in Chrome, regardless of your network speed.
+The standard solution — noVNC over websockify — runs at **2fps** on macOS. The bottleneck is ZRLE decoding in JavaScript: each frame takes 400–500ms in Chrome regardless of network speed.
 
 `mac-vnc-stream` fixes this by:
 
 1. **Decoding ZRLE server-side** — Python + numpy decodes the VNC framebuffer
-2. **Re-encoding as JPEG** — libturbojpeg at 17ms/frame (vs 32ms with Pillow)  
-3. **Pushing to the browser** — WebSocket binary push at up to 20fps
-4. **GPU-accelerated display** — browser uses `createImageBitmap` (hardware JPEG decode) + `desynchronized` canvas
+2. **Re-encoding as H.264/H.265** — Apple VideoToolbox hardware encoder on macOS (~5ms/frame)
+3. **WebCodecs decode in browser** — GPU-accelerated `VideoDecoder` API (Chrome 94+, Firefox 130+, Safari 17.4+)
+4. **Adaptive bitrate** — per-client controller scales fps and bitrate based on network feedback
 
-Result: **~20fps at ~180KB/frame** on a 1920×1080 display at JPEG quality 65. Works fine over a 10Mbit connection.
+Result: **~20–60fps at 2–5 Mbps** on a 1920×1080 display. Around **10× lower bandwidth** than JPEG streaming.
+
+JPEG fallback activates automatically for browsers without WebCodecs.
 
 ---
 
@@ -55,11 +55,12 @@ open http://localhost:6081                  # or paste in browser
 
 - macOS with **Screen Sharing enabled** (System Settings → Sharing → Screen Sharing)
 - Python 3.9+
-- `brew install jpeg-turbo` (optional, 2× faster than Pillow fallback)
+- `pip install av` — PyAV (bundles VideoToolbox on macOS; **strongly recommended**)
+- `brew install jpeg-turbo` — optional, faster JPEG fallback
 
 Python packages (installed by `install.sh`):
 ```
-websockets numpy Pillow cryptography PyTurboJPEG
+websockets numpy Pillow cryptography av PyTurboJPEG
 ```
 
 ---
@@ -102,6 +103,25 @@ python3 server.py --macos-user yourname
 
 ---
 
+## Web UI access token
+
+To prevent unauthorized access when the server is reachable over a network:
+
+```bash
+python3 server.py --vnc-pass VNC_PASS --password YOUR_WEB_TOKEN
+# or
+MVS_PASSWORD=YOUR_WEB_TOKEN python3 server.py ...
+```
+
+Clients must include `?token=YOUR_WEB_TOKEN` in the URL:
+```
+http://localhost:6081/?token=YOUR_WEB_TOKEN
+```
+
+Without `--password`, access is unrestricted (safe when bound to `127.0.0.1` over SSH).
+
+---
+
 ## Configuration
 
 All options can be set via CLI flags or environment variables:
@@ -115,8 +135,10 @@ All options can be set via CLI flags or environment variables:
 | `--macos-pass` | `MACOS_PASS` | *(none)* | macOS password (type-30 auth) |
 | `--listen` | `LISTEN` | `127.0.0.1` | WebSocket/HTTP bind address |
 | `--port` | `PORT` | `6081` | WebSocket/HTTP port |
-| `--fps` | `FPS` | `20` | Target frame rate |
-| `--quality` | `JPEG_QUALITY` | `65` | JPEG quality (1–95) |
+| `--fps` | `FPS` | `20` | Initial/minimum fps (responsive floor) |
+| `--max-fps` | `MAX_FPS` | `60` | Maximum fps when bandwidth allows |
+| `--codec` | `CODEC` | `h264` | Video codec: `h264`, `h265`, `jpeg` |
+| `--password` | `MVS_PASSWORD` | *(none)* | Web UI access token (`?token=...`) |
 
 ---
 
@@ -142,9 +164,11 @@ tail -f /tmp/macvncstream.log
 | Middle click | Middle-click |
 | Scroll | Mouse wheel |
 | Keyboard | Click canvas to focus, then type |
-| **Paste text** | **Ctrl+V** (uses browser clipboard API) |
+| **Paste text** | **Ctrl+V** — works on all browsers, no clipboard permission popup |
 | **Copy from Mac** | Mac clipboard automatically syncs to browser |
 | Mobile | Touch events supported (tap, drag) |
+
+**Paste works on Firefox and Safari** too — uses a hidden `<textarea>` that captures the browser's native `paste` event, requiring no `navigator.clipboard` permission.
 
 ---
 
@@ -153,40 +177,47 @@ tail -f /tmp/macvncstream.log
 ```
 Browser                  Python server           macOS screensharingd
   │                           │                         │
-  │ ← WebSocket JPEG push ─── │ ←── ZRLE frames ─────── │
-  │                           │  (decode + re-encode)    │
+  │ ←─ H.264 binary frames ── │ ←── ZRLE frames ─────── │
+  │    (WebCodecs decode)      │   (decode + VideoToolbox │
+  │                           │    H.264/H.265 encode)   │
   │ ── mouse/key events ────→ │ ──── VNC PointerEvent ─→ │
   │                           │       KeyEvent           │
   │ ←─ clipboard JSON ─────── │ ←── ServerCutText ─────── │
   │ ── paste text ──────────→ │ ──── ClientCutText ─────→ │
+  │ ── lag reports ─────────→ │ (adaptive bitrate/fps)    │
 ```
 
-`screensharingd` already holds Screen Recording and Accessibility entitlements
-from Apple's signed bundle. The server connects to it via the VNC protocol
-on `localhost:5900` — no extra TCC permissions required for screen capture.
+**ZRLE → H.264 pipeline:**
+1. ZRLE data decompressed with `zlib`; tiles decoded into a numpy RGB framebuffer
+2. Per-client adaptive controller picks current fps and bitrate target
+3. `av.CodecContext` (`h264_videotoolbox`) encodes RGB→YUV420→H.264 Annex B
+4. 18-byte binary header prepended: `seq(4) capture_ms(8) codec(1) flags(1) payload_len(4)`
+5. Browser parses header, feeds `EncodedVideoChunk` to `VideoDecoder`, draws to `<canvas>`
 
-**ZRLE → JPEG pipeline:**
-- ZRLE compressed data decompressed with `zlib`
-- Tiles (raw, solid, packed palette, RLE, palette RLE) decoded into a numpy framebuffer
-- numpy RGB array → libturbojpeg → JPEG bytes (~17ms at 1080p, quality 65)
-- JPEG pushed via WebSocket binary frame
-- Browser: `createImageBitmap(blob)` → GPU-decoded → drawn to `<canvas>` with `desynchronized:true`
+**Adaptive controller:**
+- Starts at `--fps` (default 20) and 5 Mbps
+- Client reports `{t:'lag', age_ms:N}` every 500ms
+- Server also reads `ws.transport.get_write_buffer_size()` for immediate TCP backpressure
+- On pressure: cut fps first (maintain ≥20fps for responsiveness), then cut bitrate
+- On 2s of clean delivery: gradually restore bitrate (15% per step), then fps
+
+**JPEG fallback:** if the client browser has no `VideoDecoder` API, or if VideoToolbox isn't available, all frames are sent as JPEG (same wire format, codec byte = 0). No separate negotiation needed.
 
 ---
 
 ## Performance
 
-Measured on a Mac mini M2 over localhost SSH tunnel:
+Measured on a Mac mini M2 (Apple Silicon) over localhost SSH tunnel:
 
-| Metric | Value |
-|--------|-------|
-| Frame rate | ~20fps (target) |
-| JPEG encode time | ~17ms/frame (libturbojpeg) |
-| Frame size | ~180KB @ 1080p quality 65 |
-| Bandwidth | ~3.6MB/s |
-| noVNC comparison | 2fps vs **20fps** (10× faster) |
+| Metric | JPEG mode | H.264 mode |
+|--------|-----------|-----------|
+| Frame rate | ~20fps | 20–60fps adaptive |
+| Encode time | ~17ms/frame | ~5ms/frame (VideoToolbox) |
+| Frame size | ~180KB @ 1080p | ~30KB/frame average |
+| Bandwidth | ~55 Mbps | **~2–5 Mbps** |
+| WebCodecs required | No | Yes (fallback: JPEG) |
 
-Reduce `--quality` (e.g. 45) or `--fps` for lower bandwidth. Quality 45 gives ~120KB/frame (~2.4MB/s) with acceptable clarity.
+H.264 via VideoToolbox uses Apple Silicon's dedicated media engine — essentially zero CPU cost.
 
 ---
 
@@ -204,11 +235,12 @@ Apple tightened VNC type-2 input injection starting in macOS 15. Use `--macos-us
 
 ## Known limitations
 
-- **Type-30 requires your macOS login password.** This is the same credential you use to log in at the keyboard. Keep it in an env var, not a CLI flag.
-- **Screen must be unlocked for type-2 auth.** On a locked screen, even type-30 events go to the lock screen — you'll need to type your password to unlock.
-- **Clipboard API requires HTTPS or localhost.** The SSH tunnel keeps you on `localhost`, so it works. If you expose the server on a LAN without TLS, clipboard paste from browser will be blocked by the browser's security model.
-- **No audio.** VNC doesn't carry audio; this doesn't either.
-- **Retina/HiDPI:** screensharingd presents the display at its native resolution to VNC. On a 5K display you'll get a 5120×2880 stream. Use `--quality 40 --fps 15` for high-res displays.
+- **Type-30 requires your macOS login password.** Keep it in `MACOS_PASS` env var, not a CLI flag.
+- **Screen must be unlocked for input injection.** On a locked screen, events go to the lock screen.
+- **Clipboard sync from Mac to browser requires HTTPS or localhost.** The SSH tunnel keeps you on `localhost`, so it works. Exposing on LAN without TLS blocks `navigator.clipboard.writeText`.
+- **No audio.** VNC doesn't carry audio.
+- **Retina/HiDPI:** screensharingd presents the display at native resolution. On a 5K display you'll get a 5120×2880 stream — use `--codec jpeg --fps 15` for high-res displays.
+- **No runtime codec switching.** Codec is fixed at startup. Restart the server to change.
 
 ---
 
