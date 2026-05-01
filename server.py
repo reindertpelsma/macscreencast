@@ -355,11 +355,11 @@ class VNCBridge:
                         if not _pending_req:
                             # Choose request type: if screensharingd has been quiet for >50ms,
                             # force a full refresh so we own the update cadence, not it.
-                            req = _FBU_FULL if stale_ms > 50 else _FBU_INC
+                            req = _FBU_FULL if stale_ms > 25 else _FBU_INC
                             s.send(req)
                             _pending_req = True
                             _last_req_ms = now_ms
-                        elif stale_ms > 50 and now_ms - _last_req_ms >= 50:
+                        elif stale_ms > 25 and now_ms - _last_req_ms >= 25:
                             # Pending incremental request has been sitting unanswered for 50ms+
                             # and the framebuffer is stale — screensharingd's damage detection
                             # missed the update. Override with a forced full refresh.
@@ -650,11 +650,27 @@ async def client_session(ws, cfg, bridge):
             return  # already upgraded
         encoder.close()
         W2, H2 = bridge.dimensions
-        encoder = EncoderPipeline(target_codec, W2, H2, ctrl.bitrate)
-        if encoder.actual_codec != CODEC_JPEG:
-            log.info("Upgraded to %s for %s", {CODEC_H264:"h264",CODEC_H265:"h265"}.get(encoder.actual_codec,"?"), ws.remote_address)
-        else:
-            log.warning("Video codec unavailable for %s — staying on JPEG", ws.remote_address)
+        # Cascade: try target_codec first, then H.265, then H.264.
+        # AV1 software encode (libaom/SVT) is too slow for real-time so we stop
+        # at H.265 when hardware AV1 isn't available.
+        seen = set()
+        fallbacks = [target_codec, CODEC_H265, CODEC_H264]
+        for codec in fallbacks:
+            if codec == CODEC_AV1:
+                continue  # skip software AV1 until hardware VT support lands
+            if codec in seen:
+                continue
+            seen.add(codec)
+            e = EncoderPipeline(codec, W2, H2, ctrl.bitrate)
+            if e.actual_codec != CODEC_JPEG:
+                encoder = e
+                log.info("Upgraded to %s for %s",
+                         {CODEC_H264:"h264",CODEC_H265:"h265",CODEC_AV1:"av1"}.get(encoder.actual_codec,"?"),
+                         ws.remote_address)
+                return
+            e.close()
+        encoder = EncoderPipeline(CODEC_JPEG, W2, H2, ctrl.bitrate)
+        log.warning("Video codec unavailable for %s — staying on JPEG", ws.remote_address)
 
     loop = asyncio.get_event_loop()
 
