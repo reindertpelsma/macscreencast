@@ -107,11 +107,12 @@ def _vnc_apple_dh(sock, username, password):
         cpub  = pow(g, cpriv, prime)
         shared = pow(spub, cpriv, prime)
         aes_key = hashlib.md5(shared.to_bytes(kl, "big")).digest()
-        payload = (password.encode("utf-8")[:64].ljust(64, b"\x00")
-                   + username.encode("utf-8")[:64].ljust(64, b"\x00"))
+        payload = (username.encode("utf-8")[:64].ljust(64, b"\x00")
+                   + password.encode("utf-8")[:64].ljust(64, b"\x00"))
         enc = Cipher(algorithms.AES(aes_key), modes.ECB(),
                      backend=default_backend()).encryptor()
-        sock.send(cpub.to_bytes(kl, "big") + enc.update(payload) + enc.finalize())
+        ciphertext = enc.update(payload) + enc.finalize()
+        sock.send(ciphertext + cpub.to_bytes(kl, "big"))
         try:
             return struct.unpack("!I", _recv(sock, 4))[0] == 0
         except ConnectionError:
