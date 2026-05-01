@@ -540,6 +540,38 @@ class EncoderPipeline:
             self.actual_codec = CODEC_JPEG
             return _encode_jpeg(rgb, jpeg_quality), True, CODEC_JPEG
 
+    def encode_keyframe(self, rgb, capture_ms, quality):
+        """Force an I-frame refresh — called after extended static period to sharpen quality.
+        Attempts gop_size=1 + pict_type=I; VideoToolbox may ignore both, in which case
+        the frame is still sent at the current (high) bitrate ceiling."""
+        if self._cc is None:
+            return _encode_jpeg(rgb, quality), True, CODEC_JPEG
+        try:
+            self._cc.gop_size = 1
+        except Exception:
+            pass
+        pkts = []
+        try:
+            frame = _av.VideoFrame.from_ndarray(rgb, format="rgb24")
+            frame = frame.reformat(format="yuv420p")
+            pts = max(self._last_pts + 1, capture_ms)
+            frame.pts = pts
+            try:
+                frame.pict_type = 1   # AV_PICTURE_TYPE_I
+            except Exception:
+                pass
+            pkts = list(self._cc.encode(frame))
+            self._last_pts = pts
+        except Exception as e:
+            log.debug("encode_keyframe err: %s", e)
+        try:
+            self._cc.gop_size = 99999
+        except Exception:
+            pass
+        if not pkts:
+            return None, False, self.actual_codec
+        return bytes(pkts[0]), True, self.actual_codec
+
     def close(self):
         if self._cc:
             try: self._cc.close()
@@ -556,7 +588,7 @@ class AdaptiveController:
     def __init__(self, cfg):
         self.fps = float(cfg.max_fps)
         self.max_fps = float(cfg.max_fps)
-        self.bitrate = 2_000_000
+        self.bitrate = 10_000_000
         self.jpeg_quality = 65
         self.client_w = 1920
         self.client_h = 1080
@@ -654,14 +686,19 @@ class AdaptiveController:
             if now - self._last_fast < 2.0:
                 return
             self._last_fast = now
-            # Priority: fps to max first (responsiveness), then gentle bitrate probe (+10%).
-            # on_lag / on_ping_rtt will backtrack if the probe causes congestion.
             if self.fps < self.max_fps:
-                self.fps = min(self.max_fps, self.fps + 2.0)
+                self.fps = self.max_fps   # jump to max; congestion signals back off if needed
             elif self.bitrate < self._max_br:
                 self.bitrate = min(self._max_br, int(self.bitrate * 1.10))
-                self.jpeg_quality = min(85, self.jpeg_quality + 2)
+                self.jpeg_quality = min(95, self.jpeg_quality + 2)
             log.debug("fresh: fps=%.1f br=%dk", self.fps, self.bitrate // 1000)
+
+    def on_screen_active(self):
+        """Screen content changed after a static period — reset fps to max immediately."""
+        with self._lock:
+            self.fps = self.max_fps
+            self._last_fast = time.monotonic()
+            log.debug("screen active: fps=%.1f", self.fps)
 
     def snapshot(self):
         with self._lock:
@@ -837,6 +874,9 @@ async def client_session(ws, cfg, bridge):
         _pipe_cap_ms = 0        # cap_ms captured when pipe_task was started
         _last_encoded_seq = -1  # _fb_seq of last successfully sent frame
         _pipe_enc_seq = -1      # _fb_seq captured when current pipe was started
+        _was_static = False     # True when screen has been unchanged this static period
+        _static_since = 0.0     # monotonic time when current static period started
+        _refreshed_kf = False   # keyframe refresh already sent this static period
         try:
             while True:
                 now = time.monotonic()
@@ -862,6 +902,11 @@ async def client_session(ws, cfg, bridge):
 
                 # Write buffer check — immediate local backpressure
                 wb = _get_wbuf(ws)
+                if wb > 4 * 1024 * 1024:
+                    log.warning("write buf %.1fMB — hard kill %s", wb / 1048576, ws.remote_address)
+                    try: await ws.close()
+                    except Exception: pass
+                    break
                 if wb > 0:
                     ctrl.on_lag(0, wb)
                     _n_drop += 1
@@ -872,13 +917,42 @@ async def client_session(ws, cfg, bridge):
                     await asyncio.sleep(0.01)
                     continue
 
-                # Static-screen skip: framebuffer content unchanged and no encode in flight.
-                # The content hash in VNCBridge._run only advances _fb_seq on real pixel changes,
-                # so equal seqs mean zero new information — decoder keeps displaying last frame.
+                # Static-screen skip: no new content, poll at 60fps max so changes are
+                # detected within 16ms even when the adaptive controller has reduced fps.
                 cur_fb_seq = bridge._fb_seq
                 if cur_fb_seq == _last_encoded_seq and _pipe_task is None:
-                    await asyncio.sleep(interval)
+                    if not _was_static:
+                        _was_static = True
+                        _static_since = now
+                        _refreshed_kf = False
+                    elif not _refreshed_kf and now - _static_since > 5.0:
+                        # 5s idle: force an I-frame refresh at current quality ceiling so
+                        # text and fine detail sharpen up after the congestion ramp-up.
+                        _refreshed_kf = True
+                        fps_s, br_s, jq_s = ctrl.snapshot()
+                        fb_s, cms_s = bridge.get_current_frame()
+                        if fb_s is not None:
+                            encoder.set_bitrate(br_s)
+                            try:
+                                payload_s, is_kf_s, codec_s = await loop.run_in_executor(
+                                    None, encoder.encode_keyframe, fb_s, cms_s, 95)
+                                if payload_s:
+                                    seq_num += 1
+                                    hdr_s = _hdr(seq_num, int(time.time() * 1000),
+                                                 codec_s, True, len(payload_s))
+                                    await ws.send(hdr_s + payload_s)
+                                    log.debug("static kf refresh: %dkbps", br_s // 1000)
+                            except Exception as e:
+                                log.debug("kf refresh err: %s", e)
+                    await asyncio.sleep(min(interval, 1.0 / 60.0))
                     continue
+
+                # Screen just changed after a static period — reset fps to max immediately
+                # so P-frames flow at full rate without waiting for the slow fresh-ramp.
+                if _was_static:
+                    _was_static = False
+                    ctrl.on_screen_active()
+                    last_send_time = time.monotonic() - interval  # skip rate-limit delay
 
                 # Fresh streak → try to speed up
                 if no_lag_since > 0 and (now - no_lag_since) > 2.0:
@@ -994,10 +1068,10 @@ async def client_session(ws, cfg, bridge):
             t0 = time.monotonic()
             try:
                 pong_waiter = await ws.ping()
-                await asyncio.wait_for(pong_waiter, timeout=10.0)
+                await asyncio.wait_for(pong_waiter, timeout=5.0)
                 rtt_ms = (time.monotonic() - t0) * 1000
                 ctrl.on_ping_rtt(rtt_ms)
-                log.debug("ping rtt=%.1fms baseline=%.1fms", rtt_ms, ctrl._ping_baseline)
+                log.debug("ping rtt=%.1fms metric=%.1fms", rtt_ms, ctrl._metric_rtt)
             except asyncio.TimeoutError:
                 log.warning("ping timeout %s — closing stale connection", ws.remote_address)
                 try: await ws.close()
@@ -1207,7 +1281,7 @@ function updateFps(){
     const bw=rxBps>=1e6?(rxBps/1e6).toFixed(1)+'Mbps':(rxBps/1e3).toFixed(0)+'Kbps';
     const lag=worstAge5s>0?'lag:'+worstAge5s+'ms ':'';
     const codec=codecName?codecName+' ':'';
-    const net=metricRtt>0?'net:'+metricRtt+'ms ':'';
+    const net=worstMetricRtt5s>0?'net:'+worstMetricRtt5s+'ms ':'';
     hud.textContent=fc+'fps '+codec+bw+' '+lag+net+imgW+'×'+imgH;
     fc=0;lastFpsT=now;
   }
@@ -1276,6 +1350,7 @@ function connect(){
 // video_ping_rtt - metric_rtt = pure queuing delay, independent of link latency/roaming.
 // ---------------------------------------------------------------------------
 let metricWs=null,metricOpen=false,metricRtt=0;
+let metricRttWindow=[],worstMetricRtt5s=0;  // rolling 5s worst-case metric RTT
 
 function connectMetric(){
   const token=new URLSearchParams(location.search).get('token')||'';
@@ -1293,7 +1368,10 @@ function connectMetric(){
       const msg=JSON.parse(e.data);
       if(msg.t==='ping'&&msg.ts){
         metricRtt=Date.now()-msg.ts;
-        // Report to video channel — server uses this as the unloaded RTT reference
+        const mnow=Date.now();
+        metricRttWindow.push({ts:mnow,rtt:metricRtt});
+        metricRttWindow=metricRttWindow.filter(e=>mnow-e.ts<5000);
+        worstMetricRtt5s=metricRttWindow.length?Math.max(...metricRttWindow.map(e=>e.rtt)):metricRtt;
         send({t:'metric_rtt',rtt_ms:metricRtt});
       }
     }catch(e){}
