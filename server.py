@@ -6,7 +6,7 @@ python server.py --vnc-pass PASSWORD
 python server.py --macos-user u --macos-pass p  # full control (macOS 15+)
 ssh -L 6081:localhost:6081 user@mac && open http://localhost:6081
 """
-import argparse, asyncio, hashlib, json, logging, os, socket, struct
+import argparse, asyncio, hashlib, json, logging, os, select, socket, struct
 import threading, time, zlib
 from io import BytesIO
 import numpy as np
@@ -283,6 +283,9 @@ class VNCBridge:
                 s.send(struct.pack("!BBHHHH", 3, 0, 0, 0, W, H))  # FramebufferUpdateRequest
                 while True:
                     self._flush_input()
+                    r, _, _ = select.select([s], [], [], 0.05)
+                    if not r:
+                        continue
                     mt = _recv(s, 1)[0]
                     if mt == 0:  # FramebufferUpdate
                         _recv(s, 1)
