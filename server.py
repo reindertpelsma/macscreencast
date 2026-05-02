@@ -813,7 +813,8 @@ class DisplayStreamBridge:
 # context) avoids that.  Same API surface as DisplayStreamBridge.
 # ---------------------------------------------------------------------------
 class InProcessSCKBridge:
-    _fo_class = None  # ObjC class registered once; cached here after first use
+    _fo_class   = None  # ObjC class registered once; cached here after first use
+    _sck_queue  = None  # GCD global queue for SCK frame delivery; set by _make_fo_class
 
     def __init__(self):
         self._lock   = threading.Lock()
@@ -831,8 +832,36 @@ class InProcessSCKBridge:
         if cls._fo_class is not None:
             return cls._fo_class
         from Foundation import NSObject
-        import CoreMedia, ctypes
-        _cv = ctypes.CDLL('/System/Library/Frameworks/CoreVideo.framework/CoreVideo')
+        import CoreMedia, ctypes, warnings, re as _re
+        import objc as _objc
+        warnings.filterwarnings('ignore', category=_objc.ObjCPointerWarning)
+        _cv  = ctypes.CDLL('/System/Library/Frameworks/CoreVideo.framework/CoreVideo')
+        _cm  = ctypes.CDLL('/System/Library/Frameworks/CoreMedia.framework/CoreMedia')
+        _cm.CMSampleBufferGetImageBuffer.restype  = ctypes.c_void_p
+        _cm.CMSampleBufferGetImageBuffer.argtypes = [ctypes.c_void_p]
+        _gcd = ctypes.CDLL('/usr/lib/system/libdispatch.dylib')
+        _gcd.dispatch_get_global_queue.restype  = ctypes.c_void_p
+        _gcd.dispatch_get_global_queue.argtypes = [ctypes.c_long, ctypes.c_ulong]
+        cls._sck_queue = _objc.objc_object(c_void_p=_gcd.dispatch_get_global_queue(21, 0))
+
+        def _sb_to_ptr(sb):
+            """Extract the ObjC CMSampleBufferRef pointer from a PyObjC proxy.
+            Strategy 1: PyObjCPointer stores ptr at offset 16 in the CPython object.
+            Strategy 2: Parse the first hex address from description (fragile but works
+                        for CF-bridged types whose description starts with 'CMSampleBuffer 0x...')."""
+            try:
+                # In CPython+PyObjC, the Python object at id(sb) is laid out as:
+                # [ob_refcnt:8][ob_type:8][objc_id:8]...
+                return ctypes.cast(id(sb), ctypes.POINTER(ctypes.c_void_p))[2]
+            except Exception:
+                pass
+            try:
+                m = _re.search(r'\b0x([0-9a-fA-F]+)\b', str(sb))
+                if m:
+                    return int(m.group(1), 16)
+            except Exception:
+                pass
+            return 0
         _cv.CVPixelBufferLockBaseAddress.restype    = ctypes.c_int32
         _cv.CVPixelBufferLockBaseAddress.argtypes   = [ctypes.c_void_p, ctypes.c_uint64]
         _cv.CVPixelBufferUnlockBaseAddress.restype  = ctypes.c_int32
@@ -858,10 +887,12 @@ class InProcessSCKBridge:
                 if bridge is None:
                     return
                 try:
-                    pb_obj = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
-                    if pb_obj is None:
+                    sb_ptr = _sb_to_ptr(sampleBuffer)
+                    if not sb_ptr:
                         return
-                    pb = hash(pb_obj)
+                    pb = _cm.CMSampleBufferGetImageBuffer(sb_ptr)
+                    if not pb:
+                        return
                     _cv.CVPixelBufferLockBaseAddress(pb, 1)
                     try:
                         W   = int(_cv.CVPixelBufferGetWidth(pb))
@@ -942,7 +973,8 @@ class InProcessSCKBridge:
 
                 writer = FO.alloc().init()
                 stream = SCKmod.SCStream.alloc().initWithFilter_configuration_delegate_(filt, cfg, writer)
-                stream.addStreamOutput_type_sampleHandlerQueue_error_(writer, 0, None, None)
+                stream.addStreamOutput_type_sampleHandlerQueue_error_(
+                    writer, 0, InProcessSCKBridge._sck_queue, None)
 
                 _st_ev = threading.Event()
                 _serr  = [None]
