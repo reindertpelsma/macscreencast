@@ -1632,12 +1632,15 @@ class AdaptiveController:
             self.canvas_phys_w = max(1, w)
             self.canvas_phys_h = max(1, h)
 
-    def on_quality(self, cap_h: int, fps_cap: int):
+    def on_quality(self, cap_h: int, fps_cap: int, max_kbps: int = 0):
         with self._lock:
             self.cap_h   = max(0, cap_h)
             self.fps_cap = max(0, fps_cap)
             ceil = float(self.fps_cap) if self.fps_cap > 0 else self.max_fps
             self.fps = min(self.fps, ceil)
+            if max_kbps > 0:
+                self._max_br = max_kbps * 1000
+                self.bitrate = min(self.bitrate, self._max_br)
 
     def effective_target(self, native_w: int, native_h: int):
         """Return (tw, th) — the target encode resolution.
@@ -1903,7 +1906,8 @@ async def client_session(ws, cfg, bridge):
                         if has_webcodecs and (tw != _enc_target_w or th != _enc_target_h):
                             _reinit_deadline = time.monotonic() + 0.5
                     elif t == "quality":
-                        ctrl.on_quality(int(ev.get("cap_h", 0)), int(ev.get("fps", 0)))
+                        ctrl.on_quality(int(ev.get("cap_h", 0)), int(ev.get("fps", 0)),
+                                        int(ev.get("maxkbps", 0)))
                         nw, nh = bridge.dimensions
                         tw, th = ctrl.effective_target(nw or W, nh or H)
                         if has_webcodecs and (tw != _enc_target_w or th != _enc_target_h):
@@ -2432,13 +2436,23 @@ canvas{display:block;position:absolute}
       </div>
     </div>
     <div id="quality-section">
-      <div style="color:#666;font:10px monospace;margin-bottom:3px">Stream quality (cap)</div>
+      <div style="color:#666;font:10px monospace;margin-bottom:3px">Stream quality (maximums)</div>
       <div class="q-row"><label>Res</label><select class="q-sel" id="q-res"><option value="0">Auto</option></select></div>
       <div class="q-row"><label>FPS</label><select class="q-sel" id="q-fps">
         <option value="0">Auto</option>
         <option value="60">60 fps</option>
         <option value="30">30 fps</option>
         <option value="20">20 fps</option>
+      </select></div>
+      <div class="q-row"><label>Max BW</label><select class="q-sel" id="q-bw">
+        <option value="0">Unlimited</option>
+        <option value="100000">100 Mbps</option>
+        <option value="50000">50 Mbps</option>
+        <option value="25000" selected>25 Mbps</option>
+        <option value="10000">10 Mbps</option>
+        <option value="5000">5 Mbps</option>
+        <option value="2000">2 Mbps</option>
+        <option value="1000">1 Mbps</option>
       </select></div>
     </div>
   </div>
@@ -2654,18 +2668,21 @@ const _Q_PRESETS=[
   {label:'1080p (Full HD)',h:1080},{label:'720p (HD)',h:720},
   {label:'480p (SD)',h:480},{label:'360p',h:360},{label:'240p',h:240},
 ];
-let _qCapH=0,_qFps=0,_qMenuBuilt=false;
+let _qCapH=0,_qFps=0,_qBwKbps=25000,_qMenuBuilt=false;
 
 function _qCookie(){
-  // Returns {cap_h, fps} from cookie, or defaults.
-  const m=document.cookie.match(/mvs_q=(\d+),(\d+)/);
-  return m?{cap_h:parseInt(m[1]),fps:parseInt(m[2])}:{cap_h:0,fps:0};
+  // Returns {cap_h, fps, bw} from cookie, or defaults.
+  const m=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+)/);
+  if(m)return{cap_h:parseInt(m[1]),fps:parseInt(m[2]),bw:parseInt(m[3])};
+  // Legacy cookie without bw field
+  const m2=document.cookie.match(/mvs_q=(\d+),(\d+)/);
+  return m2?{cap_h:parseInt(m2[1]),fps:parseInt(m2[2]),bw:25000}:{cap_h:0,fps:0,bw:25000};
 }
 function _qSaveCookie(){
-  document.cookie='mvs_q='+_qCapH+','+_qFps+';max-age='+(365*86400)+';SameSite=Strict';
+  document.cookie='mvs_q='+_qCapH+','+_qFps+','+_qBwKbps+';max-age='+(365*86400)+';SameSite=Strict';
 }
 function sendQuality(){
-  send({t:'quality',cap_h:_qCapH,fps:_qFps});
+  send({t:'quality',cap_h:_qCapH,fps:_qFps,maxkbps:_qBwKbps});
 }
 
 function _buildQualityMenu(macH){
@@ -2697,14 +2714,20 @@ function _buildQualityMenu(macH){
 (()=>{
   const rSel=document.getElementById('q-res');
   const fSel=document.getElementById('q-fps');
-  // Restore fps from cookie immediately (resolution menu built after first frame).
+  const bSel=document.getElementById('q-bw');
+  // Restore fps + bw from cookie immediately (resolution menu built after first frame).
   const saved=_qCookie();
   _qFps=saved.fps;fSel.value=String(_qFps);
+  _qBwKbps=saved.bw;bSel.value=String(_qBwKbps);
+  if(bSel.value!==String(_qBwKbps)){bSel.value='25000';_qBwKbps=25000;}
   rSel.addEventListener('change',()=>{
     _qCapH=parseInt(rSel.value)||0;_qSaveCookie();sendQuality();
   });
   fSel.addEventListener('change',()=>{
     _qFps=parseInt(fSel.value)||0;_qSaveCookie();sendQuality();
+  });
+  bSel.addEventListener('change',()=>{
+    _qBwKbps=parseInt(bSel.value)||0;_qSaveCookie();sendQuality();
   });
 })();
 
