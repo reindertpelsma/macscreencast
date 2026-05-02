@@ -6,7 +6,7 @@ python server.py --vnc-pass PASSWORD
 python server.py --macos-user u --macos-pass p  # full control (macOS 15+)
 ssh -L 6081:localhost:6081 user@mac && open http://localhost:6081
 """
-import argparse, asyncio, hashlib, json, logging, os, select, socket, struct, sys
+import argparse, asyncio, hashlib, json, logging, os, queue, select, socket, struct, sys
 import threading, time, zlib
 from io import BytesIO
 import numpy as np
@@ -290,6 +290,15 @@ _cg_mod_held: set = set()
 # True once AXIsProcessTrusted() and a test CGEventPost both succeed.
 _cg_kb_ok: bool = False
 _active_clients: int = 0   # live WebSocket sessions; capture loops idle when 0
+
+# ---------------------------------------------------------------------------
+# Audio globals — SCK + Opus encoder + WebSocket fan-out
+# ---------------------------------------------------------------------------
+_audio_clients: int = 0              # count of active audio WS subscribers
+_audio_subs: dict = {}               # qid → (asyncio.Queue, event_loop)
+_audio_subs_lock = threading.Lock()
+_audio_raw_q: queue.Queue = queue.Queue(maxsize=500)   # raw PCM chunks from SCK callback
+_audio_encoder_started: bool = False  # encoder thread started lazily on first subscriber
 
 def _cg_release_all() -> None:
     """Release all CGEvent modifier keys and mouse buttons. Called on client disconnect."""
@@ -1157,12 +1166,55 @@ class InProcessSCKBridge:
         _cv.CVPixelBufferGetBytesPerRow.restype     = ctypes.c_size_t
         _cv.CVPixelBufferGetBytesPerRow.argtypes    = [ctypes.c_void_p]
 
+        # CoreMedia audio extraction: get raw PCM from audio CMSampleBuffers.
+        _cm.CMSampleBufferGetNumSamples.restype  = ctypes.c_long
+        _cm.CMSampleBufferGetNumSamples.argtypes = [ctypes.c_void_p]
+        _cm.CMSampleBufferGetDataBuffer.restype  = ctypes.c_void_p
+        _cm.CMSampleBufferGetDataBuffer.argtypes = [ctypes.c_void_p]
+        _cm.CMBlockBufferGetDataPointer.restype  = ctypes.c_int32
+        _cm.CMBlockBufferGetDataPointer.argtypes = [
+            ctypes.c_void_p,                  # theBuffer
+            ctypes.c_size_t,                  # offset
+            ctypes.POINTER(ctypes.c_size_t),  # lengthAtOffsetOut
+            ctypes.POINTER(ctypes.c_size_t),  # totalLengthOut
+            ctypes.POINTER(ctypes.c_void_p),  # dataPointerOut (char**)
+        ]
+
         class _FrameOutputInProc(NSObject):
             # _bridge_ref is a class variable set to the active InProcessSCKBridge before
             # the stream starts.  Using a class variable avoids closure/ObjC registration issues.
             _bridge_ref = None
 
             def stream_didOutputSampleBuffer_ofType_(self_obj, stream, sampleBuffer, outputType):
+                if outputType == 1:
+                    # Audio sample buffer — extract raw PCM and queue for Opus encoding.
+                    if _audio_clients == 0:
+                        return
+                    try:
+                        sb_ptr = _sb_to_ptr(sampleBuffer)
+                        if not sb_ptr:
+                            return
+                        block_buf = _cm.CMSampleBufferGetDataBuffer(sb_ptr)
+                        if not block_buf:
+                            return
+                        length_at = ctypes.c_size_t(0)
+                        total_len = ctypes.c_size_t(0)
+                        data_ptr  = ctypes.c_void_p(0)
+                        if _cm.CMBlockBufferGetDataPointer(
+                                block_buf, 0,
+                                ctypes.byref(length_at), ctypes.byref(total_len),
+                                ctypes.byref(data_ptr)) != 0:
+                            return
+                        if not data_ptr.value or total_len.value == 0:
+                            return
+                        raw = bytes((ctypes.c_char * total_len.value).from_address(data_ptr.value))
+                        try:
+                            _audio_raw_q.put_nowait(raw)
+                        except queue.Full:
+                            pass  # drop — encoder is behind
+                    except Exception:
+                        pass
+                    return
                 if outputType != 0:
                     return
                 bridge = _FrameOutputInProc._bridge_ref
@@ -1256,12 +1308,24 @@ class InProcessSCKBridge:
                 cfg.setHeight_(H)
                 cfg.setPixelFormat_(0x42475241)  # kCVPixelFormatType_32BGRA
                 cfg.setShowsCursor_(True)
-                cfg.setCapturesAudio_(False)
+                cfg.setCapturesAudio_(True)
+                try: cfg.setExcludesCurrentProcessAudio_(True)
+                except AttributeError: pass   # macOS 14+ only
+                try: cfg.setSampleRate_(48000.0)
+                except AttributeError: pass   # macOS 13+
+                try: cfg.setChannelCount_(2)
+                except AttributeError: pass   # macOS 13+
 
                 writer = FO.alloc().init()
                 stream = SCKmod.SCStream.alloc().initWithFilter_configuration_delegate_(filt, cfg, writer)
                 stream.addStreamOutput_type_sampleHandlerQueue_error_(
                     writer, 0, InProcessSCKBridge._sck_queue, None)
+                # Register audio output on the same queue (SCK type 1 = audio).
+                try:
+                    stream.addStreamOutput_type_sampleHandlerQueue_error_(
+                        writer, 1, InProcessSCKBridge._sck_queue, None)
+                except Exception:
+                    pass  # older macOS or audio not available
 
                 _st_ev = threading.Event()
                 _serr  = [None]
@@ -2316,6 +2380,7 @@ canvas{display:block;position:absolute}
     <button class="dock-btn" id="btn-fit">Fit screen</button>
     <button class="dock-btn" id="btn-plock" style="display:none">Pointer lock [off]</button>
     <button class="dock-btn" id="btn-hide-cursor">Hide cursor [off]</button>
+    <button class="dock-btn" id="btn-audio">Audio [off]</button>
     <button class="dock-btn active" id="btn-ctrl">Ctrl=Cmd [on]</button>
     <button class="dock-btn" id="btn-sk">Special keys ▾</button>
     <div id="sk-menu">
@@ -3191,10 +3256,250 @@ document.addEventListener('visibilitychange',()=>{
 window.addEventListener('blur',()=>{
   if(wsOpen)send({t:'reset'});
 });
+// ---------------------------------------------------------------------------
+// Audio — opt-in, separate WebSocket, stays alive when tab is hidden
+// ---------------------------------------------------------------------------
+let _audioEnabled=(()=>{const m=document.cookie.match(/mvs_audio=(\d)/);return m?m[1]==='1':false;})();
+let _audioWs=null,_audioWsOpen=false;
+let _audioCtx=null,_audioDecoder=null;
+let _nextAudioTime=0;
+const _AUDIO_TARGET_LATENCY=0.060; // 60 ms jitter buffer
+const _AUDIO_MAX_LATENCY   =0.200; // reset if buffer grows beyond 200 ms
+
+function _audioSupported(){
+  return typeof AudioDecoder!=='undefined'&&typeof AudioContext!=='undefined';
+}
+
+function _onAudioFrame(audioData){
+  if(!_audioCtx||!_audioEnabled){try{audioData.close();}catch(e){}return;}
+  try{
+    const nCh=audioData.numberOfChannels,nSam=audioData.numberOfFrames,sr=audioData.sampleRate;
+    const buf=_audioCtx.createBuffer(nCh,nSam,sr);
+    for(let ch=0;ch<nCh;ch++){
+      const dst=buf.getChannelData(ch);
+      audioData.copyTo(dst,{planeIndex:ch,format:'f32-planar'});
+    }
+    audioData.close();
+    const now=_audioCtx.currentTime;
+    // Keep latency pinned to target; reset on underrun or runaway.
+    if(_nextAudioTime<now||_nextAudioTime-now>_AUDIO_MAX_LATENCY){
+      _nextAudioTime=now+_AUDIO_TARGET_LATENCY;
+    }
+    const src=_audioCtx.createBufferSource();
+    src.buffer=buf;
+    src.connect(_audioCtx.destination);
+    src.start(_nextAudioTime);
+    _nextAudioTime+=buf.duration;
+  }catch(e){try{audioData.close();}catch(e2){}}
+}
+
+function _initAudioDecoder(){
+  if(_audioDecoder){try{_audioDecoder.close();}catch(e){}}
+  _audioDecoder=null;
+  if(!_audioSupported())return;
+  try{
+    _audioDecoder=new AudioDecoder({
+      output:_onAudioFrame,
+      error:e=>console.warn('AudioDecoder:',e),
+    });
+    _audioDecoder.configure({codec:'opus',sampleRate:48000,numberOfChannels:2});
+  }catch(e){
+    console.warn('AudioDecoder configure failed:',e);
+    _audioDecoder=null;
+  }
+}
+
+function _handleAudioPacket(buf){
+  if(!_audioDecoder||_audioDecoder.state==='closed')return;
+  try{
+    const v=new DataView(buf);
+    // timestamp: 8-byte uint64 big-endian (high 32 + low 32 to avoid BigInt dependency)
+    const ts_us=v.getUint32(0)*4294967296+v.getUint32(4);
+    const opus=buf.slice(8);
+    _audioDecoder.decode(new EncodedAudioChunk({type:'key',timestamp:ts_us,data:opus}));
+  }catch(e){}
+}
+
+function connectAudio(){
+  if(!_audioEnabled||!_audioSupported())return;
+  if(_audioWs){try{_audioWs.close();}catch(e){}}
+  const token=new URLSearchParams(location.search).get('token')||'';
+  const url='ws://'+location.host+'/audio'+(token?'?token='+encodeURIComponent(token):'');
+  _audioWs=new WebSocket(url);
+  _audioWs.binaryType='arraybuffer';
+  _audioWs.onopen=()=>{
+    _audioWsOpen=true;
+    // AudioContext must be created/resumed on a user gesture; the button click counts.
+    if(!_audioCtx)_audioCtx=new AudioContext({sampleRate:48000,latencyHint:'interactive'});
+    if(_audioCtx.state==='suspended')_audioCtx.resume().catch(()=>{});
+    _nextAudioTime=0;
+    _initAudioDecoder();
+  };
+  _audioWs.onclose=()=>{
+    _audioWsOpen=false;
+    if(_audioEnabled)setTimeout(connectAudio,2000);  // auto-reconnect
+  };
+  _audioWs.onerror=()=>{};
+  _audioWs.onmessage=e=>{
+    if(e.data instanceof ArrayBuffer)_handleAudioPacket(e.data);
+  };
+}
+
+function disconnectAudio(){
+  if(_audioWs){try{_audioWs.close();}catch(e){}_audioWs=null;}
+  _audioWsOpen=false;
+  if(_audioDecoder){try{_audioDecoder.close();}catch(e){}_audioDecoder=null;}
+}
+
+const btnAudio=document.getElementById('btn-audio');
+if(!_audioSupported()){
+  btnAudio.disabled=true;
+  btnAudio.title='Audio requires WebCodecs (Chrome/Edge/Safari 16.4+)';
+}
+function _syncAudioBtn(){
+  btnAudio.textContent='Audio ['+ (_audioEnabled?'on':'off')+']';
+  btnAudio.classList.toggle('active',_audioEnabled);
+}
+_syncAudioBtn();
+btnAudio.addEventListener('click',()=>{
+  if(!_audioSupported()){ki.focus();return;}
+  _audioEnabled=!_audioEnabled;
+  document.cookie='mvs_audio='+(_audioEnabled?'1':'0')+';max-age='+(365*86400)+';SameSite=Strict';
+  _syncAudioBtn();
+  if(_audioEnabled)connectAudio();else disconnectAudio();
+  ki.focus();
+});
+// Auto-connect on load if cookie is on (AudioContext will resume on first interaction).
+if(_audioEnabled)connectAudio();
+
 resize();connect();connectMetric();
 </script></body></html>
 """
 HTML_BYTES = HTML.encode("utf-8")
+
+# ---------------------------------------------------------------------------
+# Audio: Opus encoder thread + WebSocket fan-out
+# ---------------------------------------------------------------------------
+def _audio_encoder_thread():
+    """Drain _audio_raw_q, encode PCM→Opus, fan-out to audio subscribers.
+    Started lazily when the first audio WS client connects.
+    Runs for the life of the server; exits only if Opus init fails."""
+    if not _AV_OK:
+        log.warning("Audio encoder: PyAV not available — audio disabled")
+        return
+    try:
+        import av as _av_audio
+        codec_ctx = _av_audio.CodecContext.create('libopus', 'w')
+        codec_ctx.sample_rate = 48000
+        codec_ctx.format = 'fltp'
+        codec_ctx.bit_rate = 64000
+        try:
+            codec_ctx.channel_layout = 'stereo'
+        except (AttributeError, TypeError):
+            codec_ctx.channels = 2
+        codec_ctx.open()
+        log.info("Audio encoder: Opus ready (48 kHz stereo 64 kbps)")
+    except Exception as e:
+        log.warning("Audio encoder: Opus init failed (%s) — audio disabled", e)
+        return
+
+    FRAME_SAMPLES = 960          # 20 ms at 48 kHz (one Opus frame)
+    CHANNELS      = 2
+    FRAME_FLOATS  = FRAME_SAMPLES * CHANNELS  # interleaved float32 count
+    pcm_buf = np.zeros(0, dtype=np.float32)   # accumulation buffer
+    pts     = 0                               # monotonic sample counter
+
+    while True:
+        # Block until a PCM chunk arrives (or 5s timeout to stay responsive).
+        try:
+            raw = _audio_raw_q.get(timeout=5.0)
+        except queue.Empty:
+            continue
+
+        if _audio_clients == 0:
+            # Drain queue without encoding while nobody is listening.
+            while not _audio_raw_q.empty():
+                try: _audio_raw_q.get_nowait()
+                except queue.Empty: break
+            pcm_buf = np.zeros(0, dtype=np.float32)
+            pts = 0
+            continue
+
+        # Append new samples (float32 interleaved from SCK).
+        try:
+            new_samples = np.frombuffer(raw, dtype=np.float32)
+            pcm_buf = np.concatenate([pcm_buf, new_samples])
+        except Exception:
+            continue
+
+        # Encode as many complete 20 ms frames as are available.
+        while len(pcm_buf) >= FRAME_FLOATS:
+            chunk   = pcm_buf[:FRAME_FLOATS]
+            pcm_buf = pcm_buf[FRAME_FLOATS:]
+            try:
+                # Deinterleave and clamp: (2, 960) float32 planar.
+                left  = np.ascontiguousarray(np.clip(chunk[0::2], -1.0, 1.0))
+                right = np.ascontiguousarray(np.clip(chunk[1::2], -1.0, 1.0))
+                planar = np.stack([left, right], axis=0)
+
+                frame = _av_audio.AudioFrame.from_ndarray(planar, format='fltp', layout='stereo')
+                frame.sample_rate = 48000
+                frame.pts         = pts
+
+                for pkt in codec_ctx.encode(frame):
+                    opus_bytes = bytes(pkt)
+                    ts_us = pts * 1_000_000 // 48000
+                    # Wire format: 8-byte uint64 big-endian timestamp (µs) + Opus payload.
+                    msg = struct.pack('>Q', ts_us) + opus_bytes
+                    with _audio_subs_lock:
+                        subs = list(_audio_subs.values())
+                    for aq, lp in subs:
+                        try:
+                            lp.call_soon_threadsafe(aq.put_nowait, msg)
+                        except Exception:
+                            pass  # subscriber gone or queue full
+
+                pts += FRAME_SAMPLES
+            except Exception as e:
+                log.debug("Audio encoder frame: %s", e)
+
+
+async def audio_session(ws):
+    """Stream Opus frames to one audio WebSocket client.
+    Runs independently from the video session — stays alive when tab is hidden."""
+    global _audio_clients, _audio_encoder_started
+    import uuid as _uuid
+
+    qid = _uuid.uuid4().hex
+    aq  = asyncio.Queue(maxsize=200)
+    lp  = asyncio.get_event_loop()
+
+    with _audio_subs_lock:
+        _audio_subs[qid] = (aq, lp)
+    _audio_clients += 1
+    log.info("Audio client connected (total %d)", _audio_clients)
+
+    # Start encoder thread on first subscriber (lazy init).
+    if not _audio_encoder_started:
+        _audio_encoder_started = True
+        threading.Thread(target=_audio_encoder_thread, daemon=True, name="audio-enc").start()
+
+    try:
+        while True:
+            try:
+                msg = await asyncio.wait_for(aq.get(), timeout=10.0)
+                await ws.send(msg)
+            except asyncio.TimeoutError:
+                # Send a WS ping so the connection doesn't silently drop.
+                await ws.ping()
+    except Exception:
+        pass
+    finally:
+        _audio_clients -= 1
+        with _audio_subs_lock:
+            _audio_subs.pop(qid, None)
+        log.info("Audio client disconnected (remaining %d)", _audio_clients)
+
 
 # ---------------------------------------------------------------------------
 # HTTP + WebSocket entry point
@@ -3260,7 +3565,9 @@ def make_ws_handler(cfg, bridge):
         if not _check_token(ws.request.path if hasattr(ws, 'request') else "/", cfg.password):
             await ws.close(1008, "Forbidden")
             return
-        if path == "/metric":
+        if path == "/audio":
+            await audio_session(ws)
+        elif path == "/metric":
             await metric_session(ws)
         else:
             await client_session(ws, cfg, bridge)
