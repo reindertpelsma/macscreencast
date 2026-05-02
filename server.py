@@ -49,6 +49,100 @@ def _encode_jpeg(rgb, quality):
     return buf.getvalue()
 
 # ---------------------------------------------------------------------------
+# CGDisplayImage capture subprocess — Python script sent via -c to sys.executable.
+# Requires Screen Recording (kTCCServiceScreenCapture) to be granted to python3.
+# Writes frames to stdout: magic(4) + W(4LE) + H(4LE) + ts_ms(8LE) + W*H*3 RGB bytes.
+# ---------------------------------------------------------------------------
+_SCSTREAM_CAPTURE_SRC = r"""
+import sys, struct, time, ctypes
+import numpy as np
+
+cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
+
+cg.CGMainDisplayID.restype = ctypes.c_uint32
+cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+cg.CGDisplayCreateImage.restype = ctypes.c_void_p
+cg.CGDisplayCreateImage.argtypes = [ctypes.c_uint32]
+cg.CGImageRelease.argtypes = [ctypes.c_void_p]
+cg.CGImageGetWidth.restype = ctypes.c_size_t
+cg.CGImageGetWidth.argtypes = [ctypes.c_void_p]
+cg.CGImageGetHeight.restype = ctypes.c_size_t
+cg.CGImageGetHeight.argtypes = [ctypes.c_void_p]
+cg.CGImageGetBytesPerRow.restype = ctypes.c_size_t
+cg.CGImageGetBytesPerRow.argtypes = [ctypes.c_void_p]
+cg.CGImageGetDataProvider.restype = ctypes.c_void_p
+cg.CGImageGetDataProvider.argtypes = [ctypes.c_void_p]
+cg.CGDataProviderCopyData.restype = ctypes.c_void_p
+cg.CGDataProviderCopyData.argtypes = [ctypes.c_void_p]
+cf.CFDataGetBytePtr.restype = ctypes.c_void_p
+cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+cf.CFDataGetLength.restype = ctypes.c_long
+cf.CFDataGetLength.argtypes = [ctypes.c_void_p]
+cf.CFRelease.argtypes = [ctypes.c_void_p]
+
+if not cg.CGPreflightScreenCaptureAccess():
+    cg.CGRequestScreenCaptureAccess()
+    sys.stderr.write("Screen Recording not granted\n")
+    sys.exit(1)
+
+disp = cg.CGMainDisplayID()
+out = sys.stdout.buffer
+MAGIC = b'UVNC'
+TARGET_FPS = 60
+interval = 1.0 / TARGET_FPS
+W_prev = H_prev = 0
+bgra_buf = rgb_buf = None
+consec_null = 0
+
+while True:
+    t0 = time.time()
+    img = cg.CGDisplayCreateImage(disp)
+    if not img:
+        consec_null += 1
+        if consec_null > 60:
+            sys.exit(1)
+        time.sleep(0.1)
+        continue
+    consec_null = 0
+    W = cg.CGImageGetWidth(img)
+    H = cg.CGImageGetHeight(img)
+    bpr = cg.CGImageGetBytesPerRow(img)
+    dp = cg.CGImageGetDataProvider(img)
+    data_ref = cg.CGDataProviderCopyData(dp)
+    bptr = cf.CFDataGetBytePtr(data_ref)
+    blen = cf.CFDataGetLength(data_ref)
+    if W != W_prev or H != H_prev:
+        W_prev, H_prev = W, H
+        bgra_buf = np.empty((H, W, 4), dtype=np.uint8)
+        rgb_buf  = np.empty((H, W, 3), dtype=np.uint8)
+    raw = (ctypes.c_ubyte * blen).from_address(bptr)
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    # Copy BGRA rows, handling possible row padding
+    if bpr == W * 4:
+        np.copyto(bgra_buf, arr[:H * W * 4].reshape(H, W, 4))
+    else:
+        for r in range(H):
+            bgra_buf[r] = arr[r * bpr: r * bpr + W * 4].reshape(W, 4)
+    cf.CFRelease(data_ref)
+    cg.CGImageRelease(img)
+    # BGRA → RGB: channels 2, 1, 0 → R, G, B
+    np.copyto(rgb_buf, bgra_buf[:, :, 2::-1])
+    ts = int(t0 * 1000)
+    hdr = MAGIC + struct.pack('<IIQ', W, H, ts)
+    try:
+        out.write(hdr)
+        out.write(rgb_buf.tobytes())
+        out.flush()
+    except BrokenPipeError:
+        break
+    rem = interval - (time.time() - t0)
+    if rem > 0.001:
+        time.sleep(rem)
+"""
+
+# ---------------------------------------------------------------------------
 # Frame wire format
 # Header = 18 bytes:
 #   seq(4)  capture_ms(8)  codec(1)  flags(1)  payload_len(4)
@@ -562,6 +656,150 @@ class VNCBridge:
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
+
+# ---------------------------------------------------------------------------
+# DisplayStreamBridge — direct screen capture via CGDisplayCreateImage subprocess.
+# Requires Screen Recording (kTCCServiceScreenCapture) granted to python3.
+# Falls back gracefully: if no frame within 5s, is_running() returns False and
+# BridgeProxy switches to VNCBridge for all capture calls.
+# ---------------------------------------------------------------------------
+class DisplayStreamBridge:
+    _FRAME_HDR = 20  # magic(4) + W(4LE) + H(4LE) + ts_ms(8LE)
+
+    def __init__(self):
+        self._proc = None
+        self._lock = threading.Lock()
+        self._fb = None
+        self._fb_seq = 0
+        self._fb_ms = 0
+        self._W = 0
+        self._H = 0
+        self._running = False
+
+    def start(self):
+        """Launch the capture subprocess. Returns True when first frame arrives (≤5s)."""
+        import subprocess as _sp
+        self._running = True
+        self._proc = _sp.Popen(
+            [sys.executable, "-c", _SCSTREAM_CAPTURE_SRC],
+            stdout=_sp.PIPE, stderr=_sp.PIPE,
+        )
+        t = threading.Thread(target=self._read_loop, daemon=True)
+        t.start()
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with self._lock:
+                if self._fb is not None:
+                    log.info("DisplayStreamBridge: %dx%d capture active", self._W, self._H)
+                    return True
+            time.sleep(0.05)
+        err = b""
+        if self._proc and self._proc.poll() is not None:
+            err = self._proc.stderr.read(200)
+        log.warning("DisplayStreamBridge: no frame in 5s — %s",
+                    err.decode(errors="replace").strip() or "Screen Recording permission needed")
+        self._running = False
+        return False
+
+    def _read_exact(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self._proc.stdout.read(n - len(buf))
+            if not chunk:
+                raise EOFError("capture helper exited")
+            buf += chunk
+        return bytes(buf)
+
+    def _read_loop(self):
+        try:
+            while self._running:
+                hdr = self._read_exact(self._FRAME_HDR)
+                if hdr[:4] != b'UVNC':
+                    log.warning("DisplayStreamBridge: bad magic %r", hdr[:4])
+                    break
+                W = struct.unpack_from('<I', hdr, 4)[0]
+                H = struct.unpack_from('<I', hdr, 8)[0]
+                ts_ms = struct.unpack_from('<Q', hdr, 12)[0]
+                data = self._read_exact(W * H * 3)
+                rgb = np.frombuffer(data, dtype=np.uint8).reshape(H, W, 3).copy()
+                with self._lock:
+                    self._fb = rgb
+                    self._fb_seq += 1
+                    self._fb_ms = ts_ms if ts_ms else int(time.time() * 1000)
+                    self._W, self._H = W, H
+        except Exception as e:
+            log.warning("DisplayStreamBridge: read loop stopped: %s", e)
+        self._running = False
+
+    @property
+    def dimensions(self):
+        with self._lock:
+            return self._W, self._H
+
+    def get_current_frame(self):
+        with self._lock:
+            if self._fb is None:
+                return None, 0
+            return self._fb, self._fb_ms
+
+    def is_running(self):
+        if not self._running:
+            return False
+        if self._proc and self._proc.poll() is not None:
+            self._running = False
+            return False
+        return True
+
+# ---------------------------------------------------------------------------
+# BridgeProxy — routes capture calls to DisplayStreamBridge (if active) else VNCBridge,
+# and always routes input (key/pointer/clipboard) to VNCBridge.
+# ---------------------------------------------------------------------------
+class BridgeProxy:
+    def __init__(self, vnc, ds=None):
+        self._v = vnc
+        self._d = ds
+
+    def _cap(self):
+        return self._d if (self._d and self._d.is_running()) else self._v
+
+    def get_current_frame(self):
+        return self._cap().get_current_frame()
+
+    @property
+    def _fb_seq(self):
+        return self._cap()._fb_seq
+
+    @property
+    def _fb_ms(self):
+        return self._cap()._fb_ms
+
+    @property
+    def _fbu_count(self):
+        return self._v._fbu_count
+
+    @property
+    def server_clipboard_seq(self):
+        return self._v.server_clipboard_seq
+
+    @property
+    def server_clipboard(self):
+        return self._v.server_clipboard
+
+    @property
+    def dimensions(self):
+        return self._cap().dimensions
+
+    def send_pointer(self, *a, **k):
+        return self._v.send_pointer(*a, **k)
+
+    def send_key(self, *a, **k):
+        return self._v.send_key(*a, **k)
+
+    def send_clipboard(self, *a, **k):
+        return self._v.send_clipboard(*a, **k)
+
+    def send_key_reset(self):
+        return self._v.send_key_reset()
 
 # ---------------------------------------------------------------------------
 # EncoderPipeline — per-client H.264/H.265 with JPEG fallback
@@ -1253,15 +1491,55 @@ canvas{display:block;position:absolute;image-rendering:pixelated}
 #st{position:fixed;bottom:8px;left:50%;transform:translateX(-50%);color:#aaa;
   font:11px monospace;background:rgba(0,0,0,.7);padding:2px 10px;border-radius:3px;
   pointer-events:none;z-index:9}
-/* Hidden textarea captures keyboard + paste without visible UI */
 #ki{position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;
   pointer-events:none;z-index:-1;resize:none;border:0;padding:0}
+/* Dock */
+#dock{position:fixed;left:0;top:50%;transform:translateY(-50%);
+  background:rgba(0,0,0,.82);color:#eee;font:12px/1.5 monospace;
+  border-radius:0 6px 6px 0;z-index:20;user-select:none;overflow:hidden}
+#dock-tab{width:16px;min-height:56px;display:flex;align-items:center;
+  justify-content:center;cursor:pointer;font-size:10px}
+#dock.open #dock-tab{display:none}
+#dock-head{display:none;padding:4px 8px 3px;border-bottom:1px solid rgba(255,255,255,.1);
+  font-size:10px;color:#888}
+#dock.open #dock-head{display:flex;justify-content:space-between}
+#dock-body{display:none;padding:5px 8px 8px;min-width:148px}
+#dock.open #dock-body{display:block}
+.dock-btn{display:block;width:100%;margin:3px 0;padding:5px 7px;
+  background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);
+  border-radius:3px;color:#ccc;cursor:pointer;text-align:left;font:12px monospace}
+.dock-btn:hover{background:rgba(255,255,255,.16);color:#fff}
+.dock-btn.active{background:rgba(70,180,70,.22);border-color:rgba(70,200,70,.4);color:#8f8}
+#sk-menu{display:none;margin-top:3px;padding:3px 0 0;
+  border-top:1px solid rgba(255,255,255,.09)}
+#sk-menu.show{display:block}
+.sk-btn{display:block;width:100%;margin:2px 0;padding:3px 6px;
+  background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
+  border-radius:2px;color:#aaa;cursor:pointer;text-align:left;font:11px monospace}
+.sk-btn:hover{background:rgba(255,255,255,.13);color:#ddd}
 </style></head><body>
 <canvas id="c"></canvas>
-<div id="hud">connecting…</div>
+<div id="hud">connecting...</div>
 <div id="cur"></div>
 <div id="st"></div>
 <textarea id="ki" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+<div id="dock" class="closed">
+  <div id="dock-tab">&gt;</div>
+  <div id="dock-head"><span>Menu</span><span id="dock-close" style="cursor:pointer">[x]</span></div>
+  <div id="dock-body">
+    <button class="dock-btn" id="btn-fs">Fullscreen</button>
+    <button class="dock-btn" id="btn-fit">Fit screen</button>
+    <button class="dock-btn active" id="btn-ctrl">Ctrl=Cmd [on]</button>
+    <button class="dock-btn" id="btn-sk">Special keys</button>
+    <div id="sk-menu">
+      <button class="sk-btn" id="sk-spotlight">Cmd+Space</button>
+      <button class="sk-btn" id="sk-appsw">Cmd+Tab</button>
+      <button class="sk-btn" id="sk-quit">Cmd+Q</button>
+      <button class="sk-btn" id="sk-ctrlc">Ctrl+C</button>
+      <button class="sk-btn" id="sk-cad">Ctrl+Alt+Del</button>
+    </div>
+  </div>
+</div>
 <script>
 const canvas=document.getElementById('c'),ctx=canvas.getContext('2d',{alpha:false,desynchronized:true});
 const hud=document.getElementById('hud'),cur=document.getElementById('cur');
@@ -1269,6 +1547,10 @@ const st=document.getElementById('st'),ki=document.getElementById('ki');
 
 let imgW=1920,imgH=1080,scaleX=1,scaleY=1,ox=0,oy=0;
 let ws,wsOpen=false,mBtn=0,fc=0,lastFpsT=performance.now();
+let fitMode='fit';       // 'fit' = letterbox, 'cover' = fill/crop
+let ctrlToMeta=true;     // remap ControlLeft/Right → MetaLeft (Ctrl → Cmd)
+let _ctrlRemapped={};    // tracks in-flight ctrl→meta remap for keyup pairing
+let _suppressReconnect=false,_hiddenTimer=null;  // tab visibility disconnect
 
 // Metrics
 let rxBytes=0,rxBps=0;         // WebSocket receive bandwidth
@@ -1289,7 +1571,13 @@ function resize(){
   const vw=window.innerWidth,vh=window.innerHeight;
   const ar=imgW/imgH,vr=vw/vh;
   let cw,ch;
-  if(ar>vr){cw=vw;ch=vw/ar}else{ch=vh;cw=vh*ar}
+  if(fitMode==='cover'){
+    // Fill window — canvas may extend beyond edges (clipped by overflow:hidden)
+    if(ar>vr){ch=vh;cw=vh*ar}else{cw=vw;ch=vw/ar}
+  }else{
+    // Letterbox — entire image visible with black bars
+    if(ar>vr){cw=vw;ch=vw/ar}else{ch=vh;cw=vh*ar}
+  }
   ox=(vw-cw)/2;oy=(vh-ch)/2;
   canvas.style.cssText='left:'+ox+'px;top:'+oy+'px;width:'+cw+'px;height:'+ch+'px;position:absolute;';
   scaleX=imgW/cw;scaleY=imgH/ch;
@@ -1462,8 +1750,12 @@ function connect(){
   };
   ws.onclose=()=>{
     wsOpen=false;mBtn=0;hud.textContent='disconnected';
-    st.textContent='reconnecting…';
-    setTimeout(connect,2000);
+    if(_suppressReconnect){
+      st.textContent='paused (tab hidden)';
+    }else{
+      st.textContent='reconnecting...';
+      setTimeout(connect,2000);
+    }
   };
   ws.onerror=()=>{};
   ws.onmessage=e=>{
@@ -1581,16 +1873,21 @@ canvas.addEventListener('touchend',e=>{
 // Keyboard — captured on hidden textarea so CTRL+V fires a paste event
 // ---------------------------------------------------------------------------
 ki.addEventListener('keydown',e=>{
-  // Let CTRL+V / CMD+V fall through to paste event — don't preventDefault
   if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='v')return;
-  send({t:'kd',k:e.key,code:e.code});
+  let code=e.code,key=e.key;
+  // Ctrl→Cmd: remap ControlLeft/Right to MetaLeft so Ctrl+A = Cmd+A (select all), etc.
+  if(ctrlToMeta&&!e.metaKey&&(code==='ControlLeft'||code==='ControlRight')){
+    _ctrlRemapped[code]='MetaLeft';
+    code=key='MetaLeft';
+  }
+  send({t:'kd',k:key,code:code});
   e.preventDefault();
 });
 ki.addEventListener('keyup',e=>{
-  // Paste combo (Ctrl+V / Cmd+V): keydown was suppressed, so skip keyup too.
-  // The server's paste handler already sent the full Meta+V sequence.
   if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='v')return;
-  send({t:'ku',k:e.key,code:e.code});
+  let code=e.code,key=e.key;
+  if(_ctrlRemapped[e.code]){code=key=_ctrlRemapped[e.code];delete _ctrlRemapped[e.code];}
+  send({t:'ku',k:key,code:code});
   e.preventDefault();
 });
 
@@ -1609,11 +1906,90 @@ canvas.addEventListener('click',()=>ki.focus());
 window.addEventListener('focus',()=>ki.focus());
 
 // ---------------------------------------------------------------------------
-// Init
+// Dock UI
 // ---------------------------------------------------------------------------
-// Release stuck keys/buttons when the tab regains focus (e.g. after Alt+Tab)
+const dock=document.getElementById('dock');
+const dockTab=document.getElementById('dock-tab');
+function dockOpen(o){
+  dock.classList.toggle('open',o);
+  dock.classList.toggle('closed',!o);
+  dockTab.textContent=o?'<':'>';
+}
+dockTab.addEventListener('click',()=>dockOpen(true));
+document.getElementById('dock-close').addEventListener('click',()=>{dockOpen(false);ki.focus();});
+
+document.getElementById('btn-fs').addEventListener('click',()=>{
+  if(!document.fullscreenElement)document.documentElement.requestFullscreen().catch(()=>{});
+  else document.exitFullscreen().catch(()=>{});
+  ki.focus();
+});
+
+const btnFit=document.getElementById('btn-fit');
+btnFit.addEventListener('click',()=>{
+  fitMode=fitMode==='fit'?'cover':'fit';
+  btnFit.textContent=fitMode==='cover'?'Fill screen':'Fit screen';
+  btnFit.classList.toggle('active',fitMode==='cover');
+  resize();ki.focus();
+});
+
+const btnCtrl=document.getElementById('btn-ctrl');
+btnCtrl.addEventListener('click',()=>{
+  ctrlToMeta=!ctrlToMeta;
+  _ctrlRemapped={};  // clear any in-flight remaps
+  btnCtrl.textContent='Ctrl=Cmd ['+(ctrlToMeta?'on':'off')+']';
+  btnCtrl.classList.toggle('active',ctrlToMeta);
+  ki.focus();
+});
+
+const btnSk=document.getElementById('btn-sk');
+const skMenu=document.getElementById('sk-menu');
+btnSk.addEventListener('click',()=>{
+  const show=skMenu.classList.toggle('show');
+  btnSk.classList.toggle('active',show);
+});
+
+function sendSpecial(pairs){
+  for(const[k,down]of pairs)send({t:down?'kd':'ku',k,code:k});
+}
+document.getElementById('sk-spotlight').addEventListener('click',()=>{
+  sendSpecial([['MetaLeft',true],[' ',true],[' ',false],['MetaLeft',false]]);ki.focus();
+});
+document.getElementById('sk-appsw').addEventListener('click',()=>{
+  sendSpecial([['MetaLeft',true],['Tab',true],['Tab',false],['MetaLeft',false]]);ki.focus();
+});
+document.getElementById('sk-quit').addEventListener('click',()=>{
+  sendSpecial([['MetaLeft',true],['q',true],['q',false],['MetaLeft',false]]);ki.focus();
+});
+document.getElementById('sk-ctrlc').addEventListener('click',()=>{
+  sendSpecial([['ControlLeft',true],['c',true],['c',false],['ControlLeft',false]]);ki.focus();
+});
+document.getElementById('sk-cad').addEventListener('click',()=>{
+  sendSpecial([['ControlLeft',true],['AltLeft',true],['Delete',true],
+               ['Delete',false],['AltLeft',false],['ControlLeft',false]]);ki.focus();
+});
+
+// ---------------------------------------------------------------------------
+// Init + visibility-based disconnect
+// ---------------------------------------------------------------------------
 document.addEventListener('visibilitychange',()=>{
-  if(!document.hidden&&wsOpen)send({t:'reset'});
+  if(document.hidden){
+    // Disconnect after 30s hidden to save bandwidth
+    _hiddenTimer=setTimeout(()=>{
+      if(document.hidden){
+        _suppressReconnect=true;
+        if(ws&&wsOpen)ws.close(1000,'tab-idle');
+      }
+    },30000);
+  }else{
+    clearTimeout(_hiddenTimer);_hiddenTimer=null;
+    if(_suppressReconnect){
+      _suppressReconnect=false;
+      connect();
+    }else if(wsOpen){
+      send({t:'reset'});
+    }
+    ki.focus();
+  }
 });
 window.addEventListener('blur',()=>{
   if(wsOpen)send({t:'reset'});
@@ -1716,17 +2092,19 @@ def parse_args():
                    help="Optional access token for WebSocket URL (?token=...)")
     return p.parse_args()
 
-async def _main(cfg):
+async def _main(cfg, ds=None):
     from websockets import serve
-    bridge = VNCBridge(cfg)
-    bridge.start()
+    vnc = VNCBridge(cfg)
+    vnc.start()
+    bridge = BridgeProxy(vnc, ds)
 
     http_handler = make_http_handler(cfg, bridge)
     ws_handler = make_ws_handler(cfg, bridge)
 
+    cap_mode = "CGDisplayImage" if (ds and ds.is_running()) else "VNC"
     handler = lambda ws: ws_handler(ws)
-    log.info("Listening %s:%d  codec=%s  max_fps=%d",
-             cfg.listen, cfg.port, cfg.codec, cfg.max_fps)
+    log.info("Listening %s:%d  codec=%s  max_fps=%d  capture=%s",
+             cfg.listen, cfg.port, cfg.codec, cfg.max_fps, cap_mode)
     async with serve(handler, cfg.listen, cfg.port,
                      process_request=http_handler,
                      max_size=None, compression=None):
@@ -1810,7 +2188,7 @@ try:
     import threading as _threading
     def _hid_keepalive():
         while True:
-            _time.sleep(25)
+            time.sleep(25)
             try:
                 mp = AppKit.NSEvent.mouseLocation()
                 sh = AppKit.NSScreen.mainScreen().frame().size.height
@@ -1855,8 +2233,7 @@ def _start_compositor_keepalive():
         log.warning("compositor keepalive unavailable: %s", e)
 
 def _request_accessibility():
-    """Open System Settings → Accessibility if Python isn't trusted yet.
-    macOS requires kCGHIDEventTap-posting processes to have Accessibility permission."""
+    """Open System Settings → Accessibility if Python isn't trusted yet."""
     try:
         import ctypes
         ax = ctypes.cdll.LoadLibrary(
@@ -1875,16 +2252,41 @@ def _request_accessibility():
     except Exception as e:
         log.debug("accessibility check: %s", e)
 
+def _check_screen_capture():
+    """Check Screen Recording permission; trigger TCC dialog if not granted.
+    Returns True if permission is granted. The capture subprocess uses the same
+    Python binary identity, so this grant covers DisplayStreamBridge too."""
+    try:
+        import ctypes
+        cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+        if cg.CGPreflightScreenCaptureAccess():
+            log.info("Screen Recording: granted — CGDisplayImage capture available")
+            return True
+        log.warning("Screen Recording: not granted — showing permission dialog. "
+                    "Grant in System Settings → Privacy → Screen Recording, then restart server.")
+        cg.CGRequestScreenCaptureAccess()
+        return False
+    except Exception as e:
+        log.debug("screen capture check: %s", e)
+        return False
+
 def main():
     cfg = parse_args()
     if not cfg.vnc_pass and not (cfg.macos_user and cfg.macos_pass):
         print("Error: provide --vnc-pass or --macos-user + --macos-pass")
         raise SystemExit(1)
-    target = CODEC_H264 if cfg.codec=="h264" else CODEC_H265 if cfg.codec=="h265" else CODEC_JPEG
     log.info("Target codec: %s (PyAV: %s)", cfg.codec, "yes" if _AV_OK else "NO — pip install av")
     _request_accessibility()
     _start_compositor_keepalive()
-    asyncio.run(_main(cfg))
+    ds = None
+    if _check_screen_capture():
+        ds = DisplayStreamBridge()
+        if not ds.start():
+            log.warning("DisplayStreamBridge failed — falling back to VNC capture")
+            ds = None
+    asyncio.run(_main(cfg, ds))
 
 if __name__=="__main__":
     main()
