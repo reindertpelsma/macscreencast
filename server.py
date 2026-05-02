@@ -2030,12 +2030,10 @@ document.getElementById('dock-close').addEventListener('click',()=>{dockOpen(fal
 const _LOCK_KEYS=['Escape','Tab','F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12'];
 document.addEventListener('fullscreenchange',async()=>{
   if(document.fullscreenElement){
-    if(navigator.keyboard&&navigator.keyboard.lock){
-      try{await navigator.keyboard.lock(_LOCK_KEYS);}catch(e){}
-    }
+    try{if(navigator.keyboard)await navigator.keyboard.lock(_LOCK_KEYS);}catch(e){}
     ki.focus();
   }else{
-    if(navigator.keyboard&&navigator.keyboard.unlock)navigator.keyboard.unlock();
+    try{if(navigator.keyboard)navigator.keyboard.unlock();}catch(e){}
   }
 });
 document.getElementById('btn-fs').addEventListener('click',()=>{
