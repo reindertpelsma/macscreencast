@@ -2091,7 +2091,8 @@ async def client_session(ws, cfg, bridge):
                 pass
         nonlocal _enc_target_w, _enc_target_h, _reinit_deadline
         last_encoder_codec = encoder.actual_codec
-        _bw_sent = []   # list of (monotonic_time, bytes) for rolling 1s bandwidth measurement
+        _bw_sent = []       # list of (monotonic_time, bytes) for rolling 1s bandwidth measurement
+        _need_keyframe = False  # force I-frame after encoder rebuild to unblock fresh decoder
         _t_diag = time.monotonic(); _n_diag = 0; _n_drop = 0; _n_nosend = 0
         _last_vnc_fbu = bridge._fbu_count
         # Pipelined encode: start encoding during the rate-limit sleep so that
@@ -2119,7 +2120,9 @@ async def client_session(ws, cfg, bridge):
                 fps, bitrate, jq = ctrl.snapshot()
                 interval = 1.0 / max(1.0, fps)
 
-                # Detect encoder codec switch (JPEG→H.264) — drain in-flight encode first
+                # Detect encoder codec switch — drain in-flight encode and force I-frame.
+                # After encoder rebuild the warmup consumed the I-frame; without an explicit
+                # keyframe the client's fresh VideoDecoder has no reference frame and freezes.
                 current_codec = encoder.actual_codec
                 if current_codec != last_encoder_codec:
                     last_encoder_codec = current_codec
@@ -2127,6 +2130,7 @@ async def client_session(ws, cfg, bridge):
                         try: await _pipe_task
                         except Exception: pass
                         _pipe_task = None
+                    _need_keyframe = True
 
                 # Write buffer check — immediate local backpressure.
                 # Threshold is fps+bitrate-aware (lag_wb_budget) so a single
@@ -2218,7 +2222,11 @@ async def client_session(ws, cfg, bridge):
                         encoder.set_bitrate(bitrate)
                         _pipe_cap_ms = cap_ms
                         _pipe_enc_seq = cur_fb_seq
-                        _pipe_task = loop.run_in_executor(None, encoder.encode, fb, cap_ms, jq)
+                        if _need_keyframe:
+                            _need_keyframe = False
+                            _pipe_task = loop.run_in_executor(None, encoder.encode_keyframe, fb, cap_ms, 85)
+                        else:
+                            _pipe_task = loop.run_in_executor(None, encoder.encode, fb, cap_ms, jq)
 
                 # Rate limit using deadline: last_send_time advances by interval each frame
                 # so encode + send time is absorbed and doesn't compound into the next sleep.
@@ -2245,8 +2253,13 @@ async def client_session(ws, cfg, bridge):
                         continue
                     encoder.set_bitrate(bitrate)
                     try:
-                        payload, is_kf, codec_byte = await loop.run_in_executor(
-                            None, encoder.encode, fb, cap_ms, jq)
+                        if _need_keyframe:
+                            _need_keyframe = False
+                            payload, is_kf, codec_byte = await loop.run_in_executor(
+                                None, encoder.encode_keyframe, fb, cap_ms, 85)
+                        else:
+                            payload, is_kf, codec_byte = await loop.run_in_executor(
+                                None, encoder.encode, fb, cap_ms, jq)
                     except Exception as e:
                         log.debug("encode err: %s", e); continue
                 else:
@@ -3623,10 +3636,15 @@ def _audio_encoder_thread():
             pts = 0
             continue
 
-        # Append new samples (float32 interleaved from SCK).
+        # Append new samples. SCK delivers float32 non-interleaved (planar): [L×N, R×N].
+        # libopus 'flt' expects interleaved [L0,R0,L1,R1,...], so we must interleave.
         try:
-            new_samples = np.frombuffer(raw, dtype=np.float32)
-            pcm_buf = np.concatenate([pcm_buf, new_samples])
+            planar = np.frombuffer(raw, dtype=np.float32)
+            n = len(planar) // 2
+            interleaved_in = np.empty(len(planar), dtype=np.float32)
+            interleaved_in[0::2] = planar[:n]   # left channel
+            interleaved_in[1::2] = planar[n:]   # right channel
+            pcm_buf = np.concatenate([pcm_buf, interleaved_in])
         except Exception:
             continue
 
