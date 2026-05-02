@@ -1560,6 +1560,23 @@ canvas{display:block;position:absolute;image-rendering:pixelated}
   background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);
   border-radius:2px;color:#aaa;cursor:pointer;text-align:left;font:11px monospace}
 .sk-btn:hover{background:rgba(255,255,255,.13);color:#ddd}
+#clip-section{margin-top:5px;padding-top:5px;border-top:1px solid rgba(255,255,255,.09)}
+#clip-ta{width:100%;height:54px;margin:3px 0;background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.14);border-radius:3px;color:#ccc;
+  font:11px monospace;resize:vertical;padding:3px 5px}
+#clip-ta:focus{outline:1px solid rgba(100,180,255,.5);color:#fff}
+.clip-row{display:flex;gap:4px;margin:2px 0}
+.clip-row button{flex:1;padding:3px 0;font:11px monospace;
+  background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);
+  border-radius:3px;color:#ccc;cursor:pointer}
+.clip-row button:hover{background:rgba(255,255,255,.18);color:#fff}
+#sk-custom{margin-top:4px;padding-top:4px;border-top:1px solid rgba(255,255,255,.07)}
+.mod-row{display:flex;gap:4px;flex-wrap:wrap;margin:3px 0}
+.mod-cb{display:flex;align-items:center;gap:2px;color:#aaa;font:11px monospace;cursor:pointer}
+.mod-cb input{cursor:pointer;accent-color:#6b6}
+#sk-key-input{width:100%;margin:2px 0;padding:3px 5px;background:rgba(255,255,255,.07);
+  border:1px solid rgba(255,255,255,.14);border-radius:3px;color:#ccc;font:11px monospace}
+#sk-key-input:focus{outline:1px solid rgba(100,180,255,.5);color:#fff}
 </style></head><body>
 <canvas id="c"></canvas>
 <div id="hud">connecting...</div>
@@ -1573,13 +1590,33 @@ canvas{display:block;position:absolute;image-rendering:pixelated}
     <button class="dock-btn" id="btn-fs">Fullscreen</button>
     <button class="dock-btn" id="btn-fit">Fit screen</button>
     <button class="dock-btn active" id="btn-ctrl">Ctrl=Cmd [on]</button>
-    <button class="dock-btn" id="btn-sk">Special keys</button>
+    <button class="dock-btn" id="btn-sk">Special keys ▾</button>
     <div id="sk-menu">
-      <button class="sk-btn" id="sk-spotlight">Cmd+Space</button>
-      <button class="sk-btn" id="sk-appsw">Cmd+Tab</button>
-      <button class="sk-btn" id="sk-quit">Cmd+Q</button>
-      <button class="sk-btn" id="sk-ctrlc">Ctrl+C</button>
+      <button class="sk-btn" id="sk-spotlight">Cmd+Space (Spotlight)</button>
+      <button class="sk-btn" id="sk-appsw">Cmd+Tab (App switch)</button>
+      <button class="sk-btn" id="sk-quit">Cmd+Q (Quit)</button>
+      <button class="sk-btn" id="sk-esc">Escape</button>
+      <button class="sk-btn" id="sk-tab">Tab</button>
+      <button class="sk-btn" id="sk-f11">F11</button>
+      <button class="sk-btn" id="sk-f12">F12</button>
       <button class="sk-btn" id="sk-cad">Ctrl+Alt+Del</button>
+      <div id="sk-custom">
+        <div class="mod-row">
+          <label class="mod-cb"><input type="checkbox" id="mod-shift">Shift</label>
+          <label class="mod-cb"><input type="checkbox" id="mod-ctrl">Ctrl</label>
+          <label class="mod-cb"><input type="checkbox" id="mod-alt">Alt</label>
+          <label class="mod-cb"><input type="checkbox" id="mod-cmd">Cmd</label>
+        </div>
+        <input id="sk-key-input" placeholder="key or F1…F12 then Enter" autocomplete="off" spellcheck="false">
+      </div>
+    </div>
+    <div id="clip-section">
+      <div style="color:#666;font:10px monospace;margin-bottom:2px">Clipboard (Mac→here)</div>
+      <textarea id="clip-ta" placeholder="Mac clipboard appears here. Edit then Paste↓" spellcheck="false"></textarea>
+      <div class="clip-row">
+        <button id="clip-paste">Paste on Mac</button>
+        <button id="clip-clear">Clear</button>
+      </div>
     </div>
   </div>
 </div>
@@ -1808,7 +1845,8 @@ function connect(){
         if(msg.t==='stale'){
           staleMs=msg.ms||0;
         }else if(msg.t==='clipboard'){
-          // Mac clipboard → browser clipboard
+          // Mac clipboard → dock textarea + browser clipboard
+          clipTA.value=msg.text;
           if(navigator.clipboard&&navigator.clipboard.writeText)
             navigator.clipboard.writeText(msg.text).catch(()=>{});
           st.textContent='[clipboard] '+msg.text.substring(0,50);
@@ -1913,41 +1951,64 @@ canvas.addEventListener('touchend',e=>{
 },{passive:false});
 
 // ---------------------------------------------------------------------------
-// Keyboard — captured on hidden textarea so CTRL+V fires a paste event
+// Keyboard — captured on hidden textarea
 // ---------------------------------------------------------------------------
-ki.addEventListener('keydown',e=>{
-  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='v')return;
+
+// Send text to Mac by typing it character-by-character (bypasses clipboard sync)
+function sendPasteText(text){
+  if(text&&wsOpen)send({t:'paste',text});
+}
+
+// Read browser clipboard and paste to Mac.
+// Uses navigator.clipboard.readText() (requires focus+permission or HTTPS).
+// Falls back to showing the clipboard textarea so user can paste manually.
+async function pasteFromBrowserClipboard(){
+  let text='';
+  try{
+    if(navigator.clipboard&&navigator.clipboard.readText)
+      text=await navigator.clipboard.readText();
+  }catch(e){}
+  if(text){sendPasteText(text);return;}
+  // Clipboard API blocked — open dock clipboard textarea for manual paste
+  dockOpen(true);
+  clipTA.focus();
+  clipTA.select();
+  st.textContent='Paste your text into the box, then click "Paste on Mac"';
+}
+
+ki.addEventListener('keydown',async e=>{
   let code=e.code,key=e.key;
-  // Ctrl→Cmd: remap ControlLeft/Right → MetaLeft so Ctrl+A=Cmd+A, Ctrl+Shift+G=Cmd+Shift+G, etc.
-  // Do NOT preventDefault on the modifier itself so the browser still fires paste/copy events.
+  // Ctrl→Cmd: remap ControlLeft/Right → MetaLeft (Ctrl+A=Cmd+A, Ctrl+C=Cmd+C, etc.)
   if(ctrlToMeta&&!e.metaKey&&(code==='ControlLeft'||code==='ControlRight')){
     _ctrlRemapped[code]='MetaLeft';
     code=key='MetaLeft';
     send({t:'kd',k:key,code:code});
-    // Skip preventDefault on the Ctrl key itself so subsequent Shift etc. work correctly
+    return; // no preventDefault — let browser Shift etc. still track modifier state
+  }
+  // Ctrl+V / Cmd+V: read browser clipboard explicitly; do NOT send 'v' to VNC
+  if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){
+    e.preventDefault();
+    await pasteFromBrowserClipboard();
     return;
   }
   send({t:'kd',k:key,code:code});
   e.preventDefault();
 });
 ki.addEventListener('keyup',e=>{
-  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='v')return;
   let code=e.code,key=e.key;
   if(_ctrlRemapped[e.code]){code=key=_ctrlRemapped[e.code];delete _ctrlRemapped[e.code];}
+  // suppress V keyup if a paste was in progress (ctrlKey or metaKey still held)
+  if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){e.preventDefault();return;}
   send({t:'ku',k:key,code:code});
   e.preventDefault();
 });
 
-// Paste event — on ki (focused path) and document (fallback when ki loses focus)
-function _doPaste(e){
-  const text=(e.clipboardData||window.clipboardData).getData('text/plain');
-  if(text&&wsOpen){send({t:'paste',text});}
-  e.preventDefault();
-  ki.value='';
-}
-ki.addEventListener('paste',_doPaste);
-// Document-level fallback: catches paste even when dock or other UI stole focus
-document.addEventListener('paste',e=>{if(document.activeElement!==ki)_doPaste(e);});
+// Document-level paste fallback (when dock or other UI has focus)
+document.addEventListener('paste',e=>{
+  if(document.activeElement===clipTA)return; // let user paste into clipboard textarea
+  const text=(e.clipboardData||window.clipboardData||{}).getData('text/plain');
+  if(text&&wsOpen){sendPasteText(text);e.preventDefault();}
+});
 
 // Refocus hidden textarea on canvas click and window focus so keyboard events route correctly
 canvas.addEventListener('click',()=>ki.focus());
@@ -1966,6 +2027,17 @@ function dockOpen(o){
 dockTab.addEventListener('click',()=>dockOpen(true));
 document.getElementById('dock-close').addEventListener('click',()=>{dockOpen(false);ki.focus();});
 
+const _LOCK_KEYS=['Escape','Tab','F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12'];
+document.addEventListener('fullscreenchange',async()=>{
+  if(document.fullscreenElement){
+    if(navigator.keyboard&&navigator.keyboard.lock){
+      try{await navigator.keyboard.lock(_LOCK_KEYS);}catch(e){}
+    }
+    ki.focus();
+  }else{
+    if(navigator.keyboard&&navigator.keyboard.unlock)navigator.keyboard.unlock();
+  }
+});
 document.getElementById('btn-fs').addEventListener('click',()=>{
   if(!document.fullscreenElement)document.documentElement.requestFullscreen().catch(()=>{});
   else document.exitFullscreen().catch(()=>{});
@@ -1991,6 +2063,7 @@ btnCtrl.addEventListener('click',()=>{
 
 const btnSk=document.getElementById('btn-sk');
 const skMenu=document.getElementById('sk-menu');
+const clipTA=document.getElementById('clip-ta');
 btnSk.addEventListener('click',()=>{
   const show=skMenu.classList.toggle('show');
   btnSk.classList.toggle('active',show);
@@ -2008,13 +2081,48 @@ document.getElementById('sk-appsw').addEventListener('click',()=>{
 document.getElementById('sk-quit').addEventListener('click',()=>{
   sendSpecial([['MetaLeft',true],['q',true],['q',false],['MetaLeft',false]]);ki.focus();
 });
-document.getElementById('sk-ctrlc').addEventListener('click',()=>{
-  sendSpecial([['ControlLeft',true],['c',true],['c',false],['ControlLeft',false]]);ki.focus();
+document.getElementById('sk-esc').addEventListener('click',()=>{
+  sendSpecial([['Escape',true],['Escape',false]]);ki.focus();
+});
+document.getElementById('sk-tab').addEventListener('click',()=>{
+  sendSpecial([['Tab',true],['Tab',false]]);ki.focus();
+});
+document.getElementById('sk-f11').addEventListener('click',()=>{
+  sendSpecial([['F11',true],['F11',false]]);ki.focus();
+});
+document.getElementById('sk-f12').addEventListener('click',()=>{
+  sendSpecial([['F12',true],['F12',false]]);ki.focus();
 });
 document.getElementById('sk-cad').addEventListener('click',()=>{
   sendSpecial([['ControlLeft',true],['AltLeft',true],['Delete',true],
                ['Delete',false],['AltLeft',false],['ControlLeft',false]]);ki.focus();
 });
+
+// Custom key sender: modifier checkboxes + key input
+document.getElementById('sk-key-input').addEventListener('keydown',e=>{
+  if(e.key!=='Enter')return;
+  e.preventDefault();
+  const raw=e.target.value.trim();
+  if(!raw)return;
+  const mods=[];
+  if(document.getElementById('mod-shift').checked)mods.push('ShiftLeft');
+  if(document.getElementById('mod-ctrl').checked)mods.push('ControlLeft');
+  if(document.getElementById('mod-alt').checked)mods.push('AltLeft');
+  if(document.getElementById('mod-cmd').checked)mods.push('MetaLeft');
+  const dn=mods.map(m=>[m,true]);
+  const up=mods.slice().reverse().map(m=>[m,false]);
+  sendSpecial([...dn,[raw,true],[raw,false],...up]);
+  e.target.value='';
+  ki.focus();
+});
+
+// Clipboard textarea — paste on Mac button
+document.getElementById('clip-paste').addEventListener('click',()=>{
+  const text=clipTA.value;
+  if(text&&wsOpen){sendPasteText(text);st.textContent='Pasted '+text.length+' chars';}
+  ki.focus();
+});
+document.getElementById('clip-clear').addEventListener('click',()=>{clipTA.value='';ki.focus();});
 
 // ---------------------------------------------------------------------------
 // Init + visibility-based disconnect
