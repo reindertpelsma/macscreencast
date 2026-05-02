@@ -1666,24 +1666,27 @@ class AdaptiveController:
         """Reduce quality. Must be called with _lock held; enforces 300ms debounce.
 
         Priority: cut bitrate (quality) first — preserves fps (input responsiveness).
-        fps is only reduced as a last resort when bitrate is already at the floor,
-        because lower fps means longer frame intervals which increases lag further."""
+        fps is only reduced as a last resort when bitrate is already at the floor.
+        fps floor is derived from lag_budget_ms so it never goes below one frame per
+        budget period — e.g. at 50ms budget, min fps = 20 (not 5)."""
         now = time.monotonic()
         if now - self._last_slow < 0.3:
             return
         self._last_slow = now
         self._last_fast = 0.0
         factor = 0.5 if severe else 0.75
+        # fps floor: never slower than one frame per budget window
+        min_fps = max(self._min_fps, 1000.0 / self.lag_budget_ms())
         if self.bitrate > self._min_br:
             # Save congestion point before reducing — this is the network ceiling (SSTHRESH).
             # On recovery, ramp fast back to here, probe slowly above.
             self._ceil_bitrate = self.bitrate
             self.bitrate = max(self._min_br, int(self.bitrate * factor))
             self.jpeg_quality = max(10, int(self.jpeg_quality * factor))
-        elif self.fps > self._min_fps:
-            self.fps = max(self._min_fps, self.fps * factor)
-        log.debug("backoff: fps=%.1f br=%dk ceil=%dk severe=%s",
-                  self.fps, self.bitrate // 1000, self._ceil_bitrate // 1000, severe)
+        elif self.fps > min_fps:
+            self.fps = max(min_fps, self.fps * factor)
+        log.debug("backoff: fps=%.1f br=%dk ceil=%dk severe=%s min_fps=%.1f",
+                  self.fps, self.bitrate // 1000, self._ceil_bitrate // 1000, severe, min_fps)
 
     def lag_budget_ms(self):
         """Allowed in-flight delay before congestion backoff fires.
@@ -1743,12 +1746,15 @@ class AdaptiveController:
                     log.debug("ping gradient=%.1fms rtt=%.1fms", gradient, s)
 
             # Signal 2: delta — buffer STATIC (only when gradient hasn't already fired)
-            # 50ms tolerance = expected 1-frame-in-buffer offset; anything above is real queuing.
+            # Threshold scales with lag budget: at 50ms budget fire at 50ms delta;
+            # at 200ms budget fire at 200ms delta (user explicitly allows that much queuing).
             if not gradient_fired and self._metric_rtt > 0:
                 delta = s - self._metric_rtt
-                if delta > 50:
-                    self._backoff(delta > 150)
-                    log.debug("ping delta=%.1fms rtt=%.1fms metric=%.1fms", delta, s, self._metric_rtt)
+                budget = self.lag_budget_ms()
+                if delta > budget:
+                    self._backoff(delta > budget * 2)
+                    log.debug("ping delta=%.1fms rtt=%.1fms metric=%.1fms budget=%.0fms",
+                              delta, s, self._metric_rtt, budget)
 
     def on_metric_rtt(self, rtt_ms):
         """RTT on the unloaded metric channel — pure link latency, no video queuing.
