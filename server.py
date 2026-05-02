@@ -1169,8 +1169,11 @@ class InProcessSCKBridge:
                 if bridge is None:
                     return
                 try:
-                    if _active_clients == 0:
-                        return  # no viewers — skip frame processing to save CPU/battery
+                    # Skip expensive pixel copy when no clients are watching AND we already
+                    # have a valid frame stored (the startup probe needs at least one frame
+                    # to succeed, so skip only after _fb is set).
+                    if _active_clients == 0 and bridge._fb is not None:
+                        return
                     sb_ptr = _sb_to_ptr(sampleBuffer)
                     if not sb_ptr:
                         return
