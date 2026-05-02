@@ -334,14 +334,14 @@ def _cg_send_pointer(buttons: int, x: int, y: int) -> bool:
     """Send mouse move/click via CGEvent (kCGHIDEventTap).
 
     Coordinates are in VNC space (top-left origin, logical pixels).
-    CGEvent uses bottom-left origin so Y is flipped via screen height.
+    CGEvent (CoreGraphics) also uses top-left origin with Y increasing downward,
+    so VNC coordinates map directly — no Y-flip needed.
     Returns True on success; caller falls back to VNC on False.
     """
     global _cg_mouse_prev_btn
     try:
-        import Quartz as _Q, AppKit as _AK
-        sh = _AK.NSScreen.mainScreen().frame().size.height
-        pt = _Q.CGPoint(x, sh - y)
+        import Quartz as _Q
+        pt = _Q.CGPoint(x, y)
         changed = buttons ^ _cg_mouse_prev_btn
         _cg_mouse_prev_btn = buttons
 
