@@ -2454,6 +2454,13 @@ canvas{display:block;position:absolute}
         <option value="2000">2 Mbps</option>
         <option value="1000">1 Mbps</option>
       </select></div>
+      <div class="q-row"><label>Codec</label><select class="q-sel" id="q-codec">
+        <option value="auto">Auto</option>
+        <!-- populated after WebCodecs probe -->
+      </select></div>
+      <div style="margin-top:6px">
+        <button class="dock-btn" id="q-reset" style="width:100%;font-size:10px;padding:3px 0">Reset to defaults</button>
+      </div>
     </div>
   </div>
 </div>
@@ -2668,21 +2675,43 @@ const _Q_PRESETS=[
   {label:'1080p (Full HD)',h:1080},{label:'720p (HD)',h:720},
   {label:'480p (SD)',h:480},{label:'360p',h:360},{label:'240p',h:240},
 ];
-let _qCapH=0,_qFps=0,_qBwKbps=25000,_qMenuBuilt=false;
+let _qCapH=0,_qFps=0,_qBwKbps=25000,_qCodec='auto',_qMenuBuilt=false;
+let _probedCodecs=[]; // filled after WebCodecs probe; used to populate codec select
 
 function _qCookie(){
-  // Returns {cap_h, fps, bw} from cookie, or defaults.
-  const m=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+)/);
-  if(m)return{cap_h:parseInt(m[1]),fps:parseInt(m[2]),bw:parseInt(m[3])};
-  // Legacy cookie without bw field
-  const m2=document.cookie.match(/mvs_q=(\d+),(\d+)/);
-  return m2?{cap_h:parseInt(m2[1]),fps:parseInt(m2[2]),bw:25000}:{cap_h:0,fps:0,bw:25000};
+  const m=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+),([^;]*)/);
+  if(m)return{cap_h:parseInt(m[1]),fps:parseInt(m[2]),bw:parseInt(m[3]),codec:m[4]||'auto'};
+  // legacy cookies without bw/codec fields
+  const m2=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+)/);
+  if(m2)return{cap_h:parseInt(m2[1]),fps:parseInt(m2[2]),bw:parseInt(m2[3]),codec:'auto'};
+  const m3=document.cookie.match(/mvs_q=(\d+),(\d+)/);
+  return m3?{cap_h:parseInt(m3[1]),fps:parseInt(m3[2]),bw:25000,codec:'auto'}:{cap_h:0,fps:0,bw:25000,codec:'auto'};
 }
 function _qSaveCookie(){
-  document.cookie='mvs_q='+_qCapH+','+_qFps+','+_qBwKbps+';max-age='+(365*86400)+';SameSite=Strict';
+  document.cookie='mvs_q='+_qCapH+','+_qFps+','+_qBwKbps+','+_qCodec+';max-age='+(365*86400)+';SameSite=Strict';
 }
 function sendQuality(){
   send({t:'quality',cap_h:_qCapH,fps:_qFps,maxkbps:_qBwKbps});
+}
+// Send codec choice as a caps update. 'auto' uses the full probed list;
+// a specific codec restricts to just that one; 'jpeg' forces JPEG fallback.
+function sendCaps(probed){
+  const list=probed||_probedCodecs;
+  if(_qCodec==='auto'){
+    useVideo=list.length>0;
+    send({t:'caps',webcodecs:useVideo,codecs:list,w:canvas.width,h:canvas.height});
+  }else if(_qCodec==='jpeg'){
+    useVideo=false;
+    if(decoder){try{decoder.close();}catch(e){}decoder=null;decoderCodec=-1;}
+    send({t:'caps',webcodecs:false,codecs:[],w:canvas.width,h:canvas.height});
+  }else{
+    useVideo=true;
+    if(decoder&&CODEC_NAMES[decoderCodec]!==_qCodec){
+      try{decoder.close();}catch(e){}decoder=null;decoderCodec=-1;
+    }
+    send({t:'caps',webcodecs:true,codecs:[_qCodec],w:canvas.width,h:canvas.height});
+  }
+  sendQuality();
 }
 
 function _buildQualityMenu(macH){
@@ -2711,15 +2740,37 @@ function _buildQualityMenu(macH){
   document.getElementById('q-fps').value=String(_qFps);
 }
 
+// Populate codec select after probe. Called once on connect.
+const _CODEC_LABELS={h265:'H.265 (HEVC)',h264:'H.264 (AVC)',av1:'AV1'};
+function _populateCodecSelect(probed){
+  const sel=document.getElementById('q-codec');
+  // Remove all options except Auto (first)
+  while(sel.options.length>1)sel.remove(1);
+  probed.forEach(name=>{
+    const o=document.createElement('option');
+    o.value=name;o.textContent=_CODEC_LABELS[name]||name;
+    sel.appendChild(o);
+  });
+  // JPEG is always available as a forced-fallback option
+  const jopt=document.createElement('option');
+  jopt.value='jpeg';jopt.textContent='JPEG (no WebCodecs)';
+  sel.appendChild(jopt);
+  // Restore saved codec choice; fall back to auto if no longer available.
+  sel.value=_qCodec;
+  if(sel.value!==_qCodec){sel.value='auto';_qCodec='auto';}
+}
+
 (()=>{
   const rSel=document.getElementById('q-res');
   const fSel=document.getElementById('q-fps');
   const bSel=document.getElementById('q-bw');
-  // Restore fps + bw from cookie immediately (resolution menu built after first frame).
+  const cSel=document.getElementById('q-codec');
+  // Restore fps + bw + codec from cookie immediately (codec select populated after probe).
   const saved=_qCookie();
   _qFps=saved.fps;fSel.value=String(_qFps);
   _qBwKbps=saved.bw;bSel.value=String(_qBwKbps);
   if(bSel.value!==String(_qBwKbps)){bSel.value='25000';_qBwKbps=25000;}
+  _qCodec=saved.codec||'auto';
   rSel.addEventListener('change',()=>{
     _qCapH=parseInt(rSel.value)||0;_qSaveCookie();sendQuality();
   });
@@ -2728,6 +2779,18 @@ function _buildQualityMenu(macH){
   });
   bSel.addEventListener('change',()=>{
     _qBwKbps=parseInt(bSel.value)||0;_qSaveCookie();sendQuality();
+  });
+  cSel.addEventListener('change',()=>{
+    _qCodec=cSel.value;_qSaveCookie();sendCaps();
+  });
+  document.getElementById('q-reset').addEventListener('click',()=>{
+    // Reset all quality settings to defaults and clear cookie.
+    _qCapH=0;_qFps=0;_qBwKbps=25000;_qCodec='auto';
+    document.cookie='mvs_q=;max-age=0;SameSite=Strict';
+    rSel.value='0';fSel.value='0';bSel.value='25000';cSel.value='auto';
+    sendQuality();
+    sendCaps();
+    ki.focus();
   });
 })();
 
@@ -2759,14 +2822,14 @@ function connect(){
         // Frames that arrived before this point go through the JPEG path (fail
         // silently on H.264 data — createImageBitmap rejects non-JPEG — which is
         // fine: just a brief blank until the server switches codec).
-        useVideo=codecs.length>0;
-        send({t:'caps',webcodecs:useVideo,codecs,
-              w:canvas.width,h:canvas.height});
-        sendQuality();
+        _probedCodecs=codecs;
+        _populateCodecSelect(codecs);
+        sendCaps(codecs);
       });
     }else{
-      send({t:'caps',webcodecs:false,codecs:[],
-            w:canvas.width,h:canvas.height});
+      _probedCodecs=[];
+      _populateCodecSelect([]);
+      send({t:'caps',webcodecs:false,codecs:[],w:canvas.width,h:canvas.height});
       sendQuality();
     }
   };
