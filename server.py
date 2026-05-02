@@ -792,8 +792,28 @@ class VNCBridge:
             if not _force_reconnect:
                 time.sleep(3)
 
+    def _pbpaste_poll(self):
+        """Poll pbpaste every second to detect Mac clipboard changes.
+        VNC ClientCutText is silently ignored by screensharingd on macOS 15+,
+        so pbpaste is the reliable path for Mac→browser clipboard sync."""
+        import subprocess as _sp, hashlib as _hl
+        last_hash = b''
+        while True:
+            time.sleep(1)
+            try:
+                text = _sp.run(['pbpaste'], capture_output=True, timeout=2).stdout.decode('utf-8', errors='replace')
+                h = _hl.md5(text.encode()).digest()
+                if h != last_hash:
+                    last_hash = h
+                    with self._lock:
+                        self.server_clipboard = text
+                        self.server_clipboard_seq += 1
+            except Exception:
+                pass
+
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
+        threading.Thread(target=self._pbpaste_poll, daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # DisplayStreamBridge — direct screen capture via SCK (ScreenCaptureKit) subprocess.
@@ -1690,6 +1710,12 @@ async def client_session(ws, cfg, bridge):
     async def frame_sender():
         nonlocal seq_num, last_send_time
         known_clip = bridge.server_clipboard_seq
+        # Send current Mac clipboard immediately on connect so side menu is populated.
+        if bridge.server_clipboard:
+            try:
+                await ws.send(json.dumps({"t": "clipboard", "text": bridge.server_clipboard}))
+            except Exception:
+                pass
         last_encoder_codec = encoder.actual_codec
         _t_diag = time.monotonic(); _n_diag = 0; _n_drop = 0; _n_nosend = 0
         _last_vnc_fbu = bridge._fbu_count
@@ -2271,8 +2297,7 @@ function connect(){
         }else if(msg.t==='clipboard'){
           // Mac clipboard → dock textarea + browser clipboard
           clipTA.value=msg.text;
-          if(navigator.clipboard&&navigator.clipboard.writeText)
-            navigator.clipboard.writeText(msg.text).catch(()=>{});
+          _writeClipboard(msg.text);
           st.textContent='[clipboard] '+msg.text.substring(0,50);
           setTimeout(()=>{st.textContent='';},3000);
         }else if(msg.t==='eval'){
@@ -2383,6 +2408,27 @@ function sendPasteText(text){
   if(text&&wsOpen)send({t:'paste',text});
 }
 
+// Write text to the browser's local clipboard.
+// Tries the modern async API first; falls back to the deprecated execCommand path
+// which works without permission in all major browsers.
+function _writeClipboard(text){
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).catch(()=>_legacyCopy(text));
+  }else{
+    _legacyCopy(text);
+  }
+}
+function _legacyCopy(text){
+  const ta=document.createElement('textarea');
+  ta.value=text;
+  ta.style.cssText='position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;opacity:0;';
+  document.body.appendChild(ta);
+  ta.focus();ta.select();
+  try{document.execCommand('copy');}catch(e){}
+  document.body.removeChild(ta);
+  ki.focus(); // restore VNC keyboard focus
+}
+
 // Read browser clipboard and paste to Mac.
 // Uses navigator.clipboard.readText() (requires focus+permission or HTTPS).
 // Falls back to showing the clipboard textarea so user can paste manually.
@@ -2410,12 +2456,12 @@ ki.addEventListener('keydown',async e=>{
     e.preventDefault(); // prevent browser Ctrl+key shortcuts (zoom, find, etc.)
     return;
   }
-  // Ctrl+V / Cmd+V: read browser clipboard explicitly; do NOT send 'v' to VNC
+  // Ctrl+V / Cmd+V: let the browser fire a native paste event on ki (no permission needed).
+  // document paste listener captures e.clipboardData and sends {t:"paste"} to Mac.
+  // Crucially: do NOT call e.preventDefault() here — that would block the paste event.
   if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){
-    e.preventDefault();
-    _suppressedKd.add(e.code); // suppress the matching keyup regardless of modifier state at keyup time
-    await pasteFromBrowserClipboard();
-    return;
+    _suppressedKd.add(e.code); // suppress matching keyup
+    return; // don't send V to VNC; paste event handles the rest
   }
   send({t:'kd',k:key,code:code});
   e.preventDefault();
