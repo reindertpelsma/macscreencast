@@ -2327,6 +2327,7 @@ const hud=document.getElementById('hud'),cur=document.getElementById('cur');
 const st=document.getElementById('st'),ki=document.getElementById('ki');
 
 let imgW=1920,imgH=1080,scaleX=1,scaleY=1,ox=0,oy=0;
+let _nativeW=1920,_nativeH=1080; // Mac's true capture resolution — used for mouse coordinate mapping
 let ws,wsOpen=false,mBtn=0,fc=0,lastFpsT=performance.now();
 let clipSynced=false;       // true only when navigator.clipboard.readText() permission is persistently granted
 let _lastMacClipboard='';   // last clipboard text known on Mac side; used to break browser↔Mac sync loop
@@ -2366,7 +2367,7 @@ function resize(){
   }
   ox=(vw-cw)/2;oy=(vh-ch)/2;
   canvas.style.cssText='left:'+ox+'px;top:'+oy+'px;width:'+cw+'px;height:'+ch+'px;position:absolute;';
-  scaleX=imgW/cw;scaleY=imgH/ch;
+  scaleX=_nativeW/cw;scaleY=_nativeH/ch;
   // Size canvas backing to physical pixels so compositing is 1:1 — no GPU scaling step.
   const dpr=window.devicePixelRatio||1;
   canvas.width=Math.round(cw*dpr);canvas.height=Math.round(ch*dpr);
@@ -2621,7 +2622,8 @@ function connect(){
       try{
         const msg=JSON.parse(e.data);
         if(msg.t==='native'){
-          // Mac's true capture resolution — build quality menu options from this, not canvas size.
+          _nativeW=msg.w;_nativeH=msg.h;
+          resize(); // recompute scaleX/scaleY with true native resolution
           _buildQualityMenu(msg.h);
         }else if(msg.t==='stale'){
           staleMs=msg.ms||0;
@@ -2685,7 +2687,7 @@ setInterval(sendMetricPing,2000);
 // Mouse
 // ---------------------------------------------------------------------------
 function toVNC(cx,cy){return[Math.round((cx-ox)*scaleX),Math.round((cy-oy)*scaleY)];}
-function inBounds(vx,vy){return vx>=0&&vy>=0&&vx<imgW&&vy<imgH;}
+function inBounds(vx,vy){return vx>=0&&vy>=0&&vx<_nativeW&&vy<_nativeH;}
 
 document.body.addEventListener('mousemove',e=>{
   cur.style.left=e.clientX+'px';cur.style.top=e.clientY+'px';
