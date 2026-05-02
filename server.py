@@ -1420,6 +1420,10 @@ class EncoderPipeline:
         try:
             fmt = "bgra" if (rgb.ndim == 3 and rgb.shape[2] == 4) else "rgb24"
             frame = _av.VideoFrame.from_ndarray(rgb, format=fmt)
+            # Downscale to encoder dimensions if source is larger (libswscale Lanczos).
+            if frame.width != self._cc.width or frame.height != self._cc.height:
+                frame = frame.reformat(width=self._cc.width, height=self._cc.height, format=fmt,
+                                       interpolation="LANCZOS")
             frame = frame.reformat(format="yuv420p")
             pts = max(self._last_pts + 1, capture_ms)
             frame.pts = pts
@@ -1450,6 +1454,9 @@ class EncoderPipeline:
         try:
             fmt = "bgra" if (rgb.ndim == 3 and rgb.shape[2] == 4) else "rgb24"
             frame = _av.VideoFrame.from_ndarray(rgb, format=fmt)
+            if frame.width != self._cc.width or frame.height != self._cc.height:
+                frame = frame.reformat(width=self._cc.width, height=self._cc.height, format=fmt,
+                                       interpolation="LANCZOS")
             frame = frame.reformat(format="yuv420p")
             pts = max(self._last_pts + 1, capture_ms)
             frame.pts = pts
@@ -1487,6 +1494,10 @@ class AdaptiveController:
         self.jpeg_quality = 85
         self.client_w = 1920
         self.client_h = 1080
+        self.cap_h   = 0    # 0 = auto (use canvas physical size); >0 = explicit height cap
+        self.fps_cap = 0    # 0 = use max_fps; >0 = explicit fps ceiling
+        self.canvas_phys_w = 0
+        self.canvas_phys_h = 0
         self._min_br = 300_000
         self._min_fps = 5.0          # fps floor — only reduced after bitrate hits minimum
         self._max_br = 50_000_000   # 50Mbps cap — plenty for any screenshare quality
@@ -1508,6 +1519,29 @@ class AdaptiveController:
         with self._lock:
             self.client_w = max(1, w)
             self.client_h = max(1, h)
+            # w/h are physical canvas pixels (canvas.width × canvas.height after DPR scaling)
+            self.canvas_phys_w = max(1, w)
+            self.canvas_phys_h = max(1, h)
+
+    def on_quality(self, cap_h: int, fps_cap: int):
+        with self._lock:
+            self.cap_h   = max(0, cap_h)
+            self.fps_cap = max(0, fps_cap)
+            ceil = float(self.fps_cap) if self.fps_cap > 0 else self.max_fps
+            self.fps = min(self.fps, ceil)
+
+    def effective_target(self, native_w: int, native_h: int):
+        """Return (tw, th) — the target encode resolution.
+        Never upscales; always preserves the source aspect ratio; dimensions are even."""
+        with self._lock:
+            if self.cap_h > 0:
+                th = min(self.cap_h, native_h)
+            elif self.canvas_phys_h > 0:
+                th = min(self.canvas_phys_h, native_h)
+            else:
+                th = native_h
+            tw = round(native_w * th / native_h) if native_h else native_w
+            return (tw & ~1), (th & ~1)
 
     def _backoff(self, severe):
         """Reduce quality. Must be called with _lock held; enforces 300ms debounce.
@@ -1614,8 +1648,9 @@ class AdaptiveController:
             if now - self._last_slow < 2.0:
                 return  # recent backoff — wait for stability before probing up
             self._last_fast = now
-            if self.fps < self.max_fps:
-                self.fps = self.max_fps
+            fps_ceil = float(self.fps_cap) if self.fps_cap > 0 else self.max_fps
+            if self.fps < fps_ceil:
+                self.fps = fps_ceil
             elif self.bitrate < self._max_br:
                 # Below ceiling: jump to 90% of it — the ceiling was the bitrate
                 # that just triggered congestion, so landing slightly below avoids
@@ -1635,7 +1670,8 @@ class AdaptiveController:
         known stable bitrate. Uses 90% of the congestion ceiling (same as on_fresh recovery)
         to avoid immediately re-triggering congestion on every screen-active event."""
         with self._lock:
-            self.fps = self.max_fps
+            fps_ceil = float(self.fps_cap) if self.fps_cap > 0 else self.max_fps
+            self.fps = fps_ceil
             if self._ceil_bitrate > 0 and self._ceil_bitrate > self.bitrate:
                 self.bitrate = max(self._min_br, int(self._ceil_bitrate * 0.90))
                 self.jpeg_quality = min(95, self.jpeg_quality + 20)
@@ -1680,44 +1716,53 @@ async def client_session(ws, cfg, bridge):
     target_codec = CODEC_H264 if cfg.codec == "h264" else CODEC_H265
     encoder = EncoderPipeline(CODEC_JPEG, W, H, ctrl.bitrate)  # JPEG until caps received
     has_webcodecs = False
+    _enc_target_w, _enc_target_h = W, H  # current encoder dimensions
+    _reinit_deadline = 0.0                # monotonic: reinit encoder at this time; 0=none
 
     seq_num = 0
     last_send_time = time.monotonic()
 
-    def _upgrade_encoder():
-        nonlocal encoder, has_webcodecs
+    def _upgrade_encoder(tw: int = 0, th: int = 0):
+        nonlocal encoder, has_webcodecs, _enc_target_w, _enc_target_h
         if not has_webcodecs:
             return
-        if encoder.actual_codec != CODEC_JPEG:
-            return  # already upgraded
-        encoder.close()
         W2, H2 = bridge.dimensions
+        if not tw or not th:
+            tw, th = ctrl.effective_target(W2, H2)
+        tw = tw or W2; th = th or H2
+        if encoder.actual_codec != CODEC_JPEG and (tw, th) == (_enc_target_w, _enc_target_h):
+            return  # already upgraded at this resolution
+        old = encoder
         # Cascade: try target_codec first, then H.265, then H.264.
-        # AV1 software encode (libaom/SVT) is too slow for real-time so we stop
-        # at H.265 when hardware AV1 isn't available.
         seen = set()
         fallbacks = [target_codec, CODEC_H265, CODEC_H264]
+        new_enc = None
         for codec in fallbacks:
             if codec == CODEC_AV1:
                 continue  # skip software AV1 until hardware VT support lands
             if codec in seen:
                 continue
             seen.add(codec)
-            e = EncoderPipeline(codec, W2, H2, ctrl.bitrate)
+            e = EncoderPipeline(codec, tw, th, ctrl.bitrate)
             if e.actual_codec != CODEC_JPEG:
-                encoder = e
-                log.info("Upgraded to %s for %s",
-                         {CODEC_H264:"h264",CODEC_H265:"h265",CODEC_AV1:"av1"}.get(encoder.actual_codec,"?"),
-                         ws.remote_address)
-                return
+                new_enc = e
+                break
             e.close()
-        encoder = EncoderPipeline(CODEC_JPEG, W2, H2, ctrl.bitrate)
-        log.warning("Video codec unavailable for %s — staying on JPEG", ws.remote_address)
+        if new_enc is None:
+            new_enc = EncoderPipeline(CODEC_JPEG, tw, th, ctrl.bitrate)
+            log.warning("Video codec unavailable for %s — staying on JPEG", ws.remote_address)
+        else:
+            log.info("Encoder %s %dx%d for %s",
+                     {CODEC_H264:"h264",CODEC_H265:"h265",CODEC_AV1:"av1"}.get(new_enc.actual_codec,"?"),
+                     tw, th, ws.remote_address)
+        encoder = new_enc
+        _enc_target_w, _enc_target_h = tw, th
+        old.close()
 
     loop = asyncio.get_event_loop()
 
     async def input_reader():
-        nonlocal has_webcodecs, target_codec
+        nonlocal has_webcodecs, target_codec, _reinit_deadline
         cur_buttons = 0
         try:
             async for raw in ws:
@@ -1743,6 +1788,17 @@ async def client_session(ws, cfg, bridge):
                         _upgrade_encoder()
                     elif t == "resolution":
                         ctrl.on_resolution(int(ev.get("w",1920)), int(ev.get("h",1080)))
+                        # Schedule encoder reinit if effective target changed (debounced 500ms)
+                        nw, nh = bridge.dimensions
+                        tw, th = ctrl.effective_target(nw or W, nh or H)
+                        if has_webcodecs and (tw != _enc_target_w or th != _enc_target_h):
+                            _reinit_deadline = time.monotonic() + 0.5
+                    elif t == "quality":
+                        ctrl.on_quality(int(ev.get("cap_h", 0)), int(ev.get("fps", 0)))
+                        nw, nh = bridge.dimensions
+                        tw, th = ctrl.effective_target(nw or W, nh or H)
+                        if has_webcodecs and (tw != _enc_target_w or th != _enc_target_h):
+                            _reinit_deadline = time.monotonic() + 0.5
                     elif t == "lag":
                         age = float(ev.get("age_ms", 0))
                         ctrl.on_lag(age, _get_wbuf(ws))
@@ -1879,6 +1935,7 @@ async def client_session(ws, cfg, bridge):
                 await ws.send(json.dumps({"t": "clipboard", "text": bridge.server_clipboard}))
             except Exception:
                 pass
+        nonlocal _enc_target_w, _enc_target_h, _reinit_deadline
         last_encoder_codec = encoder.actual_codec
         _t_diag = time.monotonic(); _n_diag = 0; _n_drop = 0; _n_nosend = 0
         _last_vnc_fbu = bridge._fbu_count
@@ -1982,6 +2039,18 @@ async def client_session(ws, cfg, bridge):
                     _refresh_br = 0
                     ctrl.on_screen_active()
                     last_send_time = time.monotonic() - interval  # skip rate-limit delay
+
+                # Debounced encoder reinit when quality cap or canvas size changed.
+                if _reinit_deadline > 0 and now >= _reinit_deadline:
+                    _reinit_deadline = 0.0
+                    if _pipe_task is not None:
+                        try: await _pipe_task
+                        except Exception: pass
+                        _pipe_task = None
+                    nw2, nh2 = bridge.dimensions
+                    tw2, th2 = ctrl.effective_target(nw2 or W, nh2 or H)
+                    if tw2 != _enc_target_w or th2 != _enc_target_h:
+                        _upgrade_encoder(tw2, th2)
 
                 # Probe quality up — gated internally on _last_slow (no recent backoff)
                 ctrl.on_fresh()
@@ -2181,6 +2250,12 @@ canvas{display:block;position:absolute}
 #sk-key-input{width:100%;margin:2px 0;padding:3px 5px;background:rgba(255,255,255,.07);
   border:1px solid rgba(255,255,255,.14);border-radius:3px;color:#ccc;font:11px monospace}
 #sk-key-input:focus{outline:1px solid rgba(100,180,255,.5);color:#fff}
+#quality-section{margin-top:5px;padding-top:5px;border-top:1px solid rgba(255,255,255,.09)}
+.q-row{display:flex;align-items:center;justify-content:space-between;margin:3px 0;font:11px monospace;color:#aaa}
+.q-row label{color:#888;min-width:40px}
+.q-sel{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);border-radius:3px;
+  color:#ccc;font:11px monospace;padding:2px 4px;flex:1;cursor:pointer}
+.q-sel:focus{outline:1px solid rgba(100,180,255,.4)}
 </style></head><body>
 <canvas id="c"></canvas>
 <div id="hud">connecting...</div>
@@ -2227,6 +2302,16 @@ canvas{display:block;position:absolute}
         <button id="clip-paste">Paste on Mac</button>
         <button id="clip-clear">Clear</button>
       </div>
+    </div>
+    <div id="quality-section">
+      <div style="color:#666;font:10px monospace;margin-bottom:3px">Stream quality (cap)</div>
+      <div class="q-row"><label>Res</label><select class="q-sel" id="q-res"><option value="0">Auto</option></select></div>
+      <div class="q-row"><label>FPS</label><select class="q-sel" id="q-fps">
+        <option value="0">Auto</option>
+        <option value="60">60 fps</option>
+        <option value="30">30 fps</option>
+        <option value="20">20 fps</option>
+      </select></div>
     </div>
   </div>
 </div>
@@ -2288,7 +2373,9 @@ window.addEventListener('resize',()=>{resize();sendRes();});
 
 function setDim(w,h){
   if(w===imgW&&h===imgH)return;
-  imgW=w;imgH=h;resize();
+  imgW=w;imgH=h;
+  _buildQualityMenu(h);  // first call: populate resolution options based on Mac native height
+  resize();
 }
 
 // ---------------------------------------------------------------------------
@@ -2418,10 +2505,68 @@ function updateFps(){
 }
 
 // ---------------------------------------------------------------------------
+// Quality menu — resolution + FPS cap
+// ---------------------------------------------------------------------------
+const _Q_PRESETS=[
+  {label:'2160p (4K)',h:2160},{label:'1440p (QHD)',h:1440},
+  {label:'1080p (Full HD)',h:1080},{label:'720p (HD)',h:720},
+  {label:'480p (SD)',h:480},{label:'360p',h:360},{label:'240p',h:240},
+];
+let _qCapH=0,_qFps=0,_qMenuBuilt=false;
+
+function _qCookie(){
+  // Returns {cap_h, fps} from cookie, or defaults.
+  const m=document.cookie.match(/mvs_q=(\d+),(\d+)/);
+  return m?{cap_h:parseInt(m[1]),fps:parseInt(m[2])}:{cap_h:0,fps:0};
+}
+function _qSaveCookie(){
+  document.cookie='mvs_q='+_qCapH+','+_qFps+';max-age='+(365*86400)+';SameSite=Strict';
+}
+function sendQuality(){
+  send({t:'quality',cap_h:_qCapH,fps:_qFps});
+}
+
+function _buildQualityMenu(macH){
+  if(_qMenuBuilt)return;
+  _qMenuBuilt=true;
+  const dpr=window.devicePixelRatio||1;
+  const screenPhysH=Math.round(screen.height*dpr);
+  // Maximum sensible height: no upscaling, no sending more than screen can show.
+  const maxH=macH>0?Math.min(macH,screenPhysH>0?screenPhysH:macH):screenPhysH;
+  const sel=document.getElementById('q-res');
+  _Q_PRESETS.forEach(p=>{
+    if(p.h>maxH)return;
+    const o=document.createElement('option');
+    o.value=p.h;o.textContent=p.label;
+    sel.appendChild(o);
+  });
+  // Restore saved choice
+  const saved=_qCookie();
+  _qCapH=saved.cap_h;_qFps=saved.fps;
+  sel.value=String(_qCapH);
+  document.getElementById('q-fps').value=String(_qFps);
+}
+
+(()=>{
+  const rSel=document.getElementById('q-res');
+  const fSel=document.getElementById('q-fps');
+  // Restore fps from cookie immediately (resolution menu built after first frame).
+  const saved=_qCookie();
+  _qFps=saved.fps;fSel.value=String(_qFps);
+  rSel.addEventListener('change',()=>{
+    _qCapH=parseInt(rSel.value)||0;_qSaveCookie();sendQuality();
+  });
+  fSel.addEventListener('change',()=>{
+    _qFps=parseInt(fSel.value)||0;_qSaveCookie();sendQuality();
+  });
+})();
+
+// ---------------------------------------------------------------------------
 // WebSocket
 // ---------------------------------------------------------------------------
 function send(obj){if(ws&&wsOpen)ws.send(JSON.stringify(obj));}
-function sendRes(){send({t:'resolution',w:window.innerWidth,h:window.innerHeight});}
+// Send physical canvas pixels so the server can match encode resolution to what the canvas can actually display.
+function sendRes(){send({t:'resolution',w:canvas.width,h:canvas.height});}
 
 function connect(){
   const token=new URLSearchParams(location.search).get('token')||'';
@@ -2441,11 +2586,13 @@ function connect(){
     if(haswc){
       probeSupportedCodecs().then(codecs=>{
         send({t:'caps',webcodecs:true,codecs,
-              w:window.innerWidth,h:window.innerHeight});
+              w:canvas.width,h:canvas.height});
+        sendQuality();
       });
     }else{
       send({t:'caps',webcodecs:false,codecs:[],
-            w:window.innerWidth,h:window.innerHeight});
+            w:canvas.width,h:canvas.height});
+      sendQuality();
     }
   };
   ws.onclose=()=>{
