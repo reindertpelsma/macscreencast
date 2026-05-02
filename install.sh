@@ -1,36 +1,63 @@
 #!/usr/bin/env bash
-# install.sh — set up mac-vnc-stream dependencies on macOS
-set -e
+# mac-vnc-stream/install.sh
+#
+# One-command install from a fresh macOS machine (no prior clone needed).
+# Clones the repo to ~/mac-vnc-stream and runs setup.sh.
+#
+# Usage:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh)
+#
+# With flags passed through to setup.sh:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh) \
+#     --port 6081 --listen 0.0.0.0
 
-echo "==> mac-vnc-stream install"
+set -euo pipefail
 
-# Ensure Python 3.9+
-if ! command -v python3 &>/dev/null; then
-  echo "Error: python3 not found. Install Python 3.9+ first."
-  exit 1
+REPO_URL="https://github.com/reindertpelsma/mac-vnc-stream"
+CLONE_DIR="$HOME/mac-vnc-stream"
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+step()   { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+die()    { red "ERROR: $*"; exit 1; }
+
+# ── Ensure interactive stdin ───────────────────────────────────────────────────
+# When piped through curl (curl ... | bash), stdin carries the script itself.
+# Re-open /dev/tty so that read prompts in setup.sh reach the user's terminal.
+if [ ! -t 0 ]; then
+    exec < /dev/tty
 fi
-PY=$(python3 -c "import sys; print(sys.version_info[:2] >= (3,9))")
-if [ "$PY" != "True" ]; then
-  echo "Error: Python 3.9+ required."
-  exit 1
+
+step "mac-vnc-stream installer"
+echo "  Repo: $REPO_URL"
+echo "  Clone target: $CLONE_DIR"
+
+# ── Prerequisites ──────────────────────────────────────────────────────────────
+if ! command -v git >/dev/null 2>&1; then
+    die "git not found. Install Xcode Command Line Tools first:
+  xcode-select --install
+Then re-run this installer."
 fi
 
-# Install libturbojpeg via Homebrew (optional but strongly recommended)
-if command -v brew &>/dev/null; then
-  echo "==> Installing jpeg-turbo (for fast JPEG encoding)..."
-  brew install jpeg-turbo || true
+if ! command -v python3 >/dev/null 2>&1; then
+    die "python3 not found. Install Xcode Command Line Tools:
+  xcode-select --install"
+fi
+
+# ── Clone or update ────────────────────────────────────────────────────────────
+step "Fetching mac-vnc-stream"
+
+if [[ -d "$CLONE_DIR/.git" ]]; then
+    yellow "  Repo already at $CLONE_DIR — pulling latest..."
+    git -C "$CLONE_DIR" pull --ff-only \
+        || yellow "  Pull failed (local changes?). Continuing with existing code."
+    green "  Up to date"
 else
-  echo "==> Homebrew not found; skipping jpeg-turbo (will fall back to Pillow)"
+    git clone "$REPO_URL" "$CLONE_DIR"
+    green "  Cloned to $CLONE_DIR"
 fi
 
-# Install Python dependencies
-echo "==> Installing Python packages..."
-python3 -m pip install --upgrade websockets numpy Pillow cryptography av PyTurboJPEG
-
-echo ""
-echo "==> Done! Run the server with:"
-echo "    python3 server.py --vnc-pass <your_vnc_password>"
-echo ""
-echo "Then from your laptop:"
-echo "    ssh -L 6081:localhost:6081 user@your-mac"
-echo "    open http://localhost:6081"
+# ── Hand off to setup.sh ───────────────────────────────────────────────────────
+exec bash "$CLONE_DIR/setup.sh" "$@"
