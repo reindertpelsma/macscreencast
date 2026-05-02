@@ -1837,6 +1837,14 @@ async def client_session(ws, cfg, bridge):
     def _upgrade_encoder(tw: int = 0, th: int = 0):
         nonlocal encoder, has_webcodecs, _enc_target_w, _enc_target_h
         if not has_webcodecs:
+            # Client doesn't support WebCodecs (or revoked it after an error).
+            # Downgrade to JPEG so the client's JPEG path actually gets JPEG frames.
+            if encoder.actual_codec != CODEC_JPEG:
+                W2, H2 = bridge.dimensions
+                old = encoder
+                encoder = EncoderPipeline(CODEC_JPEG, W2 or 1920, H2 or 1080, ctrl.bitrate)
+                _enc_target_w, _enc_target_h = W2, H2
+                old.close()
             return
         W2, H2 = bridge.dimensions
         if not tw or not th:
@@ -2546,9 +2554,9 @@ const CODEC_STRINGS={
 };
 
 // Probe which codecs the browser can decode via WebCodecs.
-// Tries hardware first, then software, so Firefox (software-only H.264) is detected.
-// Returns ordered list best→worst e.g. ['h265','h264']; empty = fall back to JPEG.
-const _codecHwMode={}; // codec name → hardwareAcceleration mode confirmed by probe
+// Stores the exact config that isConfigSupported approved so configure() uses
+// the identical options — avoiding browsers where isConfigSupported is optimistic.
+const _codecConfig={}; // codec name → exact VideoDecoderConfig approved by probe
 async function probeSupportedCodecs(){
   if(typeof VideoDecoder==='undefined')return[];
   const probes=[
@@ -2558,11 +2566,16 @@ async function probeSupportedCodecs(){
   ];
   const out=[];
   for(const p of probes){
+    let found=false;
     for(const hw of['prefer-hardware','prefer-software','no-preference']){
-      try{
-        const r=await VideoDecoder.isConfigSupported({codec:p.codec,hardwareAcceleration:hw});
-        if(r.supported){out.push(p.name);_codecHwMode[p.name]=hw;break;}
-      }catch(e){}
+      if(found)break;
+      for(const lat of[true,false]){
+        const cfg={codec:p.codec,hardwareAcceleration:hw,optimizeForLatency:lat};
+        try{
+          const r=await VideoDecoder.isConfigSupported(cfg);
+          if(r.supported){out.push(p.name);_codecConfig[p.name]=cfg;found=true;break;}
+        }catch(e){}
+      }
     }
   }
   return out;
@@ -2588,8 +2601,8 @@ function initDecoder(codec){
         if(wsOpen)send({t:'caps',webcodecs:false,codecs:[],w:canvas.width,h:canvas.height});
       }
     });
-    const hw=_codecHwMode[CODEC_NAMES[codec]]||'prefer-hardware';
-    decoder.configure({codec:cs,optimizeForLatency:true,hardwareAcceleration:hw});
+    const probedCfg=_codecConfig[CODEC_NAMES[codec]];
+    decoder.configure(probedCfg||{codec:cs,hardwareAcceleration:'prefer-hardware',optimizeForLatency:true});
     decoderCodec=codec;
   }catch(e){console.warn('VideoDecoder configure:',e);useVideo=false;decoder=null;}
 }
