@@ -659,7 +659,6 @@ class DisplayStreamBridge:
         self._proc = None
         self._lock = threading.Lock()
         self._fb = None
-        self._fb_fmt = "rgb24"
         self._fb_seq = 0
         self._fb_ms = 0
         self._W = 0
@@ -719,9 +718,8 @@ class DisplayStreamBridge:
                     data  = self._read_exact(W * H * 3)
                     frame = np.frombuffer(data, dtype=np.uint8).reshape(H, W, 3).copy()
                 with self._lock:
-                    self._fb       = frame
-                    self._fb_fmt   = "bgra" if magic == b'BVNC' else "rgb24"
-                    self._fb_seq  += 1
+                    self._fb      = frame
+                    self._fb_seq += 1
                     self._fb_ms    = ts_ms if ts_ms else int(time.time() * 1000)
                     self._W, self._H = W, H
         except Exception as e:
