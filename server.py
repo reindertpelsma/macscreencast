@@ -2541,7 +2541,7 @@ async function probeSupportedCodecs(){
       if(r.supported)out.push(p.name);
     }catch(e){}
   }
-  return out.length>0?out:['h264'];
+  return out; // empty list = no supported codec; caller decides fallback
 }
 
 function initDecoder(codec){
@@ -2557,7 +2557,12 @@ function initDecoder(codec){
         ctx.drawImage(frame,0,0,canvas.width,canvas.height);frame.close();
         fc++;updateFps();
       },
-      error:e=>{console.warn('VideoDecoder:',e);useVideo=false;decoder=null;}
+      error:e=>{
+        console.warn('VideoDecoder:',e);
+        useVideo=false;decoder=null;
+        // Tell server to switch to JPEG so we still get frames (e.g. Firefox WebCodecs)
+        if(wsOpen)send({t:'caps',webcodecs:false,codecs:[],w:canvas.width,h:canvas.height});
+      }
     });
     decoder.configure({codec:cs,optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'});
     decoderCodec=codec;
@@ -2723,7 +2728,11 @@ function connect(){
     const haswc=typeof VideoDecoder!=='undefined';
     if(haswc){
       probeSupportedCodecs().then(codecs=>{
-        send({t:'caps',webcodecs:true,codecs,
+        // If no codec probed as supported (e.g. Firefox has VideoDecoder but no H.264/H.265),
+        // tell server webcodecs:false so it sends JPEG which every browser can decode.
+        const wc=codecs.length>0;
+        if(!wc)useVideo=false;
+        send({t:'caps',webcodecs:wc,codecs,
               w:canvas.width,h:canvas.height});
         sendQuality();
       });
