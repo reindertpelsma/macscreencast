@@ -1219,6 +1219,13 @@ async def client_session(ws, cfg, bridge):
                         text = ev.get("text","")
                         if text:
                             bridge.send_clipboard(text)
+                            # Release any modifiers held by ctrlToMeta remapping so
+                            # only our clean Cmd+V lands — avoids Ctrl+Cmd+V confusion.
+                            for ks in [KEYSYM["ShiftLeft"], KEYSYM["ShiftRight"],
+                                       KEYSYM["Control"], KEYSYM["ControlRight"],
+                                       KEYSYM["Alt"], KEYSYM["AltRight"],
+                                       KEYSYM["MetaLeft"], KEYSYM["MetaRight"]]:
+                                bridge.send_key(False, ks)
                             # CMD+V (Meta+V) triggers paste in macOS apps
                             bridge.send_key(True,  KEYSYM["MetaLeft"])
                             bridge.send_key(True,  0x76)
@@ -1303,29 +1310,31 @@ async def client_session(ws, cfg, bridge):
                         _refresh_t = 0.0
                     else:
                         fps_s, br_s, jq_s = ctrl.snapshot()
-                        # Send a quality-improving I-frame refresh when:
-                        #   • idle for >3s (initial settle)
-                        #   • cooldown elapsed (3s between refreshes)
-                        #   • bitrate improved >25% since last refresh (real headroom gain)
-                        if (now - _static_since > 3.0 and
-                                now - _refresh_t > 3.0 and
-                                br_s > _refresh_br * 1.25):
-                            _refresh_br = br_s
+                        # Heartbeat: send a frame every 2s when static so the client
+                        # sees cursor movement and confirms the stream is alive (0fps
+                        # on a static screen feels broken even when latency is fine).
+                        # Also send a higher-quality refresh when bitrate improved >25%.
+                        last_refresh_age = now - _refresh_t
+                        quality = 95 if br_s > _refresh_br * 1.25 else 75
+                        if now - _static_since > 1.0 and last_refresh_age > 2.0:
                             _refresh_t = now
+                            if br_s > _refresh_br * 1.25:
+                                _refresh_br = br_s
                             fb_s, cms_s = bridge.get_current_frame()
                             if fb_s is not None:
                                 encoder.set_bitrate(br_s)
                                 try:
                                     payload_s, is_kf_s, codec_s = await loop.run_in_executor(
-                                        None, encoder.encode_keyframe, fb_s, cms_s, 95)
+                                        None, encoder.encode_keyframe, fb_s, cms_s, quality)
                                     if payload_s:
                                         seq_num += 1
                                         hdr_s = _hdr(seq_num, int(time.time() * 1000),
                                                      codec_s, True, len(payload_s))
                                         await ws.send(hdr_s + payload_s)
-                                        log.debug("quality refresh: %dkbps", br_s // 1000)
+                                        _n_diag += 1
+                                        log.debug("static heartbeat: %dkbps q=%d", br_s // 1000, quality)
                                 except Exception as e:
-                                    log.debug("kf refresh err: %s", e)
+                                    log.warning("heartbeat frame err: %s", e)
                     await asyncio.sleep(min(interval, 1.0 / 60.0))
                     continue
 
@@ -1875,10 +1884,14 @@ canvas.addEventListener('touchend',e=>{
 ki.addEventListener('keydown',e=>{
   if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='v')return;
   let code=e.code,key=e.key;
-  // Ctrl→Cmd: remap ControlLeft/Right to MetaLeft so Ctrl+A = Cmd+A (select all), etc.
+  // Ctrl→Cmd: remap ControlLeft/Right → MetaLeft so Ctrl+A=Cmd+A, Ctrl+Shift+G=Cmd+Shift+G, etc.
+  // Do NOT preventDefault on the modifier itself so the browser still fires paste/copy events.
   if(ctrlToMeta&&!e.metaKey&&(code==='ControlLeft'||code==='ControlRight')){
     _ctrlRemapped[code]='MetaLeft';
     code=key='MetaLeft';
+    send({t:'kd',k:key,code:code});
+    // Skip preventDefault on the Ctrl key itself so subsequent Shift etc. work correctly
+    return;
   }
   send({t:'kd',k:key,code:code});
   e.preventDefault();
@@ -1891,17 +1904,18 @@ ki.addEventListener('keyup',e=>{
   e.preventDefault();
 });
 
-// Paste event — works on all browsers when textarea is focused
-ki.addEventListener('paste',e=>{
+// Paste event — on ki (focused path) and document (fallback when ki loses focus)
+function _doPaste(e){
   const text=(e.clipboardData||window.clipboardData).getData('text/plain');
-  if(text&&wsOpen){
-    send({t:'paste',text});  // server sets Mac clipboard + sends CMD+V
-  }
+  if(text&&wsOpen){send({t:'paste',text});}
   e.preventDefault();
   ki.value='';
-});
+}
+ki.addEventListener('paste',_doPaste);
+// Document-level fallback: catches paste even when dock or other UI stole focus
+document.addEventListener('paste',e=>{if(document.activeElement!==ki)_doPaste(e);});
 
-// Refocus hidden textarea on any canvas interaction or window focus
+// Refocus hidden textarea on canvas click and window focus so keyboard events route correctly
 canvas.addEventListener('click',()=>ki.focus());
 window.addEventListener('focus',()=>ki.focus());
 
