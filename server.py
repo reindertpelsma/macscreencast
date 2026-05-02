@@ -3598,7 +3598,7 @@ def _audio_encoder_thread():
         codec_ctx.sample_rate = 48000
         # libopus supports 'flt' (interleaved float32) and 's16' — NOT 'fltp' (planar)
         codec_ctx.format = 'flt'
-        codec_ctx.bit_rate = 64000
+        codec_ctx.bit_rate = 128000
         # PyAV 13+ uses .layout; older PyAV used .channel_layout / .channels
         try:
             codec_ctx.layout = 'stereo'
