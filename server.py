@@ -1858,8 +1858,8 @@ async def client_session(ws, cfg, bridge):
         fallbacks = [target_codec, CODEC_H265, CODEC_H264]
         new_enc = None
         for codec in fallbacks:
-            if codec == CODEC_AV1:
-                continue  # skip software AV1 until hardware VT support lands
+            if codec == CODEC_AV1 and codec != target_codec:
+                continue  # AV1 is CPU-only; skip in auto cascade but allow when explicitly chosen
             if codec in seen:
                 continue
             seen.add(codec)
@@ -2711,8 +2711,11 @@ function sendQuality(){
 function sendCaps(probed){
   const list=probed||_probedCodecs;
   if(_qCodec==='auto'){
-    useVideo=list.length>0;
-    send({t:'caps',webcodecs:useVideo,codecs:list,w:canvas.width,h:canvas.height});
+    // Exclude AV1 from auto: server has no VideoToolbox AV1 encoder (CPU only).
+    // User can still pick AV1 explicitly from the codec menu.
+    const autoList=list.filter(c=>c!=='av1');
+    useVideo=autoList.length>0;
+    send({t:'caps',webcodecs:useVideo,codecs:autoList,w:canvas.width,h:canvas.height});
   }else if(_qCodec==='jpeg'){
     useVideo=false;
     if(decoder){try{decoder.close();}catch(e){}decoder=null;decoderCodec=-1;}
@@ -2754,7 +2757,7 @@ function _buildQualityMenu(macH){
 }
 
 // Populate codec select after probe. Called once on connect.
-const _CODEC_LABELS={h265:'H.265 (HEVC)',h264:'H.264 (AVC)',av1:'AV1'};
+const _CODEC_LABELS={h265:'H.265 (HEVC)',h264:'H.264 (AVC)',av1:'AV1 (CPU — no HW enc)'};
 function _populateCodecSelect(probed){
   const sel=document.getElementById('q-codec');
   // Remove all options except Auto (first)
