@@ -807,6 +807,200 @@ class DisplayStreamBridge:
         return True
 
 # ---------------------------------------------------------------------------
+# InProcessSCKBridge — SCK capture running in the server process itself.
+# On macOS 26, subprocess-spawned Python processes get -3801 even with a valid
+# TCC grant; running SCK in the LaunchAgent process (GUI session, proper bundle
+# context) avoids that.  Same API surface as DisplayStreamBridge.
+# ---------------------------------------------------------------------------
+class InProcessSCKBridge:
+    _fo_class = None  # ObjC class registered once; cached here after first use
+
+    def __init__(self):
+        self._lock   = threading.Lock()
+        self._fb     = None
+        self._fb_seq = 0
+        self._fb_ms  = 0
+        self._W = self._H = 0
+        self._running = False
+        self._stream  = None
+        self._writer  = None
+
+    @classmethod
+    def _make_fo_class(cls):
+        """Create and cache the NSObject frame-output delegate (ObjC class registration is once-only)."""
+        if cls._fo_class is not None:
+            return cls._fo_class
+        from Foundation import NSObject
+        import CoreMedia, ctypes
+        _cv = ctypes.CDLL('/System/Library/Frameworks/CoreVideo.framework/CoreVideo')
+        _cv.CVPixelBufferLockBaseAddress.restype    = ctypes.c_int32
+        _cv.CVPixelBufferLockBaseAddress.argtypes   = [ctypes.c_void_p, ctypes.c_uint64]
+        _cv.CVPixelBufferUnlockBaseAddress.restype  = ctypes.c_int32
+        _cv.CVPixelBufferUnlockBaseAddress.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        _cv.CVPixelBufferGetBaseAddress.restype     = ctypes.c_void_p
+        _cv.CVPixelBufferGetBaseAddress.argtypes    = [ctypes.c_void_p]
+        _cv.CVPixelBufferGetWidth.restype           = ctypes.c_size_t
+        _cv.CVPixelBufferGetWidth.argtypes          = [ctypes.c_void_p]
+        _cv.CVPixelBufferGetHeight.restype          = ctypes.c_size_t
+        _cv.CVPixelBufferGetHeight.argtypes         = [ctypes.c_void_p]
+        _cv.CVPixelBufferGetBytesPerRow.restype     = ctypes.c_size_t
+        _cv.CVPixelBufferGetBytesPerRow.argtypes    = [ctypes.c_void_p]
+
+        class _FrameOutputInProc(NSObject):
+            # _bridge_ref is a class variable set to the active InProcessSCKBridge before
+            # the stream starts.  Using a class variable avoids closure/ObjC registration issues.
+            _bridge_ref = None
+
+            def stream_didOutputSampleBuffer_ofType_(self_obj, stream, sampleBuffer, outputType):
+                if outputType != 0:
+                    return
+                bridge = _FrameOutputInProc._bridge_ref
+                if bridge is None:
+                    return
+                try:
+                    pb_obj = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
+                    if pb_obj is None:
+                        return
+                    pb = hash(pb_obj)
+                    _cv.CVPixelBufferLockBaseAddress(pb, 1)
+                    try:
+                        W   = int(_cv.CVPixelBufferGetWidth(pb))
+                        H   = int(_cv.CVPixelBufferGetHeight(pb))
+                        bpr = int(_cv.CVPixelBufferGetBytesPerRow(pb))
+                        base = _cv.CVPixelBufferGetBaseAddress(pb)
+                        if not base or W <= 0 or H <= 0:
+                            return
+                        if bpr == W * 4:
+                            data = bytes(ctypes.string_at(base, H * bpr))
+                        else:
+                            data = b''.join(ctypes.string_at(base + r * bpr, W * 4) for r in range(H))
+                        frame = np.frombuffer(data, dtype=np.uint8).reshape(H, W, 4).copy()
+                        with bridge._lock:
+                            bridge._fb     = frame
+                            bridge._fb_seq += 1
+                            bridge._fb_ms  = int(time.time() * 1000)
+                            bridge._W, bridge._H = W, H
+                    finally:
+                        _cv.CVPixelBufferUnlockBaseAddress(pb, 1)
+                except Exception as e:
+                    log.debug("InProcessSCK frame: %s", e)
+
+        cls._fo_class = _FrameOutputInProc
+        return cls._fo_class
+
+    def start(self):
+        """Initialize SCK capture in-process. Returns True when the first frame arrives (≤5s)."""
+        done = threading.Event()
+        ok   = [False]
+
+        def _init():
+            try:
+                import ScreenCaptureKit as SCKmod
+                FO = InProcessSCKBridge._make_fo_class()
+                FO._bridge_ref = self
+
+                _cnt_ev  = threading.Event()
+                _content = [None]
+                _cerr    = [None]
+
+                def _cnt_cb(content, error):
+                    _content[0] = content
+                    _cerr[0]    = error
+                    _cnt_ev.set()
+
+                try:
+                    SCKmod.SCShareableContent.getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+                        False, True, _cnt_cb)
+                except AttributeError:
+                    SCKmod.SCShareableContent.getExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+                        False, True, _cnt_cb)
+
+                # Give the user up to 60s to respond to the macOS consent dialog
+                # (shown when no TCC entry exists for com.apple.python3).
+                if not _cnt_ev.wait(60):
+                    log.warning("InProcessSCK: content timeout — if a 'Python would like to record your screen' dialog appeared, click Allow then restart the server")
+                    done.set(); return
+                if _cerr[0] or not _content[0]:
+                    log.warning("InProcessSCK: content error: %s — grant Screen Recording in System Settings > Privacy > Screen Recording, then restart", _cerr[0])
+                    done.set(); return
+
+                displays = _content[0].displays()
+                if not displays:
+                    log.warning("InProcessSCK: no displays")
+                    done.set(); return
+
+                display = displays[0]
+                W, H = display.width(), display.height()
+
+                filt = SCKmod.SCContentFilter.alloc().initWithDisplay_excludingApplications_exceptingWindows_(display, [], [])
+                cfg  = SCKmod.SCStreamConfiguration.alloc().init()
+                cfg.setWidth_(W)
+                cfg.setHeight_(H)
+                cfg.setPixelFormat_(0x42475241)  # kCVPixelFormatType_32BGRA
+                cfg.setShowsCursor_(True)
+                cfg.setCapturesAudio_(False)
+
+                writer = FO.alloc().init()
+                stream = SCKmod.SCStream.alloc().initWithFilter_configuration_delegate_(filt, cfg, writer)
+                stream.addStreamOutput_type_sampleHandlerQueue_error_(writer, 0, None, None)
+
+                _st_ev = threading.Event()
+                _serr  = [None]
+                def _st_cb(e): _serr[0] = e; _st_ev.set()
+                stream.startCaptureWithCompletionHandler_(_st_cb)
+
+                if not _st_ev.wait(10):
+                    log.warning("InProcessSCK: start timeout")
+                    done.set(); return
+                if _serr[0]:
+                    log.warning("InProcessSCK: start error: %s", _serr[0])
+                    done.set(); return
+
+                self._stream  = stream
+                self._writer  = writer
+                self._running = True
+                ok[0] = True
+                log.info("InProcessSCK: stream active %dx%d", W, H)
+                done.set()
+                # Hold ObjC refs alive until stopped.
+                while self._running:
+                    time.sleep(1)
+            except Exception as e:
+                log.warning("InProcessSCK: init failed: %s", e)
+                done.set()
+
+        threading.Thread(target=_init, daemon=True).start()
+        done.wait(70)  # allows 60s for user to respond to macOS consent dialog + stream start
+        if not ok[0]:
+            return False
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with self._lock:
+                if self._fb is not None:
+                    log.info("InProcessSCKBridge: %dx%d capture active", self._W, self._H)
+                    return True
+            time.sleep(0.05)
+
+        log.warning("InProcessSCKBridge: no frame in 5s")
+        self._running = False
+        return False
+
+    @property
+    def dimensions(self):
+        with self._lock:
+            return self._W, self._H
+
+    def get_current_frame(self):
+        with self._lock:
+            if self._fb is None:
+                return None, 0
+            return self._fb, self._fb_ms
+
+    def is_running(self):
+        return self._running
+
+# ---------------------------------------------------------------------------
 # BridgeProxy — routes capture calls to DisplayStreamBridge (if active) else VNCBridge,
 # and always routes input (key/pointer/clipboard) to VNCBridge.
 # ---------------------------------------------------------------------------
@@ -856,6 +1050,10 @@ class BridgeProxy:
 
     def send_key_reset(self):
         return self._v.send_key_reset()
+
+    def set_capture(self, ds):
+        """Hot-swap the display capture backend (e.g., when SCK permission is granted later)."""
+        self._d = ds
 
 # ---------------------------------------------------------------------------
 # EncoderPipeline — per-client H.264/H.265 with JPEG fallback
@@ -1658,6 +1856,12 @@ canvas{display:block;position:absolute;image-rendering:pixelated}
       <button class="sk-btn" id="sk-f11">F11</button>
       <button class="sk-btn" id="sk-f12">F12</button>
       <button class="sk-btn" id="sk-cad">Ctrl+Alt+Del</button>
+      <button class="sk-btn" id="sk-ctrlc">Ctrl+C (interrupt)</button>
+      <button class="sk-btn" id="sk-ctrlz">Ctrl+Z (suspend)</button>
+      <button class="sk-btn" id="sk-ctrld">Ctrl+D (EOF)</button>
+      <button class="sk-btn" id="sk-zoom-in">Cmd+= (zoom in)</button>
+      <button class="sk-btn" id="sk-zoom-out">Cmd+- (zoom out)</button>
+      <button class="sk-btn" id="sk-redo">Cmd+Shift+Z (redo)</button>
       <div id="sk-custom">
         <div class="mod-row">
           <label class="mod-cb"><input type="checkbox" id="mod-shift">Shift</label>
@@ -2044,7 +2248,8 @@ ki.addEventListener('keydown',async e=>{
     _ctrlRemapped[code]='MetaLeft';
     code=key='MetaLeft';
     send({t:'kd',k:key,code:code});
-    return; // no preventDefault — let browser Shift etc. still track modifier state
+    e.preventDefault(); // prevent browser Ctrl+key shortcuts (zoom, find, etc.)
+    return;
   }
   // Ctrl+V / Cmd+V: read browser clipboard explicitly; do NOT send 'v' to VNC
   if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){
@@ -2164,6 +2369,24 @@ document.getElementById('sk-f12').addEventListener('click',()=>{
 document.getElementById('sk-cad').addEventListener('click',()=>{
   sendSpecial([['ControlLeft',true],['AltLeft',true],['Delete',true],
                ['Delete',false],['AltLeft',false],['ControlLeft',false]]);ki.focus();
+});
+document.getElementById('sk-ctrlc').addEventListener('click',()=>{
+  sendSpecial([['ControlLeft',true],['c',true],['c',false],['ControlLeft',false]]);ki.focus();
+});
+document.getElementById('sk-ctrlz').addEventListener('click',()=>{
+  sendSpecial([['ControlLeft',true],['z',true],['z',false],['ControlLeft',false]]);ki.focus();
+});
+document.getElementById('sk-ctrld').addEventListener('click',()=>{
+  sendSpecial([['ControlLeft',true],['d',true],['d',false],['ControlLeft',false]]);ki.focus();
+});
+document.getElementById('sk-zoom-in').addEventListener('click',()=>{
+  sendSpecial([['MetaLeft',true],['=',true],['=',false],['MetaLeft',false]]);ki.focus();
+});
+document.getElementById('sk-zoom-out').addEventListener('click',()=>{
+  sendSpecial([['MetaLeft',true],['-',true],['-',false],['MetaLeft',false]]);ki.focus();
+});
+document.getElementById('sk-redo').addEventListener('click',()=>{
+  sendSpecial([['MetaLeft',true],['ShiftLeft',true],['z',true],['z',false],['ShiftLeft',false],['MetaLeft',false]]);ki.focus();
 });
 
 // Custom key sender: modifier checkboxes + key input
@@ -2338,9 +2561,28 @@ async def _main(cfg, ds=None):
     handler = lambda ws: ws_handler(ws)
     log.info("Listening %s:%d  codec=%s  max_fps=%d  capture=%s",
              cfg.listen, cfg.port, cfg.codec, cfg.max_fps, cap_mode)
+
+    async def _sck_retry_loop():
+        """Background task: retry InProcessSCKBridge every 30s.
+        Activates 60fps capture automatically after user grants Screen Recording permission."""
+        await asyncio.sleep(30)
+        while True:
+            if bridge._d is None or not bridge._d.is_running():
+                try:
+                    loop = asyncio.get_event_loop()
+                    ip = InProcessSCKBridge()
+                    ok = await loop.run_in_executor(None, ip.start)
+                    if ok:
+                        bridge.set_capture(ip)
+                        log.info("SCK capture activated via retry — now 60fps")
+                except Exception as e:
+                    log.debug("SCK retry: %s", e)
+            await asyncio.sleep(30)
+
     async with serve(handler, cfg.listen, cfg.port,
                      process_request=http_handler,
                      max_size=None, compression=None):
+        asyncio.create_task(_sck_retry_loop())
         await asyncio.Future()
 
 _COMPOSITOR_KEEPALIVE_SCRIPT = """\
@@ -2465,6 +2707,37 @@ def _start_compositor_keepalive():
     except Exception as e:
         log.warning("compositor keepalive unavailable: %s", e)
 
+def _request_screen_capture_access():
+    """Request Screen Recording permission on macOS 13+.
+    Initializes NSApp so the system consent dialog can appear from a LaunchAgent context.
+    Returns True if already granted; False if the dialog was shown (user must click Allow)
+    or if permission is denied."""
+    try:
+        import ctypes
+        cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        cg.CGRequestScreenCaptureAccess.restype   = ctypes.c_bool
+        if cg.CGPreflightScreenCaptureAccess():
+            return True
+        # Initialize NSApp so the system dialog can be presented from a LaunchAgent.
+        try:
+            from AppKit import NSApplication
+            NSApplication.sharedApplication()
+        except Exception:
+            pass
+        result = cg.CGRequestScreenCaptureAccess()
+        if not result:
+            log.info(
+                "Screen Recording: permission not yet granted. "
+                "To enable 60fps SCK capture: open System Settings → Privacy & Security → "
+                "Screen Recording, enable Python (com.apple.python3), then the server will "
+                "automatically switch to 60fps within ~30 seconds."
+            )
+        return bool(result)
+    except Exception as e:
+        log.debug("screen capture access request: %s", e)
+        return False
+
 def _request_accessibility():
     """Open System Settings → Accessibility if Python isn't trusted yet."""
     try:
@@ -2544,10 +2817,16 @@ def main():
         print("Error: provide --vnc-pass or --macos-user + --macos-pass")
         raise SystemExit(1)
     log.info("Target codec: %s (PyAV: %s)", cfg.codec, "yes" if _AV_OK else "NO — pip install av")
+    _request_screen_capture_access()
     _request_accessibility()
     _start_compositor_keepalive()
     ds = None
-    if _check_screen_capture():
+    # Try in-process SCK first: avoids subprocess permission/session issues on macOS 26.
+    ip = InProcessSCKBridge()
+    if ip.start():
+        ds = ip
+        log.info("capture=SCK-inproc")
+    elif _check_screen_capture():
         ds = DisplayStreamBridge()
         if not ds.start():
             log.warning("DisplayStreamBridge failed — falling back to VNC capture")
