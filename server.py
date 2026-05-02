@@ -2457,6 +2457,11 @@ async function _checkClipboardPermission(){
     if(navigator.permissions){
       try{perm=await navigator.permissions.query({name:'clipboard-read'});}catch(e){}
       if(perm){
+        // Free event hook — no polling; reacts instantly if user toggles in browser settings
+        perm.onchange=()=>{
+          clipSynced=(perm.state==='granted');
+          if(clipSynced)_startClipPoll();else _stopClipPoll();
+        };
         if(perm.state==='granted'){clipSynced=true;_startClipPoll();return;}
         if(perm.state==='denied')return; // hard-denied; CTRL+V fallback only
         // 'prompt': fall through — try readText() once to trigger the dialog
@@ -2493,15 +2498,19 @@ function _stopClipPoll(){
 }
 
 // Push browser clipboard to Mac if it has changed. Called every 1s (only
-// when clipSynced and tab is visible) and immediately on tab focus/connect.
+// when clipSynced and tab is genuinely focused) and immediately on focus/connect.
+// IMPORTANT: Chrome requires document.hasFocus() — not just !document.hidden.
+// A visible-but-unfocused tab throws "Document is not focused" from readText(),
+// which must NOT be treated as permission revocation.
 async function _pollBrowserClipboard(){
-  if(!clipSynced||!wsOpen||document.hidden)return;
+  if(!clipSynced||!wsOpen||!document.hasFocus())return;
   try{
     const text=await navigator.clipboard.readText();
     if(text&&text!==_lastMacClipboard){_lastMacClipboard=text;send({t:'setclip',text});}
   }catch(e){
-    clipSynced=false; // permission revoked or API unavailable
-    _stopClipPoll();
+    // Only treat as revocation if we still have focus — a focus-loss race can
+    // produce "Document is not focused" even though permission is intact.
+    if(document.hasFocus()){clipSynced=false;_stopClipPoll();}
   }
 }
 
