@@ -302,7 +302,8 @@ def _cg_release_all() -> None:
             _Q.CGEventPost(_Q.kCGHIDEventTap, evt)
         _cg_mod_held.clear()
         if _cg_mouse_prev_btn:
-            pt = _Q.CGPoint(0, 0)
+            lx, ly = _cg_mouse_last_pt
+            pt = _Q.CGPoint(lx, ly)
             for mask, _, up_name, btn_name in _CG_BTNS:
                 if _cg_mouse_prev_btn & mask:
                     _Q.CGEventPost(_Q.kCGHIDEventTap,
@@ -342,6 +343,10 @@ def _poll_cg_kb():
 
 # Previous VNC button mask for delta detection (CGEvent path only).
 _cg_mouse_prev_btn: int = 0
+# Last known CGEvent pointer position (native Mac coordinates, top-left origin).
+# Stored so _cg_release_all() can release buttons at the correct position instead
+# of posting a button-up at (0,0) which would teleport the Mac cursor to top-left.
+_cg_mouse_last_pt: tuple = (0, 0)
 
 # kCGEvent* constants accessed at call-time to avoid import-time Quartz dependency.
 _CG_BTNS = (
@@ -359,10 +364,11 @@ def _cg_send_pointer(buttons: int, x: int, y: int) -> bool:
     so VNC coordinates map directly — no Y-flip needed.
     Returns True on success; caller falls back to VNC on False.
     """
-    global _cg_mouse_prev_btn
+    global _cg_mouse_prev_btn, _cg_mouse_last_pt
     try:
         import Quartz as _Q
         pt = _Q.CGPoint(x, y)
+        _cg_mouse_last_pt = (x, y)
         changed = buttons ^ _cg_mouse_prev_btn
         _cg_mouse_prev_btn = buttons
 
@@ -2305,6 +2311,8 @@ canvas{display:block;position:absolute}
   <div id="dock-body">
     <button class="dock-btn" id="btn-fs">Fullscreen</button>
     <button class="dock-btn" id="btn-fit">Fit screen</button>
+    <button class="dock-btn" id="btn-plock" style="display:none">Pointer lock [off]</button>
+    <button class="dock-btn" id="btn-hide-cursor">Hide cursor [off]</button>
     <button class="dock-btn active" id="btn-ctrl">Ctrl=Cmd [on]</button>
     <button class="dock-btn" id="btn-sk">Special keys ▾</button>
     <div id="sk-menu">
@@ -2371,6 +2379,10 @@ let ctrlToMeta=!navigator.userAgent.includes('Macintosh');
 let _ctrlRemapped={};    // tracks in-flight ctrl→meta remap for keyup pairing
 const _suppressedKd=new Set(); // keys whose keydown was intercepted; suppress matching keyup
 let _suppressReconnect=false,_hiddenTimer=null;  // tab visibility disconnect
+let _hideCursor=false;      // dock "Hide cursor" toggle
+let _plockActive=false;     // pointer lock engaged (real or emulated)
+let _plockVX=0,_plockVY=0; // virtual cursor position in native Mac coords (pointer lock mode)
+const _plockSupported='requestPointerLock' in document.documentElement||'requestPointerLock' in (document.createElement('canvas'));
 
 // Metrics
 let rxBytes=0,rxBps=0;         // WebSocket receive bandwidth
@@ -2731,13 +2743,22 @@ function toVNC(cx,cy){return[Math.round((cx-ox)*scaleX),Math.round((cy-oy)*scale
 function inBounds(vx,vy){return vx>=0&&vy>=0&&vx<_nativeW&&vy<_nativeH;}
 
 document.body.addEventListener('mousemove',e=>{
+  if(_plockActive){
+    // Pointer lock: use movementX/Y (relative) to update virtual Mac cursor position.
+    // movementX/Y are in CSS pixels; scaleX/Y convert CSS→native coordinates.
+    _plockVX=Math.max(0,Math.min(_nativeW-1,_plockVX+e.movementX*scaleX));
+    _plockVY=Math.max(0,Math.min(_nativeH-1,_plockVY+e.movementY*scaleY));
+    send({t:'mm',x:Math.round(_plockVX),y:Math.round(_plockVY),b:mBtn});
+    return;
+  }
   cur.style.left=e.clientX+'px';cur.style.top=e.clientY+'px';
   const[vx,vy]=toVNC(e.clientX,e.clientY);
   if(inBounds(vx,vy))send({t:'mm',x:vx,y:vy,b:mBtn});
 });
 canvas.addEventListener('mousedown',e=>{
   mBtn|=(1<<e.button);cur.classList.add('dn');
-  const[vx,vy]=toVNC(e.clientX,e.clientY);
+  // In pointer lock mode clientX/Y are frozen; use virtual cursor position instead.
+  const[vx,vy]=_plockActive?[Math.round(_plockVX),Math.round(_plockVY)]:toVNC(e.clientX,e.clientY);
   send({t:'md',b:e.button,x:vx,y:vy});
   e.preventDefault();ki.focus();
 });
@@ -2745,12 +2766,12 @@ canvas.addEventListener('mousedown',e=>{
 window.addEventListener('mouseup',e=>{
   if(!(mBtn&(1<<e.button)))return;
   mBtn&=~(1<<e.button);cur.classList.remove('dn');
-  const[vx,vy]=toVNC(e.clientX,e.clientY);
+  const[vx,vy]=_plockActive?[Math.round(_plockVX),Math.round(_plockVY)]:toVNC(e.clientX,e.clientY);
   send({t:'mu',b:e.button,x:vx,y:vy});
 });
 canvas.addEventListener('contextmenu',e=>e.preventDefault());
 canvas.addEventListener('wheel',e=>{
-  const[vx,vy]=toVNC(e.clientX,e.clientY);
+  const[vx,vy]=_plockActive?[Math.round(_plockVX),Math.round(_plockVY)]:toVNC(e.clientX,e.clientY);
   // Normalize to integer click-counts: deltaMode 0=pixels, 1=lines(×40), 2=page(×800)
   const mul=e.deltaMode===1?40:e.deltaMode===2?800:1;
   const norm=v=>v===0?0:Math.sign(v)*Math.max(1,Math.min(8,Math.round(Math.abs(v*mul)/80)));
@@ -2950,7 +2971,10 @@ document.addEventListener('fullscreenchange',async()=>{
     ki.focus();
   }else{
     try{if(navigator.keyboard)navigator.keyboard.unlock();}catch(e){}
+    // If emulated pointer lock was active (fullscreen-only path), exit it.
+    if(_plockActive&&!_plockSupported)_plockExit();
   }
+  _updatePlockBtn();
 });
 document.getElementById('btn-fs').addEventListener('click',()=>{
   if(!document.fullscreenElement)document.documentElement.requestFullscreen().catch(()=>{});
@@ -2965,6 +2989,73 @@ btnFit.addEventListener('click',()=>{
   btnFit.classList.toggle('active',fitMode==='cover');
   resize();ki.focus();
 });
+
+// ---------------------------------------------------------------------------
+// Hide cursor toggle
+// ---------------------------------------------------------------------------
+const btnHideCursor=document.getElementById('btn-hide-cursor');
+function _applyHideCursor(){
+  // Apply or remove cursor:none. Pointer lock also hides cursor; this is orthogonal.
+  const hide=_hideCursor||_plockActive;
+  canvas.style.cursor=hide?'none':'';
+  cur.style.display=hide?'none':'';
+}
+btnHideCursor.addEventListener('click',()=>{
+  _hideCursor=!_hideCursor;
+  btnHideCursor.textContent='Hide cursor ['+ (_hideCursor?'on':'off')+']';
+  btnHideCursor.classList.toggle('active',_hideCursor);
+  _applyHideCursor();
+  ki.focus();
+});
+
+// ---------------------------------------------------------------------------
+// Pointer lock — real API when supported; emulated (movementX/Y) in fullscreen
+// ---------------------------------------------------------------------------
+function _updatePlockBtn(){
+  const btn=document.getElementById('btn-plock');
+  // Show if real pointer lock is supported, or if we're in fullscreen (emulated mode).
+  const visible=_plockSupported||!!document.fullscreenElement;
+  btn.style.display=visible?'':'none';
+  btn.textContent='Pointer lock ['+ (_plockActive?'on':'off')+']';
+  btn.classList.toggle('active',_plockActive);
+}
+function _plockEnter(){
+  if(_plockSupported){
+    canvas.requestPointerLock();  // pointerlockchange event will set _plockActive
+  }else if(document.fullscreenElement){
+    // Emulated: hide cursor + track movementX/Y; mouse can't escape fullscreen.
+    _plockActive=true;
+    _plockVX=_nativeW/2;_plockVY=_nativeH/2;
+    _applyHideCursor();
+    dockOpen(false);
+    _updatePlockBtn();
+  }
+}
+function _plockExit(){
+  if(_plockSupported&&document.pointerLockElement){
+    document.exitPointerLock();  // pointerlockchange will clean up
+  }else if(_plockActive){
+    _plockActive=false;
+    _applyHideCursor();
+    _updatePlockBtn();
+  }
+}
+// Real pointer lock: browser fires this on acquire and release.
+document.addEventListener('pointerlockchange',()=>{
+  _plockActive=!!document.pointerLockElement;
+  if(_plockActive){
+    _plockVX=_nativeW/2;_plockVY=_nativeH/2;
+    dockOpen(false);
+  }
+  _applyHideCursor();
+  _updatePlockBtn();
+});
+document.getElementById('btn-plock').addEventListener('click',()=>{
+  if(_plockActive)_plockExit();else _plockEnter();
+  ki.focus();
+});
+// Prevent dock from opening while pointer lock is active (all DOM blocked per spec).
+dockTab.addEventListener('click',e=>{if(_plockActive){e.stopImmediatePropagation();}},{capture:true});
 
 const btnCtrl=document.getElementById('btn-ctrl');
 // Sync button label to initial auto-detected state
