@@ -2126,7 +2126,7 @@ HTML = r"""<!DOCTYPE html>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{width:100%;height:100%;background:#111;overflow:hidden}
-canvas{display:block;position:absolute;image-rendering:pixelated}
+canvas{display:block;position:absolute}
 #hud{position:fixed;top:6px;right:10px;color:#0f0;font:11px monospace;
   background:rgba(0,0,0,.7);padding:2px 8px;border-radius:3px;z-index:9;
   cursor:pointer;user-select:none}
@@ -2269,21 +2269,24 @@ function resize(){
   const ar=imgW/imgH,vr=vw/vh;
   let cw,ch;
   if(fitMode==='cover'){
-    // Fill window — canvas may extend beyond edges (clipped by overflow:hidden)
     if(ar>vr){ch=vh;cw=vh*ar}else{cw=vw;ch=vw/ar}
   }else{
-    // Letterbox — entire image visible with black bars
     if(ar>vr){cw=vw;ch=vw/ar}else{ch=vh;cw=vh*ar}
   }
   ox=(vw-cw)/2;oy=(vh-ch)/2;
   canvas.style.cssText='left:'+ox+'px;top:'+oy+'px;width:'+cw+'px;height:'+ch+'px;position:absolute;';
   scaleX=imgW/cw;scaleY=imgH/ch;
+  // Size canvas backing to physical pixels so compositing is 1:1 — no GPU scaling step.
+  const dpr=window.devicePixelRatio||1;
+  canvas.width=Math.round(cw*dpr);canvas.height=Math.round(ch*dpr);
 }
 window.addEventListener('resize',()=>{resize();sendRes();});
+// Recompute when DPR changes (e.g. dragging window to a different monitor).
+(()=>{const mq=matchMedia(`(resolution: ${window.devicePixelRatio||1}dppx)`);mq.addEventListener('change',()=>{resize();},{ once:true });})();
 
 function setDim(w,h){
   if(w===imgW&&h===imgH)return;
-  imgW=w;imgH=h;canvas.width=w;canvas.height=h;resize();
+  imgW=w;imgH=h;resize();
 }
 
 // ---------------------------------------------------------------------------
@@ -2329,7 +2332,7 @@ function initDecoder(codec){
     decoder=new VideoDecoder({
       output:frame=>{
         setDim(frame.codedWidth,frame.codedHeight);
-        ctx.drawImage(frame,0,0);frame.close();
+        ctx.drawImage(frame,0,0,canvas.width,canvas.height);frame.close();
         fc++;updateFps();
       },
       error:e=>{console.warn('VideoDecoder:',e);useVideo=false;decoder=null;}
@@ -2378,7 +2381,7 @@ function handleBinary(buf){
     // JPEG path
     createImageBitmap(new Blob([payload],{type:'image/jpeg'})).then(bmp=>{
       setDim(bmp.width,bmp.height);
-      ctx.drawImage(bmp,0,0);bmp.close();
+      ctx.drawImage(bmp,0,0,canvas.width,canvas.height);bmp.close();
       fc++;updateFps();
     }).catch(()=>{});
   }else{
@@ -2890,7 +2893,7 @@ document.addEventListener('visibilitychange',()=>{
 window.addEventListener('blur',()=>{
   if(wsOpen)send({t:'reset'});
 });
-canvas.width=imgW;canvas.height=imgH;resize();connect();connectMetric();
+resize();connect();connectMetric();
 </script></body></html>
 """
 HTML_BYTES = HTML.encode("utf-8")
