@@ -2074,6 +2074,9 @@ const st=document.getElementById('st'),ki=document.getElementById('ki');
 
 let imgW=1920,imgH=1080,scaleX=1,scaleY=1,ox=0,oy=0;
 let ws,wsOpen=false,mBtn=0,fc=0,lastFpsT=performance.now();
+let clipSynced=false;       // true only when navigator.clipboard.readText() permission is persistently granted
+let _lastMacClipboard='';   // last clipboard text known on Mac side; used to break browser↔Mac sync loop
+let _clipPollTimer=null;    // setInterval handle for browser-clipboard polling
 let fitMode='fit';       // 'fit' = letterbox, 'cover' = fill/crop
 // Default ctrlToMeta ON for Windows/Linux (Ctrl+C/V → Cmd+C/V on Mac).
 // Default OFF on macOS browsers — user has a physical Cmd key, no remap needed.
@@ -2263,6 +2266,7 @@ function connect(){
     st.textContent='connected';
     startLagReporter();
     ki.focus();
+    _checkClipboardPermission(); // silently request clipboard-read permission once per connection
     // Probe codec support async; send caps once probing is done so server picks
     // the best codec this browser can actually decode (H.265 > H.264 > JPEG).
     const haswc=typeof VideoDecoder!=='undefined';
@@ -2295,7 +2299,10 @@ function connect(){
         if(msg.t==='stale'){
           staleMs=msg.ms||0;
         }else if(msg.t==='clipboard'){
-          // Mac clipboard → dock textarea + browser clipboard
+          // Mac clipboard → dock textarea + browser clipboard.
+          // Update _lastMacClipboard BEFORE _writeClipboard so the next
+          // async poll sees it and skips re-sending the same text back.
+          _lastMacClipboard=msg.text;
           clipTA.value=msg.text;
           _writeClipboard(msg.text);
           st.textContent='[clipboard] '+msg.text.substring(0,50);
@@ -2405,7 +2412,10 @@ canvas.addEventListener('touchend',e=>{
 
 // Send text to Mac by typing it character-by-character (bypasses clipboard sync)
 function sendPasteText(text){
-  if(text&&wsOpen)send({t:'paste',text});
+  if(text&&wsOpen){
+    _lastMacClipboard=text; // optimistic: prevent the server-echo from looping back
+    send({t:'paste',text});
+  }
 }
 
 // Write text to the browser's local clipboard.
@@ -2429,21 +2439,76 @@ function _legacyCopy(text){
   ki.focus(); // restore VNC keyboard focus
 }
 
-// Read browser clipboard and paste to Mac.
-// Uses navigator.clipboard.readText() (requires focus+permission or HTTPS).
-// Falls back to showing the clipboard textarea so user can paste manually.
-async function pasteFromBrowserClipboard(){
-  let text='';
+// ---------------------------------------------------------------------------
+// Async clipboard permission + bidirectional sync (browser-agnostic)
+//
+// clipSynced=true only when navigator.clipboard.readText() has a persistent
+// grant (permission.state==='granted') or no Permissions API exists and a
+// live readText() call succeeds.  Firefox shows a per-call paste button that
+// never becomes 'granted', so clipSynced stays false there — CTRL+V via the
+// ki paste event is the working path.  Chrome grants persistently after one
+// dialog, making full background sync possible.
+// ---------------------------------------------------------------------------
+
+async function _checkClipboardPermission(){
+  if(!navigator.clipboard||!navigator.clipboard.readText)return;
   try{
-    if(navigator.clipboard&&navigator.clipboard.readText)
-      text=await navigator.clipboard.readText();
-  }catch(e){}
-  if(text){sendPasteText(text);return;}
-  // Clipboard API blocked — open dock clipboard textarea for manual paste
-  dockOpen(true);
-  clipTA.focus();
-  clipTA.select();
-  st.textContent='Paste your text into the box, then click "Paste on Mac"';
+    let perm=null;
+    if(navigator.permissions){
+      try{perm=await navigator.permissions.query({name:'clipboard-read'});}catch(e){}
+      if(perm){
+        // React to future permission toggles in browser settings without polling
+        perm.onchange=()=>{
+          clipSynced=(perm.state==='granted');
+          if(clipSynced)_startClipPoll();else _stopClipPoll();
+        };
+        if(perm.state==='granted'){clipSynced=true;_startClipPoll();return;}
+        if(perm.state==='denied')return; // hard-denied; CTRL+V fallback only
+        // 'prompt': fall through — try readText() once to trigger the dialog
+      }
+    }
+    // One-time readText() attempt: shows permission dialog on Chrome, a one-time
+    // paste button on Firefox.  NOT called repeatedly — Firefox's per-call button
+    // would be too intrusive if polled every second.
+    const text=await navigator.clipboard.readText();
+    // Check whether we now have a persistent grant
+    let granted=false;
+    if(perm){
+      granted=(perm.state==='granted'); // Firefox stays 'prompt' — don't poll
+    }else{
+      granted=true; // no Permissions API; readText() succeeded → trust it
+    }
+    if(granted){
+      clipSynced=true;
+      _startClipPoll();
+      // Immediately push browser clipboard to Mac (user just connected/refocused)
+      if(text&&text!==_lastMacClipboard&&wsOpen){_lastMacClipboard=text;send({t:'setclip',text});}
+    }
+  }catch(e){
+    clipSynced=false; // denied or unsupported; silent fallback
+  }
+}
+
+function _startClipPoll(){
+  if(_clipPollTimer)return;
+  _clipPollTimer=setInterval(_pollBrowserClipboard,1000);
+}
+function _stopClipPoll(){
+  if(_clipPollTimer){clearInterval(_clipPollTimer);_clipPollTimer=null;}
+}
+
+// Push browser clipboard to Mac if it has changed. Called every 1s (only
+// when clipSynced and tab is visible) and immediately on tab focus/connect.
+async function _pollBrowserClipboard(){
+  if(!clipSynced||!wsOpen||document.hidden)return;
+  try{
+    const text=await navigator.clipboard.readText();
+    if(text&&text!==_lastMacClipboard){_lastMacClipboard=text;send({t:'setclip',text});}
+  }catch(e){
+    // Permission revoked (e.g. user toggled it off in browser settings)
+    clipSynced=false;
+    _stopClipPoll();
+  }
 }
 
 ki.addEventListener('keydown',async e=>{
@@ -2486,9 +2551,11 @@ document.addEventListener('paste',e=>{
   if(text&&wsOpen){sendPasteText(text);e.preventDefault();}
 });
 
-// Refocus hidden textarea on canvas click and window focus so keyboard events route correctly
+// Refocus hidden textarea on canvas click and window focus so keyboard events route correctly.
+// On window focus: if clipboard is synced, immediately push browser clipboard to Mac so the
+// user's client-side clipboard is authoritative after switching back to this tab.
 canvas.addEventListener('click',()=>ki.focus());
-window.addEventListener('focus',()=>ki.focus());
+window.addEventListener('focus',()=>{ki.focus();if(clipSynced)_pollBrowserClipboard();});
 
 // ---------------------------------------------------------------------------
 // Dock UI
@@ -2620,12 +2687,13 @@ document.getElementById('clip-paste').addEventListener('click',()=>{
 });
 document.getElementById('clip-clear').addEventListener('click',()=>{clipTA.value='';ki.focus();});
 
-// Bidirectional sync: when user edits clipTA, update Mac clipboard in real-time (debounced 400ms)
+// Bidirectional sync: when user edits clipTA, update Mac clipboard in real-time (debounced 400ms).
+// Set _lastMacClipboard to prevent the server echo from being re-sent back.
 let _clipTATimer=null;
 clipTA.addEventListener('input',()=>{
   clearTimeout(_clipTATimer);
   _clipTATimer=setTimeout(()=>{
-    if(wsOpen)send({t:'setclip',text:clipTA.value});
+    if(wsOpen){_lastMacClipboard=clipTA.value;send({t:'setclip',text:clipTA.value});}
   },400);
 });
 
@@ -2648,6 +2716,7 @@ document.addEventListener('visibilitychange',()=>{
       connect();
     }else if(wsOpen){
       send({t:'reset'});
+      if(clipSynced)_pollBrowserClipboard(); // push browser clipboard to Mac immediately
     }
     ki.focus();
   }
