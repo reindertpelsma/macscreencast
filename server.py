@@ -49,86 +49,147 @@ def _encode_jpeg(rgb, quality):
     return buf.getvalue()
 
 # ---------------------------------------------------------------------------
-# CGWindowListCreateImage capture subprocess — Python script sent via -c to sys.executable.
-# Requires Screen Recording (kTCCServiceScreenCapture) to be granted to python3.
-# Writes frames to stdout: magic(4) + W(4LE) + H(4LE) + ts_ms(8LE) + W*H*3 RGB bytes.
+# SCK (ScreenCaptureKit) capture subprocess — Python script sent via -c to sys.executable.
+# Requires the enhanced Screen Recording permission on macOS 15+ (System Settings >
+# Privacy & Security > Screen Recording — toggle Python on).
+# On macOS 26+, CGWindowListCreateImage only captures the desktop wallpaper;
+# SCK is the only API that delivers full screen including application windows.
+# Frame wire format: BVNC(4) + W(4LE uint32) + H(4LE uint32) + ts_ms(8LE uint64) + W*H*4 BGRA bytes.
 # ---------------------------------------------------------------------------
 _SCSTREAM_CAPTURE_SRC = r"""
-# CGWindowListCreateImage polling capture subprocess.
-# CGDisplayStream returns NULL on macOS 26+; SCK/AVFoundation require a separate TCC
-# grant that isn't in the legacy kTCCServiceScreenCapture DB entry.
-# CGWindowListCreateImage still honours the legacy grant and delivers ~60fps peak.
-# No artificial fps cap: the subprocess runs as fast as CGWindowListCreateImage allows
-# (~13ms per frame at 1920x1080 when sending BGRA = ~75fps theoretical).
-# Frame wire format: BVNC(4) + W(4LE uint32) + H(4LE uint32) + ts_ms(8LE uint64) + W*H*4 BGRA bytes.
-# Magic BVNC (not UVNC) signals BGRA payload so the server reads 4 bytes/pixel.
-import sys, os, struct, time, ctypes
-import Quartz
+# SCK capture subprocess via PyObjC ScreenCaptureKit.
+# Runs a CoreFoundation run loop on the main thread; SCK delivers frames there.
+# CVPixelBuffer raw bytes are extracted via ctypes CoreVideo.
+import sys, os, struct, time, threading, ctypes
+from Foundation import NSObject, NSRunLoop, NSDate, NSDefaultRunLoopMode
+import ScreenCaptureKit as SCK
+import CoreMedia
 
-MAGIC = b'BVNC'   # B = BGRA variant
+MAGIC = b'BVNC'
 out   = sys.stdout.buffer
+ppid  = os.getppid()
 
-_cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-_cg.CGMainDisplayID.restype      = ctypes.c_uint32
-_cg.CGDisplayPixelsWide.argtypes = [ctypes.c_uint32]; _cg.CGDisplayPixelsWide.restype = ctypes.c_size_t
-_cg.CGDisplayPixelsHigh.argtypes = [ctypes.c_uint32]; _cg.CGDisplayPixelsHigh.restype = ctypes.c_size_t
+_cv = ctypes.CDLL('/System/Library/Frameworks/CoreVideo.framework/CoreVideo')
+_cv.CVPixelBufferLockBaseAddress.restype    = ctypes.c_int32
+_cv.CVPixelBufferLockBaseAddress.argtypes   = [ctypes.c_void_p, ctypes.c_uint64]
+_cv.CVPixelBufferUnlockBaseAddress.restype  = ctypes.c_int32
+_cv.CVPixelBufferUnlockBaseAddress.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+_cv.CVPixelBufferGetBaseAddress.restype     = ctypes.c_void_p
+_cv.CVPixelBufferGetBaseAddress.argtypes    = [ctypes.c_void_p]
+_cv.CVPixelBufferGetWidth.restype           = ctypes.c_size_t
+_cv.CVPixelBufferGetWidth.argtypes          = [ctypes.c_void_p]
+_cv.CVPixelBufferGetHeight.restype          = ctypes.c_size_t
+_cv.CVPixelBufferGetHeight.argtypes         = [ctypes.c_void_p]
+_cv.CVPixelBufferGetBytesPerRow.restype     = ctypes.c_size_t
+_cv.CVPixelBufferGetBytesPerRow.argtypes    = [ctypes.c_void_p]
 
-display = _cg.CGMainDisplayID()
-W = int(_cg.CGDisplayPixelsWide(display))
-H = int(_cg.CGDisplayPixelsHigh(display))
-if W <= 0 or H <= 0:
-    sys.stderr.write("CGWindowListCapture: invalid display dimensions\n")
+class _FrameOutput(NSObject):
+    def stream_didOutputSampleBuffer_ofType_(self, stream, sampleBuffer, outputType):
+        if outputType != 0:  # SCStreamOutputTypeScreen == 0
+            return
+        try:
+            pb_obj = CoreMedia.CMSampleBufferGetImageBuffer(sampleBuffer)
+            if pb_obj is None:
+                return
+            # PyObjC wraps CF objects; hash() returns the CF pointer for NSObject-bridged types.
+            pb = hash(pb_obj)
+            _cv.CVPixelBufferLockBaseAddress(pb, 1)  # kCVPixelBufferLock_ReadOnly = 1
+            try:
+                W   = int(_cv.CVPixelBufferGetWidth(pb))
+                H   = int(_cv.CVPixelBufferGetHeight(pb))
+                bpr = int(_cv.CVPixelBufferGetBytesPerRow(pb))
+                if W <= 0 or H <= 0:
+                    return
+                base = _cv.CVPixelBufferGetBaseAddress(pb)
+                if not base:
+                    return
+                ts_ms = int(time.time() * 1000)
+                hdr = MAGIC + struct.pack('<IIQ', W, H, ts_ms)
+                if bpr == W * 4:
+                    pixel_data = ctypes.string_at(base, H * bpr)
+                else:
+                    pixel_data = b''.join(ctypes.string_at(base + r * bpr, W * 4) for r in range(H))
+                out.write(hdr + pixel_data)
+                out.flush()
+            finally:
+                _cv.CVPixelBufferUnlockBaseAddress(pb, 1)
+        except BrokenPipeError:
+            os._exit(0)
+        except Exception as e:
+            sys.stderr.write('SCKCapture frame: ' + str(e) + '\n')
+
+_ready  = threading.Event()
+_content = [None]
+_cerr   = [None]
+
+def _content_cb(content, error):
+    _content[0] = content
+    _cerr[0]    = error
+    _ready.set()
+
+try:
+    SCK.SCShareableContent.getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+        False, True, _content_cb)
+except AttributeError:
+    # Older macOS: try legacy method name
+    SCK.SCShareableContent.getExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+        False, True, _content_cb)
+
+t0 = time.time()
+while not _ready.is_set() and time.time() - t0 < 10:
+    NSRunLoop.mainRunLoop().runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.1))
+
+if _cerr[0] or _content[0] is None:
+    sys.stderr.write('SCKCapture: content error: ' + str(_cerr[0]) + '\n')
     sys.exit(1)
 
-sys.stderr.write(f"CGWindowListCapture: starting {W}x{H} at max fps (BGRA)\n")
+displays = _content[0].displays()
+if not displays:
+    sys.stderr.write('SCKCapture: no displays\n')
+    sys.exit(1)
+
+display = displays[0]
+W, H    = display.width(), display.height()
+sys.stderr.write('SCKCapture: starting ' + str(W) + 'x' + str(H) + ' @ 60fps (BGRA/SCK)\n')
 sys.stderr.flush()
 
-# Pre-allocate a reusable BGRA buffer and bitmap context (avoids per-frame alloc).
-# Sending BGRA directly (no RGB conversion) saves ~7ms/frame vs the RGB path.
-bpr = W * 4
-buf = (ctypes.c_uint8 * (bpr * H))()
-ctx = Quartz.CGBitmapContextCreateWithData(
-    buf, W, H, 8, bpr,
-    Quartz.CGColorSpaceCreateDeviceRGB(),
-    Quartz.kCGImageAlphaNoneSkipFirst | Quartz.kCGBitmapByteOrder32Host,
-    None, None
-)
-if not ctx:
-    sys.stderr.write("CGWindowListCapture: CGBitmapContextCreateWithData failed\n")
+filt   = SCK.SCContentFilter.alloc().initWithDisplay_excludingApplications_exceptingWindows_(display, [], [])
+config = SCK.SCStreamConfiguration.alloc().init()
+config.setWidth_(W)
+config.setHeight_(H)
+config.setPixelFormat_(0x42475241)  # kCVPixelFormatType_32BGRA
+config.setShowsCursor_(True)
+config.setCapturesAudio_(False)
+
+writer = _FrameOutput.alloc().init()
+stream = SCK.SCStream.alloc().initWithFilter_configuration_delegate_(filt, config, writer)
+stream.addStreamOutput_type_sampleHandlerQueue_error_(writer, 0, None, None)
+
+_started = threading.Event()
+_serr    = [None]
+def _start_cb(e): _serr[0] = e; _started.set()
+stream.startCaptureWithCompletionHandler_(_start_cb)
+
+t0 = time.time()
+while not _started.is_set() and time.time() - t0 < 8:
+    NSRunLoop.mainRunLoop().runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.1))
+
+if _serr[0]:
+    sys.stderr.write('SCKCapture: start error: ' + str(_serr[0]) + '\n')
     sys.exit(1)
 
-bounds      = Quartz.CGRectMake(0, 0, W, H)
-ppid        = os.getppid()
-_ppid_check = 0   # check parent liveness every ~5s
+sys.stderr.write('SCKCapture: stream active\n')
+sys.stderr.flush()
 
+# Run main loop; parent-death watchdog fires every ~5s
+_ppid_check = 0
 while True:
+    NSRunLoop.mainRunLoop().runMode_beforeDate_(NSDefaultRunLoopMode, NSDate.dateWithTimeIntervalSinceNow_(0.01))
     _ppid_check += 1
-    if _ppid_check >= 200:
+    if _ppid_check >= 500:
         _ppid_check = 0
-        try:
-            os.kill(ppid, 0)
-        except ProcessLookupError:
-            break
-
-    img = Quartz.CGWindowListCreateImage(
-        Quartz.CGRectInfinite,
-        Quartz.kCGWindowListOptionOnScreenOnly,
-        Quartz.kCGNullWindowID,
-        Quartz.kCGWindowImageDefault,
-    )
-    if img is None:
-        time.sleep(0.1)
-        continue
-
-    Quartz.CGContextDrawImage(ctx, bounds, img)
-
-    ts_ms = int(time.time() * 1000)
-    try:
-        out.write(MAGIC + struct.pack('<IIQ', W, H, ts_ms))
-        out.write(bytes(buf))   # raw BGRA — no intermediate copy needed
-        out.flush()
-    except BrokenPipeError:
-        os._exit(0)
+        try: os.kill(ppid, 0)
+        except ProcessLookupError: break
 """
 
 # ---------------------------------------------------------------------------
@@ -647,7 +708,7 @@ class VNCBridge:
         threading.Thread(target=self._run, daemon=True).start()
 
 # ---------------------------------------------------------------------------
-# DisplayStreamBridge — direct screen capture via CGWindowListCreateImage subprocess.
+# DisplayStreamBridge — direct screen capture via SCK (ScreenCaptureKit) subprocess.
 # Requires Screen Recording (kTCCServiceScreenCapture) granted to python3.
 # Falls back gracefully: if no frame within 5s, is_running() returns False and
 # BridgeProxy switches to VNCBridge for all capture calls.
@@ -2273,7 +2334,7 @@ async def _main(cfg, ds=None):
     http_handler = make_http_handler(cfg, bridge)
     ws_handler = make_ws_handler(cfg, bridge)
 
-    cap_mode = "CGWindowList" if (ds and ds.is_running()) else "VNC"
+    cap_mode = "SCK" if (ds and ds.is_running()) else "VNC"
     handler = lambda ws: ws_handler(ws)
     log.info("Listening %s:%d  codec=%s  max_fps=%d  capture=%s",
              cfg.listen, cfg.port, cfg.codec, cfg.max_fps, cap_mode)
@@ -2425,37 +2486,56 @@ def _request_accessibility():
         log.debug("accessibility check: %s", e)
 
 def _check_screen_capture():
-    """Probe whether CGWindowListCreateImage is available and Screen Recording is granted.
-    Returns True if a non-NULL image is obtained.
+    """Probe whether SCK (ScreenCaptureKit) screen capture is available and permitted.
 
-    CGPreflightScreenCaptureAccess() returns False even when TCC has the grant for
-    LaunchAgent processes on macOS 15+.  On macOS 26+, CGDisplayStream returns NULL
-    despite the TCC grant (the API is functionally removed); this probe uses
-    CGWindowListCreateImage which still honours the legacy kTCCServiceScreenCapture grant."""
+    On macOS 15+, CGWindowListCreateImage only captures the desktop wallpaper —
+    application windows require SCK with the enhanced Screen Recording permission.
+    This probe tests SCK directly: if it can enumerate displays and start a stream,
+    full-screen capture (including all windows) is available via DisplayStreamBridge.
+
+    If denied: log guidance and return False so BridgeProxy falls back to VNCBridge.
+    If granted: return True and DisplayStreamBridge uses the SCK capture subprocess.
+    """
     import subprocess
     _probe = r"""
-import sys, ctypes
-import Quartz
-img = Quartz.CGWindowListCreateImage(
-    Quartz.CGRectInfinite,
-    Quartz.kCGWindowListOptionOnScreenOnly,
-    Quartz.kCGNullWindowID,
-    Quartz.kCGWindowImageDefault,
-)
-sys.exit(0 if img else 1)
+import sys, time, threading
+try:
+    from Foundation import NSRunLoop, NSDate, NSDefaultRunLoopMode
+    import ScreenCaptureKit as SCK
+    _ready = threading.Event()
+    _err   = [None]
+    def _cb(content, error): _err[0] = error; _ready.set()
+    try:
+        SCK.SCShareableContent.getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+            False, True, _cb)
+    except AttributeError:
+        SCK.SCShareableContent.getExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+            False, True, _cb)
+    t0 = time.time()
+    while not _ready.is_set() and time.time() - t0 < 7:
+        NSRunLoop.mainRunLoop().runMode_beforeDate_(NSDefaultRunLoopMode,
+                                                   NSDate.dateWithTimeIntervalSinceNow_(0.1))
+    sys.exit(1 if _err[0] else 0)
+except Exception as e:
+    sys.stderr.write(str(e) + '\n')
+    sys.exit(2)
 """
     try:
-        p = subprocess.run([sys.executable, "-c", _probe],
-                           timeout=6, capture_output=True)
+        p = subprocess.run([sys.executable, "-c", _probe], timeout=12, capture_output=True)
         if p.returncode == 0:
-            log.info("Screen Recording: CGWindowListCreateImage available and granted")
+            log.info("Screen Recording: SCK permission granted — window capture active")
             return True
         reason = p.stderr.decode(errors='replace').strip()
-        log.warning("Screen Recording: CGWindowListCreateImage unavailable — %s",
-                    reason or "permission not granted or no display session")
+        if p.returncode == 1:
+            log.warning(
+                "Screen Recording: SCK permission denied — displaying via VNC fallback (21fps). "
+                "To enable 60fps window capture: System Settings > Privacy & Security > "
+                "Screen Recording > enable Python (com.apple.python3), then restart the server.")
+        else:
+            log.warning("Screen Recording: SCK unavailable (%s) — VNC fallback", reason or "unknown")
         return False
     except Exception as e:
-        log.debug("screen capture probe failed: %s", e)
+        log.debug("SCK screen capture probe failed: %s", e)
         return False
 
 def main():
