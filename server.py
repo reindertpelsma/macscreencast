@@ -933,19 +933,20 @@ class EncoderPipeline:
 # AdaptiveController — per-client fps + bitrate management
 # ---------------------------------------------------------------------------
 class AdaptiveController:
-    _WB_THRESH = 32 * 1024   # must match frame-drop threshold in frame_sender
 
     def __init__(self, cfg):
         self.fps = float(cfg.max_fps)
         self.max_fps = float(cfg.max_fps)
-        self.bitrate = 10_000_000
+        self.bitrate = 4_000_000     # start conservative — 1Mbps users reach stable in 2 halvings
         self.jpeg_quality = 85
         self.client_w = 1920
         self.client_h = 1080
         self._min_br = 300_000
         self._min_fps = 5.0          # fps floor — only reduced after bitrate hits minimum
         self._max_br = 50_000_000   # 50Mbps cap — plenty for any screenshare quality
-        self._peak_bitrate = self.bitrate  # highest stable bitrate seen — target on wakeup
+        # Congestion ceiling: bitrate at the moment the last backoff fired.
+        # 0 = not yet measured — on_fresh probes slowly until first congestion event.
+        self._ceil_bitrate = 0
         self._last_slow = 0.0
         self._last_fast = 0.0
         self._lock = threading.Lock()
@@ -977,21 +978,38 @@ class AdaptiveController:
         if self.bitrate > self._min_br:
             # Save congestion point before reducing — this is the network ceiling (SSTHRESH).
             # On recovery, ramp fast back to here, probe slowly above.
-            self._peak_bitrate = self.bitrate
+            self._ceil_bitrate = self.bitrate
             self.bitrate = max(self._min_br, int(self.bitrate * factor))
             self.jpeg_quality = max(10, int(self.jpeg_quality * factor))
         elif self.fps > self._min_fps:
             self.fps = max(self._min_fps, self.fps * factor)
-        log.debug("backoff: fps=%.1f br=%dk peak=%dk severe=%s",
-                  self.fps, self.bitrate // 1000, self._peak_bitrate // 1000, severe)
+        log.debug("backoff: fps=%.1f br=%dk ceil=%dk severe=%s",
+                  self.fps, self.bitrate // 1000, self._ceil_bitrate // 1000, severe)
+
+    def lag_budget_ms(self):
+        """Allowed in-flight delay per frame.
+
+        1 frame interval for ≤20fps (low throughput — every extra ms is felt),
+        naturally ~3 frames at 60fps (still ≤50ms reaction time), hard-capped
+        at 500ms so a single slow frame never monopolises the buffer for a full
+        second even at very low fps. Floor at 50ms for high-fps paths.
+        """
+        return max(50.0, min(1000.0 / max(1.0, self.fps), 500.0))
+
+    def lag_wb_budget(self):
+        """Write-buffer byte equivalent of lag_budget_ms at current bitrate.
+        Floor is 2 average frame sizes — absorbs a keyframe burst without false backoff.
+        At 1Mbps/20fps this is ~12KB (not 32KB); at 10Mbps/60fps it's ~42KB."""
+        avg_frame = int(self.bitrate / max(1.0, self.fps) / 8)  # bytes per average frame
+        return max(2 * avg_frame, 4 * 1024, int(self.lag_budget_ms() * self.bitrate / 8000))
 
     def on_lag(self, age_ms, write_buf=0):
-        # 50ms tolerance = expected 1-frame-in-buffer baseline on any link.
-        # Use metric_rtt as the dynamic baseline when available.
-        baseline = (self._metric_rtt + 50) if self._metric_rtt > 0 else 150
-        if age_ms < baseline and write_buf < self._WB_THRESH:
+        budget = self.lag_budget_ms()
+        if age_ms > 0 and age_ms < budget and write_buf < self.lag_wb_budget():
             return
-        severe = age_ms > baseline * 3 or write_buf > 524288
+        if age_ms == 0 and write_buf < self.lag_wb_budget():
+            return
+        severe = age_ms > budget * 3 or write_buf > self.lag_wb_budget() * 6
         with self._lock:
             self._backoff(severe)
 
@@ -1053,30 +1071,30 @@ class AdaptiveController:
             if self.fps < self.max_fps:
                 self.fps = self.max_fps
             elif self.bitrate < self._max_br:
-                # Below peak: ramp fast (we know the network handled it before).
-                # Above peak: probe carefully (uncharted territory).
-                if self.bitrate < self._peak_bitrate * 0.85:
-                    factor = 1.5
-                elif self.bitrate < self._peak_bitrate:
-                    factor = 1.25
+                # Below ceiling: jump to 90% of it — the ceiling was the bitrate
+                # that just triggered congestion, so landing slightly below avoids
+                # an immediate re-trigger while still recovering fast.
+                # _ceil_bitrate == 0 means no congestion measured yet; probe cautiously.
+                if self._ceil_bitrate > 0 and self.bitrate < self._ceil_bitrate:
+                    self.bitrate = max(self._min_br, int(self._ceil_bitrate * 0.90))
                 elif self.bitrate < 20_000_000:
-                    factor = 1.10
+                    self.bitrate = min(self._max_br, int(self.bitrate * 1.10))
                 else:
-                    factor = 1.05
-                self.bitrate = min(self._max_br, int(self.bitrate * factor))
+                    self.bitrate = min(self._max_br, int(self.bitrate * 1.05))
                 self.jpeg_quality = min(95, self.jpeg_quality + 5)
-            log.debug("fresh: fps=%.1f br=%dk peak=%dk", self.fps, self.bitrate//1000, self._peak_bitrate//1000)
+            log.debug("fresh: fps=%.1f br=%dk ceil=%dk", self.fps, self.bitrate//1000, self._ceil_bitrate//1000)
 
     def on_screen_active(self):
-        """Screen content changed after a static period — reset to last known stable state.
-        Jumps directly to peak bitrate so we don't spend 20s ramping from the post-backoff floor."""
+        """Screen content changed after a static period — restore fps and jump toward last
+        known stable bitrate. Uses 90% of the congestion ceiling (same as on_fresh recovery)
+        to avoid immediately re-triggering congestion on every screen-active event."""
         with self._lock:
             self.fps = self.max_fps
-            if self._peak_bitrate > self.bitrate:
-                self.bitrate = self._peak_bitrate
+            if self._ceil_bitrate > 0 and self._ceil_bitrate > self.bitrate:
+                self.bitrate = max(self._min_br, int(self._ceil_bitrate * 0.90))
                 self.jpeg_quality = min(95, self.jpeg_quality + 20)
             self._last_fast = time.monotonic()
-            log.debug("screen active: fps=%.1f br=%dk peak=%dk", self.fps, self.bitrate//1000, self._peak_bitrate//1000)
+            log.debug("screen active: fps=%.1f br=%dk ceil=%dk", self.fps, self.bitrate//1000, self._ceil_bitrate//1000)
 
     def snapshot(self):
         with self._lock:
@@ -1184,8 +1202,6 @@ async def client_session(ws, cfg, bridge):
                         ctrl.on_lag(age, _get_wbuf(ws))
                     elif t == "metric_rtt":
                         ctrl.on_metric_rtt(float(ev.get("rtt_ms", 0)))
-                    elif t == "fresh":
-                        ctrl.on_fresh()  # JS confirms no lag — same gate as frame_sender probe
                     elif t == "mm":
                         bridge.send_pointer(cur_buttons, int(ev["x"]), int(ev["y"]))
                     elif t == "md":
@@ -1265,6 +1281,7 @@ async def client_session(ws, cfg, bridge):
                     _vnc_n = bridge._fbu_count
                     _vnc_fps = (_vnc_n - _last_vnc_fbu) / dt; _last_vnc_fbu = _vnc_n
                     _fb_age = int(time.time() * 1000) - bridge._fb_ms
+                    await ws.send(json.dumps({"t": "stale", "ms": _fb_age}))
                     log.info("DIAG: sent=%d/%.1fs=%.1ffps drop_wb=%d nosend=%d ctrl_fps=%.1f vnc=%.1ffps fb_age=%dms",
                              _n_diag, dt, _n_diag/dt, _n_drop, _n_nosend, ctrl.fps, _vnc_fps, _fb_age)
                     _n_diag = _n_drop = _n_nosend = 0
@@ -1281,15 +1298,15 @@ async def client_session(ws, cfg, bridge):
                         _pipe_task = None
 
                 # Write buffer check — immediate local backpressure.
-                # Threshold is 32KB (not 0) so a single large frame still draining
-                # doesn't cause immediate drops on fast links.
+                # Threshold is fps+bitrate-aware (lag_wb_budget) so a single
+                # large frame draining doesn't trigger false congestion at low fps.
                 wb = _get_wbuf(ws)
                 if wb > 4 * 1024 * 1024:
                     log.warning("write buf %.1fMB — hard kill %s", wb / 1048576, ws.remote_address)
                     try: await ws.close()
                     except Exception: pass
                     break
-                if wb > 32 * 1024:
+                if wb > ctrl.lag_wb_budget():
                     ctrl.on_lag(0, wb)
                     _n_drop += 1
                     if _pipe_task is not None:
@@ -1365,7 +1382,7 @@ async def client_session(ws, cfg, bridge):
                 if to_sleep > 0.001:
                     await asyncio.sleep(to_sleep)
                     wb = _get_wbuf(ws)
-                    if wb > 32 * 1024:
+                    if wb > ctrl.lag_wb_budget():
                         ctrl.on_lag(0, wb)
                         _n_drop += 1
                         if _pipe_task is not None:
@@ -1401,7 +1418,7 @@ async def client_session(ws, cfg, bridge):
                     last_send_time = target
                     continue
 
-                if _get_wbuf(ws) > 32 * 1024:
+                if _get_wbuf(ws) > ctrl.lag_wb_budget():
                     ctrl.on_lag(0, _get_wbuf(ws))
                     _n_drop += 1
                     continue
@@ -1566,6 +1583,7 @@ let rxBytes=0,rxBps=0;         // WebSocket receive bandwidth
 let codecName='';               // current codec name
 let ageWindow=[];               // rolling 5s frame-age samples [{ts,age}]
 let worstAge5s=0;               // worst-case frame age in last 5s
+let staleMs=0;                  // server-reported screen content age (ms)
 let hudMode=0;                  // 0=full 1=dim 2=hidden (cycles on click)
 
 hud.addEventListener('click',()=>{
@@ -1654,18 +1672,10 @@ function initDecoder(codec){
 // ---------------------------------------------------------------------------
 // Frame receive + lag reporting
 // ---------------------------------------------------------------------------
-let lagSamples=[],lagTimer=null;
-
-function startLagReporter(){
-  if(lagTimer)return;
-  lagTimer=setInterval(()=>{
-    if(!wsOpen)return;
-    if(lagSamples.length===0){send({t:'fresh'});return;}
-    const avg=lagSamples.reduce((a,b)=>a+b,0)/lagSamples.length;
-    send({t:'lag',age_ms:Math.round(avg)});
-    lagSamples=[];
-  },500);
-}
+// Lag is reported per received frame, throttled to ≤10/s.
+// No 'fresh' message when idle — connection liveness is covered by WS ping/pong.
+let _lastLagReport=0;
+function startLagReporter(){} // no-op; reporter is inline in handleBinary
 
 const CODEC_NAMES={0:'jpeg',1:'h264',2:'h265',3:'av1'};
 
@@ -1682,12 +1692,16 @@ function handleBinary(buf){
   const age=Date.now()-capMs;
   codecName=CODEC_NAMES[codec]||'?';
   if(age>0){
-    lagSamples.push(age);
-    // Rolling 5s worst-case age window
+    // Rolling 5s worst-case age window (for HUD display)
     const now=Date.now();
     ageWindow.push({ts:now,age});
     ageWindow=ageWindow.filter(e=>now-e.ts<5000);
     worstAge5s=ageWindow.length?Math.max(...ageWindow.map(e=>e.age)):0;
+    // Per-frame lag report, throttled to ≤10/s
+    if(now-_lastLagReport>=100){
+      _lastLagReport=now;
+      send({t:'lag',age_ms:Math.round(age)});
+    }
   }
 
   if(codec===0||!useVideo){
@@ -1722,7 +1736,8 @@ function updateFps(){
     const lag=worstAge5s>0?'lag:'+worstAge5s+'ms ':'';
     const codec=codecName?codecName+' ':'';
     const net=worstMetricRtt5s>0?'net:'+worstMetricRtt5s+'ms ':'';
-    hud.textContent=fc+'fps '+codec+bw+' '+lag+net+imgW+'×'+imgH;
+    const stl=staleMs>2000?'stale:'+(staleMs/1000).toFixed(0)+'s ':'';
+    hud.textContent=fc+'fps '+codec+bw+' '+lag+net+stl+imgW+'×'+imgH;
     fc=0;lastFpsT=now;
   }
 }
@@ -1773,7 +1788,9 @@ function connect(){
     }else{
       try{
         const msg=JSON.parse(e.data);
-        if(msg.t==='clipboard'){
+        if(msg.t==='stale'){
+          staleMs=msg.ms||0;
+        }else if(msg.t==='clipboard'){
           // Mac clipboard → browser clipboard
           if(navigator.clipboard&&navigator.clipboard.writeText)
             navigator.clipboard.writeText(msg.text).catch(()=>{});
