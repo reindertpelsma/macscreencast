@@ -61,8 +61,6 @@ cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics
 cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
 
 cg.CGMainDisplayID.restype = ctypes.c_uint32
-cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
-cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
 cg.CGDisplayCreateImage.restype = ctypes.c_void_p
 cg.CGDisplayCreateImage.argtypes = [ctypes.c_uint32]
 cg.CGImageRelease.argtypes = [ctypes.c_void_p]
@@ -82,12 +80,15 @@ cf.CFDataGetLength.restype = ctypes.c_long
 cf.CFDataGetLength.argtypes = [ctypes.c_void_p]
 cf.CFRelease.argtypes = [ctypes.c_void_p]
 
-if not cg.CGPreflightScreenCaptureAccess():
-    cg.CGRequestScreenCaptureAccess()
+disp = cg.CGMainDisplayID()
+# Verify capture works by trying a test frame — CGPreflightScreenCaptureAccess()
+# returns False even when TCC has the grant (macOS 15+ quirk for non-GUI processes),
+# so test the actual API instead.
+_test = cg.CGDisplayCreateImage(disp)
+if not _test:
     sys.stderr.write("Screen Recording not granted\n")
     sys.exit(1)
-
-disp = cg.CGMainDisplayID()
+cg.CGImageRelease(_test)
 out = sys.stdout.buffer
 MAGIC = b'UVNC'
 TARGET_FPS = 60
@@ -2284,20 +2285,31 @@ def _request_accessibility():
         log.debug("accessibility check: %s", e)
 
 def _check_screen_capture():
-    """Check Screen Recording permission; trigger TCC dialog if not granted.
-    Returns True if permission is granted. The capture subprocess uses the same
-    Python binary identity, so this grant covers DisplayStreamBridge too."""
+    """Check Screen Recording permission by attempting an actual capture.
+    CGPreflightScreenCaptureAccess() returns False even when TCC has the grant
+    for LaunchAgent / SSH-launched processes on macOS 15+, so we probe by calling
+    CGDisplayCreateImage directly. Returns True if capture succeeds."""
     try:
         import ctypes
         cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
-        cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
-        if cg.CGPreflightScreenCaptureAccess():
+        cg.CGMainDisplayID.restype = ctypes.c_uint32
+        cg.CGDisplayCreateImage.restype = ctypes.c_void_p
+        cg.CGDisplayCreateImage.argtypes = [ctypes.c_uint32]
+        cg.CGImageRelease.argtypes = [ctypes.c_void_p]
+        disp = cg.CGMainDisplayID()
+        img = cg.CGDisplayCreateImage(disp)
+        if img:
+            cg.CGImageRelease(img)
             log.info("Screen Recording: granted — CGDisplayImage capture available")
             return True
+        # Permission not yet granted — request it so the system shows the TCC dialog
+        try:
+            cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
+            cg.CGRequestScreenCaptureAccess()
+        except Exception:
+            pass
         log.warning("Screen Recording: not granted — showing permission dialog. "
                     "Grant in System Settings → Privacy → Screen Recording, then restart server.")
-        cg.CGRequestScreenCaptureAccess()
         return False
     except Exception as e:
         log.debug("screen capture check: %s", e)
