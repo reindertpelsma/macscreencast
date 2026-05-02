@@ -54,52 +54,59 @@ def _encode_jpeg(rgb, quality):
 # Writes frames to stdout: magic(4) + W(4LE) + H(4LE) + ts_ms(8LE) + W*H*3 RGB bytes.
 # ---------------------------------------------------------------------------
 _SCSTREAM_CAPTURE_SRC = r"""
-import sys, struct, time, ctypes
+import sys, struct, time, ctypes, math
 import numpy as np
 
 cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
 cf = ctypes.CDLL('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation')
 
-cg.CGMainDisplayID.restype = ctypes.c_uint32
-cg.CGDisplayCreateImage.restype = ctypes.c_void_p
-cg.CGDisplayCreateImage.argtypes = [ctypes.c_uint32]
+# CGWindowListCreateImage composites all on-screen windows — required on macOS 15+
+# because CGDisplayCreateImage only returns the wallpaper layer (no window compositor).
+class CGRect(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double),
+                ("w", ctypes.c_double), ("h", ctypes.c_double)]
+
+cg.CGWindowListCreateImage.restype = ctypes.c_void_p
+cg.CGWindowListCreateImage.argtypes = [CGRect, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
 cg.CGImageRelease.argtypes = [ctypes.c_void_p]
-cg.CGImageGetWidth.restype = ctypes.c_size_t
-cg.CGImageGetWidth.argtypes = [ctypes.c_void_p]
-cg.CGImageGetHeight.restype = ctypes.c_size_t
-cg.CGImageGetHeight.argtypes = [ctypes.c_void_p]
-cg.CGImageGetBytesPerRow.restype = ctypes.c_size_t
-cg.CGImageGetBytesPerRow.argtypes = [ctypes.c_void_p]
-cg.CGImageGetDataProvider.restype = ctypes.c_void_p
-cg.CGImageGetDataProvider.argtypes = [ctypes.c_void_p]
-cg.CGDataProviderCopyData.restype = ctypes.c_void_p
-cg.CGDataProviderCopyData.argtypes = [ctypes.c_void_p]
-cf.CFDataGetBytePtr.restype = ctypes.c_void_p
-cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
-cf.CFDataGetLength.restype = ctypes.c_long
-cf.CFDataGetLength.argtypes = [ctypes.c_void_p]
+cg.CGImageGetWidth.restype  = ctypes.c_size_t; cg.CGImageGetWidth.argtypes  = [ctypes.c_void_p]
+cg.CGImageGetHeight.restype = ctypes.c_size_t; cg.CGImageGetHeight.argtypes = [ctypes.c_void_p]
+cg.CGImageGetBytesPerRow.restype = ctypes.c_size_t; cg.CGImageGetBytesPerRow.argtypes = [ctypes.c_void_p]
+cg.CGImageGetDataProvider.restype = ctypes.c_void_p; cg.CGImageGetDataProvider.argtypes = [ctypes.c_void_p]
+cg.CGDataProviderCopyData.restype = ctypes.c_void_p; cg.CGDataProviderCopyData.argtypes = [ctypes.c_void_p]
+cf.CFDataGetBytePtr.restype = ctypes.c_void_p; cf.CFDataGetBytePtr.argtypes = [ctypes.c_void_p]
+cf.CFDataGetLength.restype  = ctypes.c_long;  cf.CFDataGetLength.argtypes  = [ctypes.c_void_p]
 cf.CFRelease.argtypes = [ctypes.c_void_p]
 
-disp = cg.CGMainDisplayID()
-# Verify capture works by trying a test frame — CGPreflightScreenCaptureAccess()
-# returns False even when TCC has the grant (macOS 15+ quirk for non-GUI processes),
-# so test the actual API instead.
-_test = cg.CGDisplayCreateImage(disp)
+# kCGWindowListOptionOnScreenOnly=1, kCGNullWindowID=0, kCGWindowImageDefault=0
+# CGRectNull = {inf, inf, 0, 0} — instructs CGWindowListCreateImage to use all screens
+_RECT_NULL = CGRect(math.inf, math.inf, 0.0, 0.0)
+_ON_SCREEN  = ctypes.c_uint32(1)
+_NULL_WIN   = ctypes.c_uint32(0)
+_IMG_DEFAULT = ctypes.c_uint32(0)
+
+def _capture():
+    return cg.CGWindowListCreateImage(_RECT_NULL, _ON_SCREEN, _NULL_WIN, _IMG_DEFAULT)
+
+# Startup probe
+_test = _capture()
 if not _test:
     sys.stderr.write("Screen Recording not granted\n")
     sys.exit(1)
 cg.CGImageRelease(_test)
+
 out = sys.stdout.buffer
 MAGIC = b'UVNC'
 TARGET_FPS = 60
 interval = 1.0 / TARGET_FPS
 W_prev = H_prev = 0
 bgra_buf = rgb_buf = None
+prev_hash = None
 consec_null = 0
 
 while True:
     t0 = time.time()
-    img = cg.CGDisplayCreateImage(disp)
+    img = _capture()
     if not img:
         consec_null += 1
         if consec_null > 60:
@@ -118,9 +125,9 @@ while True:
         W_prev, H_prev = W, H
         bgra_buf = np.empty((H, W, 4), dtype=np.uint8)
         rgb_buf  = np.empty((H, W, 3), dtype=np.uint8)
+        prev_hash = None
     raw = (ctypes.c_ubyte * blen).from_address(bptr)
     arr = np.frombuffer(raw, dtype=np.uint8)
-    # Copy BGRA rows, handling possible row padding
     if bpr == W * 4:
         np.copyto(bgra_buf, arr[:H * W * 4].reshape(H, W, 4))
     else:
@@ -128,8 +135,17 @@ while True:
             bgra_buf[r] = arr[r * bpr: r * bpr + W * 4].reshape(W, 4)
     cf.CFRelease(data_ref)
     cg.CGImageRelease(img)
-    # BGRA → RGB: channels 2, 1, 0 → R, G, B
+    # BGRA → RGB
     np.copyto(rgb_buf, bgra_buf[:, :, 2::-1])
+    # Change detection: sample every 8th pixel — fast, catches any visual change
+    sh, sw = max(1, H // 32), max(1, W // 32)
+    new_hash = hash(rgb_buf[::sh, ::sw, 0].tobytes())
+    if new_hash == prev_hash:
+        rem = interval - (time.time() - t0)
+        if rem > 0.001:
+            time.sleep(rem)
+        continue
+    prev_hash = new_hash
     ts = int(t0 * 1000)
     hdr = MAGIC + struct.pack('<IIQ', W, H, ts)
     try:
@@ -2290,19 +2306,19 @@ def _check_screen_capture():
     for LaunchAgent / SSH-launched processes on macOS 15+, so we probe by calling
     CGDisplayCreateImage directly. Returns True if capture succeeds."""
     try:
-        import ctypes
+        import ctypes, math
         cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-        cg.CGMainDisplayID.restype = ctypes.c_uint32
-        cg.CGDisplayCreateImage.restype = ctypes.c_void_p
-        cg.CGDisplayCreateImage.argtypes = [ctypes.c_uint32]
+        class _CGRect(ctypes.Structure):
+            _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double),
+                        ("w", ctypes.c_double), ("h", ctypes.c_double)]
+        cg.CGWindowListCreateImage.restype = ctypes.c_void_p
+        cg.CGWindowListCreateImage.argtypes = [_CGRect, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32]
         cg.CGImageRelease.argtypes = [ctypes.c_void_p]
-        disp = cg.CGMainDisplayID()
-        img = cg.CGDisplayCreateImage(disp)
+        img = cg.CGWindowListCreateImage(_CGRect(math.inf, math.inf, 0.0, 0.0), 1, 0, 0)
         if img:
             cg.CGImageRelease(img)
-            log.info("Screen Recording: granted — CGDisplayImage capture available")
+            log.info("Screen Recording: granted — CGWindowListCreateImage capture available")
             return True
-        # Permission not yet granted — request it so the system shows the TCC dialog
         try:
             cg.CGRequestScreenCaptureAccess.restype = ctypes.c_bool
             cg.CGRequestScreenCaptureAccess()
