@@ -1248,18 +1248,26 @@ async def client_session(ws, cfg, bridge):
                         k = ev.get("k",""); code = ev.get("code","")
                         ks = KEYSYM.get(code) or KEYSYM.get(k) or (ord(k) if len(k)==1 else None)
                         if ks: bridge.send_key(t=="kd", ks)
-                    elif t == "paste":
+                    elif t in ("paste", "setclip"):
                         text = ev.get("text","")
                         if text:
-                            bridge.send_clipboard(text)
-                            # Release any modifiers held by ctrlToMeta remapping so
-                            # only our clean Cmd+V lands — avoids Ctrl+Cmd+V confusion.
+                            # pbcopy is more reliable than VNC ClientCutText on macOS 15+
+                            # (ClientCutText may be silently ignored by screensharingd)
+                            try:
+                                proc = await asyncio.create_subprocess_exec(
+                                    'pbcopy', stdin=asyncio.subprocess.PIPE)
+                                proc.stdin.write(text.encode('utf-8', errors='replace'))
+                                proc.stdin.close()
+                                await asyncio.wait_for(proc.wait(), timeout=2.0)
+                            except Exception:
+                                bridge.send_clipboard(text)  # fallback
+                        if t == "paste" and text:
+                            # Release any held modifiers, then send Cmd+V
                             for ks in [KEYSYM["ShiftLeft"], KEYSYM["ShiftRight"],
                                        KEYSYM["Control"], KEYSYM["ControlRight"],
                                        KEYSYM["Alt"], KEYSYM["AltRight"],
                                        KEYSYM["MetaLeft"], KEYSYM["MetaRight"]]:
                                 bridge.send_key(False, ks)
-                            # CMD+V (Meta+V) triggers paste in macOS apps
                             bridge.send_key(True,  KEYSYM["MetaLeft"])
                             bridge.send_key(True,  0x76)
                             bridge.send_key(False, 0x76)
@@ -1628,8 +1636,11 @@ const st=document.getElementById('st'),ki=document.getElementById('ki');
 let imgW=1920,imgH=1080,scaleX=1,scaleY=1,ox=0,oy=0;
 let ws,wsOpen=false,mBtn=0,fc=0,lastFpsT=performance.now();
 let fitMode='fit';       // 'fit' = letterbox, 'cover' = fill/crop
-let ctrlToMeta=true;     // remap ControlLeft/Right → MetaLeft (Ctrl → Cmd)
+// Default ctrlToMeta ON for Windows/Linux (Ctrl+C/V → Cmd+C/V on Mac).
+// Default OFF on macOS browsers — user has a physical Cmd key, no remap needed.
+let ctrlToMeta=!navigator.userAgent.includes('Macintosh');
 let _ctrlRemapped={};    // tracks in-flight ctrl→meta remap for keyup pairing
+const _suppressedKd=new Set(); // keys whose keydown was intercepted; suppress matching keyup
 let _suppressReconnect=false,_hiddenTimer=null;  // tab visibility disconnect
 
 // Metrics
@@ -1988,6 +1999,7 @@ ki.addEventListener('keydown',async e=>{
   // Ctrl+V / Cmd+V: read browser clipboard explicitly; do NOT send 'v' to VNC
   if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){
     e.preventDefault();
+    _suppressedKd.add(e.code); // suppress the matching keyup regardless of modifier state at keyup time
     await pasteFromBrowserClipboard();
     return;
   }
@@ -1997,7 +2009,11 @@ ki.addEventListener('keydown',async e=>{
 ki.addEventListener('keyup',e=>{
   let code=e.code,key=e.key;
   if(_ctrlRemapped[e.code]){code=key=_ctrlRemapped[e.code];delete _ctrlRemapped[e.code];}
-  // suppress V keyup if a paste was in progress (ctrlKey or metaKey still held)
+  // Suppress keyup for any key whose keydown was intercepted (e.g. V after Ctrl+V paste).
+  // Must check e.code (physical key) not key, because modifier state may have changed.
+  if(_suppressedKd.has(e.code)){_suppressedKd.delete(e.code);e.preventDefault();return;}
+  // Belt-and-suspenders: also suppress if modifier still held (catches cases where
+  // the keydown wasn't tracked but modifier is clearly still active).
   if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){e.preventDefault();return;}
   send({t:'ku',k:key,code:code});
   e.preventDefault();
@@ -2051,9 +2067,13 @@ btnFit.addEventListener('click',()=>{
 });
 
 const btnCtrl=document.getElementById('btn-ctrl');
+// Sync button label to initial auto-detected state
+btnCtrl.textContent='Ctrl=Cmd ['+(ctrlToMeta?'on':'off')+']';
+btnCtrl.classList.toggle('active',ctrlToMeta);
 btnCtrl.addEventListener('click',()=>{
   ctrlToMeta=!ctrlToMeta;
   _ctrlRemapped={};  // clear any in-flight remaps
+  _suppressedKd.clear();
   btnCtrl.textContent='Ctrl=Cmd ['+(ctrlToMeta?'on':'off')+']';
   btnCtrl.classList.toggle('active',ctrlToMeta);
   ki.focus();
@@ -2121,6 +2141,15 @@ document.getElementById('clip-paste').addEventListener('click',()=>{
   ki.focus();
 });
 document.getElementById('clip-clear').addEventListener('click',()=>{clipTA.value='';ki.focus();});
+
+// Bidirectional sync: when user edits clipTA, update Mac clipboard in real-time (debounced 400ms)
+let _clipTATimer=null;
+clipTA.addEventListener('input',()=>{
+  clearTimeout(_clipTATimer);
+  _clipTATimer=setTimeout(()=>{
+    if(wsOpen)send({t:'setclip',text:clipTA.value});
+  },400);
+});
 
 // ---------------------------------------------------------------------------
 // Init + visibility-based disconnect
