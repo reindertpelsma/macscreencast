@@ -2279,6 +2279,8 @@ function resize(){
   // Size canvas backing to physical pixels so compositing is 1:1 — no GPU scaling step.
   const dpr=window.devicePixelRatio||1;
   canvas.width=Math.round(cw*dpr);canvas.height=Math.round(ch*dpr);
+  // Resetting canvas.width clears context state — restore high-quality scaling.
+  ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
 }
 window.addEventListener('resize',()=>{resize();sendRes();});
 // Recompute when DPR changes (e.g. dragging window to a different monitor).
