@@ -2457,11 +2457,6 @@ async function _checkClipboardPermission(){
     if(navigator.permissions){
       try{perm=await navigator.permissions.query({name:'clipboard-read'});}catch(e){}
       if(perm){
-        // React to future permission toggles in browser settings without polling
-        perm.onchange=()=>{
-          clipSynced=(perm.state==='granted');
-          if(clipSynced)_startClipPoll();else _stopClipPoll();
-        };
         if(perm.state==='granted'){clipSynced=true;_startClipPoll();return;}
         if(perm.state==='denied')return; // hard-denied; CTRL+V fallback only
         // 'prompt': fall through — try readText() once to trigger the dialog
@@ -2505,8 +2500,7 @@ async function _pollBrowserClipboard(){
     const text=await navigator.clipboard.readText();
     if(text&&text!==_lastMacClipboard){_lastMacClipboard=text;send({t:'setclip',text});}
   }catch(e){
-    // Permission revoked (e.g. user toggled it off in browser settings)
-    clipSynced=false;
+    clipSynced=false; // permission revoked or API unavailable
     _stopClipPoll();
   }
 }
