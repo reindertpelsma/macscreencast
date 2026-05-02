@@ -1611,6 +1611,7 @@ class AdaptiveController:
         self._min_fps = 5.0          # fps floor — only reduced after bitrate hits minimum
         self._max_br = 50_000_000   # 50Mbps cap — plenty for any screenshare quality
         self.user_bw_cap = 0        # hard send-level cap in bits/sec; 0 = unlimited
+        self.lag_budget_override = 0  # user-specified lag budget in ms; 0 = auto (50ms floor)
         # Congestion ceiling: bitrate at the moment the last backoff fired.
         # 0 = not yet measured — on_fresh probes slowly until first congestion event.
         self._ceil_bitrate = 0
@@ -1633,7 +1634,7 @@ class AdaptiveController:
             self.canvas_phys_w = max(1, w)
             self.canvas_phys_h = max(1, h)
 
-    def on_quality(self, cap_h: int, fps_cap: int, max_kbps: int = 0):
+    def on_quality(self, cap_h: int, fps_cap: int, max_kbps: int = 0, lag_ms: int = 0):
         with self._lock:
             self.cap_h   = max(0, cap_h)
             self.fps_cap = max(0, fps_cap)
@@ -1646,6 +1647,7 @@ class AdaptiveController:
             else:
                 self._max_br = 50_000_000
                 self.user_bw_cap = 0
+            self.lag_budget_override = max(0, lag_ms)
 
     def effective_target(self, native_w: int, native_h: int):
         """Return (tw, th) — the target encode resolution.
@@ -1684,19 +1686,19 @@ class AdaptiveController:
                   self.fps, self.bitrate // 1000, self._ceil_bitrate // 1000, severe)
 
     def lag_budget_ms(self):
-        """Allowed in-flight delay per frame.
+        """Allowed in-flight delay before congestion backoff fires.
 
-        1 frame interval for ≤20fps (low throughput — every extra ms is felt),
-        naturally ~3 frames at 60fps (still ≤50ms reaction time), hard-capped
-        at 500ms so a single slow frame never monopolises the buffer for a full
-        second even at very low fps. Floor at 50ms for high-fps paths.
+        Auto: 1 frame interval (floors at 50ms at high fps, caps at 500ms).
+        Override: user-specified value — higher = smoother video, more input latency.
         """
+        if self.lag_budget_override > 0:
+            return float(self.lag_budget_override)
         return max(50.0, min(1000.0 / max(1.0, self.fps), 500.0))
 
     def lag_wb_budget(self):
         """Write-buffer byte equivalent of lag_budget_ms at current bitrate.
-        Floor is 2 average frame sizes — absorbs a keyframe burst without false backoff.
-        At 1Mbps/20fps this is ~12KB (not 32KB); at 10Mbps/60fps it's ~42KB."""
+        Scales with lag_budget_ms so a higher lag budget also tolerates a larger
+        TCP send buffer before triggering backoff. Floor is 2 average frame sizes."""
         avg_frame = int(self.bitrate / max(1.0, self.fps) / 8)  # bytes per average frame
         return max(2 * avg_frame, 4 * 1024, int(self.lag_budget_ms() * self.bitrate / 8000))
 
@@ -1935,7 +1937,7 @@ async def client_session(ws, cfg, bridge):
                             _reinit_deadline = time.monotonic() + 0.5
                     elif t == "quality":
                         ctrl.on_quality(int(ev.get("cap_h", 0)), int(ev.get("fps", 0)),
-                                        int(ev.get("maxkbps", 0)))
+                                        int(ev.get("maxkbps", 0)), int(ev.get("lag_ms", 0)))
                         nw, nh = bridge.dimensions
                         tw, th = ctrl.effective_target(nw or W, nh or H)
                         if has_webcodecs and (tw != _enc_target_w or th != _enc_target_h):
@@ -2511,6 +2513,12 @@ canvas{display:block;position:absolute}
         <option value="auto">Auto</option>
         <!-- populated after WebCodecs probe -->
       </select></div>
+      <div class="q-row"><label>Lag budget</label><select class="q-sel" id="q-lag">
+        <option value="0" selected>50ms (responsive)</option>
+        <option value="100">100ms</option>
+        <option value="200">200ms (smooth video)</option>
+        <option value="500">500ms</option>
+      </select></div>
       <div style="margin-top:6px">
         <button class="dock-btn" id="q-reset" style="width:100%;font-size:10px;padding:3px 0">Reset to defaults</button>
       </div>
@@ -2733,23 +2741,27 @@ const _Q_PRESETS=[
   {label:'1080p (Full HD)',h:1080},{label:'720p (HD)',h:720},
   {label:'480p (SD)',h:480},{label:'360p',h:360},{label:'240p',h:240},
 ];
-let _qCapH=0,_qFps=0,_qBwKbps=25000,_qCodec='auto',_qMenuBuilt=false;
+let _qCapH=0,_qFps=0,_qBwKbps=25000,_qCodec='auto',_qLagMs=0,_qMenuBuilt=false;
 let _probedCodecs=[]; // filled after WebCodecs probe; used to populate codec select
 
 function _qCookie(){
-  const m=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+),([^;]*)/);
-  if(m)return{cap_h:parseInt(m[1]),fps:parseInt(m[2]),bw:parseInt(m[3]),codec:m[4]||'auto'};
-  // legacy cookies without bw/codec fields
+  // v5 format: cap_h,fps,bw,codec,lag
+  const m=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+),([^,;]+),(\d+)/);
+  if(m)return{cap_h:parseInt(m[1]),fps:parseInt(m[2]),bw:parseInt(m[3]),codec:m[4]||'auto',lag:parseInt(m[5])};
+  // v4: cap_h,fps,bw,codec
+  const m4=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+),([^;]*)/);
+  if(m4)return{cap_h:parseInt(m4[1]),fps:parseInt(m4[2]),bw:parseInt(m4[3]),codec:m4[4]||'auto',lag:0};
+  // legacy
   const m2=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+)/);
-  if(m2)return{cap_h:parseInt(m2[1]),fps:parseInt(m2[2]),bw:parseInt(m2[3]),codec:'auto'};
+  if(m2)return{cap_h:parseInt(m2[1]),fps:parseInt(m2[2]),bw:parseInt(m2[3]),codec:'auto',lag:0};
   const m3=document.cookie.match(/mvs_q=(\d+),(\d+)/);
-  return m3?{cap_h:parseInt(m3[1]),fps:parseInt(m3[2]),bw:25000,codec:'auto'}:{cap_h:0,fps:0,bw:25000,codec:'auto'};
+  return m3?{cap_h:parseInt(m3[1]),fps:parseInt(m3[2]),bw:25000,codec:'auto',lag:0}:{cap_h:0,fps:0,bw:25000,codec:'auto',lag:0};
 }
 function _qSaveCookie(){
-  document.cookie='mvs_q='+_qCapH+','+_qFps+','+_qBwKbps+','+_qCodec+';max-age='+(365*86400)+';SameSite=Strict';
+  document.cookie='mvs_q='+_qCapH+','+_qFps+','+_qBwKbps+','+_qCodec+','+_qLagMs+';max-age='+(365*86400)+';SameSite=Strict';
 }
 function sendQuality(){
-  send({t:'quality',cap_h:_qCapH,fps:_qFps,maxkbps:_qBwKbps});
+  send({t:'quality',cap_h:_qCapH,fps:_qFps,maxkbps:_qBwKbps,lag_ms:_qLagMs});
 }
 // Send codec choice as a caps update. 'auto' uses the full probed list;
 // a specific codec restricts to just that one; 'jpeg' forces JPEG fallback.
@@ -2826,12 +2838,15 @@ function _populateCodecSelect(probed){
   const fSel=document.getElementById('q-fps');
   const bSel=document.getElementById('q-bw');
   const cSel=document.getElementById('q-codec');
-  // Restore fps + bw + codec from cookie immediately (codec select populated after probe).
+  const lSel=document.getElementById('q-lag');
+  // Restore settings from cookie immediately (codec select populated after probe).
   const saved=_qCookie();
   _qFps=saved.fps;fSel.value=String(_qFps);
   _qBwKbps=saved.bw;bSel.value=String(_qBwKbps);
   if(bSel.value!==String(_qBwKbps)){bSel.value='25000';_qBwKbps=25000;}
   _qCodec=saved.codec||'auto';
+  _qLagMs=saved.lag||0;lSel.value=String(_qLagMs);
+  if(lSel.value!==String(_qLagMs)){lSel.value='0';_qLagMs=0;}
   rSel.addEventListener('change',()=>{
     _qCapH=parseInt(rSel.value)||0;_qSaveCookie();sendQuality();
   });
@@ -2844,11 +2859,13 @@ function _populateCodecSelect(probed){
   cSel.addEventListener('change',()=>{
     _qCodec=cSel.value;_qSaveCookie();sendCaps();
   });
+  lSel.addEventListener('change',()=>{
+    _qLagMs=parseInt(lSel.value)||0;_qSaveCookie();sendQuality();
+  });
   document.getElementById('q-reset').addEventListener('click',()=>{
-    // Reset all quality settings to defaults and clear cookie.
-    _qCapH=0;_qFps=0;_qBwKbps=25000;_qCodec='auto';
+    _qCapH=0;_qFps=0;_qBwKbps=25000;_qCodec='auto';_qLagMs=0;
     document.cookie='mvs_q=;max-age=0;SameSite=Strict';
-    rSel.value='0';fSel.value='0';bSel.value='25000';cSel.value='auto';
+    rSel.value='0';fSel.value='0';bSel.value='25000';cSel.value='auto';lSel.value='0';
     sendQuality();
     sendCaps();
     ki.focus();
