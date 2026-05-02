@@ -1610,6 +1610,7 @@ class AdaptiveController:
         self._min_br = 300_000
         self._min_fps = 5.0          # fps floor — only reduced after bitrate hits minimum
         self._max_br = 50_000_000   # 50Mbps cap — plenty for any screenshare quality
+        self.user_bw_cap = 0        # hard send-level cap in bits/sec; 0 = unlimited
         # Congestion ceiling: bitrate at the moment the last backoff fired.
         # 0 = not yet measured — on_fresh probes slowly until first congestion event.
         self._ceil_bitrate = 0
@@ -1640,7 +1641,11 @@ class AdaptiveController:
             self.fps = min(self.fps, ceil)
             if max_kbps > 0:
                 self._max_br = max_kbps * 1000
+                self.user_bw_cap = self._max_br
                 self.bitrate = min(self.bitrate, self._max_br)
+            else:
+                self._max_br = 50_000_000
+                self.user_bw_cap = 0
 
     def effective_target(self, native_w: int, native_h: int):
         """Return (tw, th) — the target encode resolution.
@@ -1830,12 +1835,13 @@ async def client_session(ws, cfg, bridge):
     has_webcodecs = False
     _enc_target_w, _enc_target_h = W, H  # current encoder dimensions
     _reinit_deadline = 0.0                # monotonic: reinit encoder at this time; 0=none
+    _codec_error_msg = None               # set by _upgrade_encoder on explicit codec failure
 
     seq_num = 0
     last_send_time = time.monotonic()
 
-    def _upgrade_encoder(tw: int = 0, th: int = 0):
-        nonlocal encoder, has_webcodecs, _enc_target_w, _enc_target_h
+    def _upgrade_encoder(tw: int = 0, th: int = 0, explicit: bool = False):
+        nonlocal encoder, has_webcodecs, _enc_target_w, _enc_target_h, _codec_error_msg
         if not has_webcodecs:
             # Client doesn't support WebCodecs (or revoked it after an error).
             # Downgrade to JPEG so the client's JPEG path actually gets JPEG frames.
@@ -1854,8 +1860,13 @@ async def client_session(ws, cfg, bridge):
             return  # already upgraded at this resolution
         old = encoder
         # Cascade: try target_codec first, then H.265, then H.264.
+        # When explicit=True the user chose a specific codec — don't cascade to others;
+        # if the chosen codec fails, report an error and fall back to JPEG only.
         seen = set()
-        fallbacks = [target_codec, CODEC_H265, CODEC_H264]
+        if explicit and target_codec != CODEC_JPEG:
+            fallbacks = [target_codec]
+        else:
+            fallbacks = [target_codec, CODEC_H265, CODEC_H264]
         new_enc = None
         for codec in fallbacks:
             if codec == CODEC_AV1 and codec != target_codec:
@@ -1869,8 +1880,13 @@ async def client_session(ws, cfg, bridge):
                 break
             e.close()
         if new_enc is None:
+            _codec_labels = {CODEC_H264: "H.264", CODEC_H265: "H.265", CODEC_AV1: "AV1"}
+            if explicit:
+                _codec_error_msg = (f"{_codec_labels.get(target_codec, 'Codec')} encoder not"
+                                    f" available on this server — using JPEG fallback")
+            else:
+                log.warning("Video codec unavailable for %s — staying on JPEG", ws.remote_address)
             new_enc = EncoderPipeline(CODEC_JPEG, tw, th, ctrl.bitrate)
-            log.warning("Video codec unavailable for %s — staying on JPEG", ws.remote_address)
         else:
             log.info("Encoder %s %dx%d for %s",
                      {CODEC_H264:"h264",CODEC_H265:"h265",CODEC_AV1:"av1"}.get(new_enc.actual_codec,"?"),
@@ -1882,7 +1898,7 @@ async def client_session(ws, cfg, bridge):
     loop = asyncio.get_event_loop()
 
     async def input_reader():
-        nonlocal has_webcodecs, target_codec, _reinit_deadline
+        nonlocal has_webcodecs, target_codec, _reinit_deadline, _codec_error_msg
         cur_buttons = 0
         try:
             async for raw in ws:
@@ -1897,6 +1913,7 @@ async def client_session(ws, cfg, bridge):
                     elif t == "caps":
                         has_webcodecs = bool(ev.get("webcodecs", False))
                         client_codecs = ev.get("codecs", [])
+                        explicit = bool(ev.get("explicit", False))
                         w, h = int(ev.get("w", 1920)), int(ev.get("h", 1080))
                         ctrl.on_resolution(w, h)
                         # Negotiate codec: pick best that client supports.
@@ -1905,7 +1922,10 @@ async def client_session(ws, cfg, bridge):
                         # webcodecs=true without a list, keep the configured default.
                         if client_codecs and has_webcodecs:
                             target_codec = _select_codec(client_codecs)
-                        _upgrade_encoder()
+                        _upgrade_encoder(explicit=explicit)
+                        if _codec_error_msg:
+                            _msg = _codec_error_msg; _codec_error_msg = None
+                            await ws.send(json.dumps({"t": "codec_error", "msg": _msg}))
                     elif t == "resolution":
                         ctrl.on_resolution(int(ev.get("w",1920)), int(ev.get("h",1080)))
                         # Schedule encoder reinit if effective target changed (debounced 500ms)
@@ -2071,6 +2091,7 @@ async def client_session(ws, cfg, bridge):
                 pass
         nonlocal _enc_target_w, _enc_target_h, _reinit_deadline
         last_encoder_codec = encoder.actual_codec
+        _bw_sent = []   # list of (monotonic_time, bytes) for rolling 1s bandwidth measurement
         _t_diag = time.monotonic(); _n_diag = 0; _n_drop = 0; _n_nosend = 0
         _last_vnc_fbu = bridge._fbu_count
         # Pipelined encode: start encoding during the rate-limit sleep so that
@@ -2249,6 +2270,17 @@ async def client_session(ws, cfg, bridge):
 
                 last_send_time = target
                 _last_encoded_seq = _pipe_enc_seq
+                # Enforce user bandwidth cap: drop frame if rolling 1s window is over budget.
+                # This applies to all codecs including JPEG (which ignores the bitrate setting).
+                _bw_cap_bps = ctrl.user_bw_cap
+                if _bw_cap_bps:
+                    _bw_now = time.monotonic()
+                    _bw_sent = [(t, b) for t, b in _bw_sent if t > _bw_now - 1.0]
+                    _frame_bytes = 18 + len(payload)  # 18 = struct.calcsize(">IQBBI")
+                    if (sum(b for _, b in _bw_sent) + _frame_bytes) * 8 > _bw_cap_bps:
+                        _n_drop += 1
+                        continue
+                    _bw_sent.append((_bw_now, _frame_bytes))
                 _n_diag += 1
                 seq_num += 1
                 # Use current wall-clock time for cap_ms in the header — the browser
@@ -2725,7 +2757,7 @@ function sendCaps(probed){
     if(decoder&&CODEC_NAMES[decoderCodec]!==_qCodec){
       try{decoder.close();}catch(e){}decoder=null;decoderCodec=-1;
     }
-    send({t:'caps',webcodecs:true,codecs:[_qCodec],w:canvas.width,h:canvas.height});
+    send({t:'caps',webcodecs:true,codecs:[_qCodec],explicit:true,w:canvas.width,h:canvas.height});
   }
   sendQuality();
 }
@@ -2817,6 +2849,22 @@ function send(obj){if(ws&&wsOpen)ws.send(JSON.stringify(obj));}
 // Send physical canvas pixels so the server can match encode resolution to what the canvas can actually display.
 function sendRes(){send({t:'resolution',w:canvas.width,h:canvas.height});}
 
+function _showError(text){
+  let el=document.getElementById('err-banner');
+  if(!el){
+    el=document.createElement('div');
+    el.id='err-banner';
+    el.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;background:#c00;color:#fff;'+
+      'font:bold 15px/1.4 sans-serif;padding:14px 20px;text-align:center;cursor:pointer;'+
+      'box-shadow:0 2px 10px rgba(0,0,0,.6);';
+    el.onclick=()=>el.remove();
+    document.body.appendChild(el);
+  }
+  el.textContent=text+' — click to dismiss';
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>{if(el.parentNode)el.remove();},8000);
+}
+
 function connect(){
   const token=new URLSearchParams(location.search).get('token')||'';
   const url='ws://'+location.host+'/stream'+(token?'?token='+encodeURIComponent(token):'');
@@ -2882,6 +2930,8 @@ function connect(){
           _writeClipboard(msg.text);
           st.textContent='[clipboard] '+msg.text.substring(0,50);
           setTimeout(()=>{st.textContent='';},3000);
+        }else if(msg.t==='codec_error'){
+          _showError(msg.msg||'Codec unavailable');
         }else if(msg.t==='eval'){
           let result='';
           try{result=String(eval(msg.js))}catch(e){result='ERR:'+String(e);}
