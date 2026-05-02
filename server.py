@@ -3417,23 +3417,31 @@ def _audio_encoder_thread():
     """Drain _audio_raw_q, encode PCM→Opus, fan-out to audio subscribers.
     Started lazily when the first audio WS client connects.
     Runs for the life of the server; exits only if Opus init fails."""
+    global _audio_encoder_started
     if not _AV_OK:
         log.warning("Audio encoder: PyAV not available — audio disabled")
+        _audio_encoder_started = False
         return
     try:
         import av as _av_audio
         codec_ctx = _av_audio.CodecContext.create('libopus', 'w')
         codec_ctx.sample_rate = 48000
-        codec_ctx.format = 'fltp'
+        # libopus supports 'flt' (interleaved float32) and 's16' — NOT 'fltp' (planar)
+        codec_ctx.format = 'flt'
         codec_ctx.bit_rate = 64000
+        # PyAV 13+ uses .layout; older PyAV used .channel_layout / .channels
         try:
-            codec_ctx.channel_layout = 'stereo'
-        except (AttributeError, TypeError):
-            codec_ctx.channels = 2
+            codec_ctx.layout = 'stereo'
+        except AttributeError:
+            try:
+                codec_ctx.channel_layout = 'stereo'
+            except AttributeError:
+                codec_ctx.channels = 2
         codec_ctx.open()
         log.info("Audio encoder: Opus ready (48 kHz stereo 64 kbps)")
     except Exception as e:
         log.warning("Audio encoder: Opus init failed (%s) — audio disabled", e)
+        _audio_encoder_started = False
         return
 
     FRAME_SAMPLES = 960          # 20 ms at 48 kHz (one Opus frame)
@@ -3470,12 +3478,11 @@ def _audio_encoder_thread():
             chunk   = pcm_buf[:FRAME_FLOATS]
             pcm_buf = pcm_buf[FRAME_FLOATS:]
             try:
-                # Deinterleave and clamp: (2, 960) float32 planar.
-                left  = np.ascontiguousarray(np.clip(chunk[0::2], -1.0, 1.0))
-                right = np.ascontiguousarray(np.clip(chunk[1::2], -1.0, 1.0))
-                planar = np.stack([left, right], axis=0)
+                # Clamp and keep interleaved: libopus uses 'flt' (interleaved float32).
+                interleaved = np.ascontiguousarray(np.clip(chunk, -1.0, 1.0))
 
-                frame = _av_audio.AudioFrame.from_ndarray(planar, format='fltp', layout='stereo')
+                frame = _av_audio.AudioFrame.from_ndarray(
+                    interleaved.reshape(1, -1), format='flt', layout='stereo')
                 frame.sample_rate = 48000
                 frame.pts         = pts
 
