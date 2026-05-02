@@ -309,7 +309,49 @@ if [[ $WAITED -ge 15 ]]; then
     yellow "  Server did not respond within 15s — check log: tail -f $LOG_PATH"
 fi
 
-# ── Step 8: Connection info ────────────────────────────────────────────────────
+# ── Step 8: Trigger macOS permission prompts now ──────────────────────────────
+# Both Screen Recording and Accessibility prompts appear as system dialogs in
+# the GUI session.  If the user runs setup.sh from an SSH terminal, the dialogs
+# are not visible there — but because the server LaunchAgent is already running
+# and owns a screen, the prompts surface inside the active display session.
+# We invoke a short Python helper to poke both APIs so the dialogs appear
+# immediately rather than waiting for the first web-UI connection.
+step "Requesting macOS permissions (Screen Recording + Accessibility)"
+"$PYTHON_BINARY" - <<'PYEOF' 2>/dev/null &
+import sys, time
+# Screen Recording — CGRequestScreenCaptureAccess() pops the system dialog
+try:
+    import Quartz
+    Quartz.CGRequestScreenCaptureAccess()
+except Exception:
+    pass
+
+# Accessibility — AXIsProcessTrusted(options:{prompt:True}) pops the dialog
+try:
+    import ctypes, ctypes.util
+    ax = ctypes.cdll.LoadLibrary(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+    ax.AXIsProcessTrustedWithOptions.restype = ctypes.c_bool
+    ax.AXIsProcessTrustedWithOptions.argtypes = [ctypes.c_void_p]
+    # kAXTrustedCheckOptionPrompt = True triggers the System Settings dialog
+    try:
+        from Foundation import NSDictionary
+        opts = NSDictionary.dictionaryWithObject_forKey_(True, "AXTrustedCheckOptionPrompt")
+        ax.AXIsProcessTrustedWithOptions(ctypes.c_void_p(id(opts)))
+    except Exception:
+        pass
+except Exception:
+    pass
+# Keep the process alive briefly so the dialogs have time to render
+time.sleep(3)
+PYEOF
+PERM_PID=$!
+yellow "  Permission dialogs may appear on screen — click Allow for both."
+yellow "  (Screen Recording enables 60fps capture; Accessibility enables smooth input)"
+sleep 4
+kill "$PERM_PID" 2>/dev/null || true
+
+# ── Step 9: Connection info ────────────────────────────────────────────────────
 MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
 
 echo
@@ -330,13 +372,9 @@ else
     echo "    then open: http://127.0.0.1:${PORT}/?token=${MVS_PASSWORD}"
 fi
 echo
-echo "  Current capture mode: VNC (~30 fps)"
-echo "  To upgrade to 60 fps SCK capture:"
-echo
-yellow "    1. Open the web UI above — screen is already visible"
-yellow "    2. A 'Python wants to record your screen' dialog will appear"
-yellow "       in the GUI session (visible in the web UI itself)"
-yellow "    3. Click Allow — server auto-upgrades to 60 fps within 30s"
+echo "  Capture: SCK 60fps (or VNC fallback until Screen Recording is allowed)"
+echo "  Input:   CGEvent native (or VNC fallback until Accessibility is allowed)"
+echo "  The server upgrades automatically within 5s after permissions are granted."
 echo
 echo "  Python: $PYTHON_BINARY"
 echo "  Log:    tail -f $LOG_PATH"
