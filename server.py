@@ -2304,7 +2304,12 @@ def _check_screen_capture():
     """Check Screen Recording permission by attempting an actual capture.
     CGPreflightScreenCaptureAccess() returns False even when TCC has the grant
     for LaunchAgent / SSH-launched processes on macOS 15+, so we probe by calling
-    CGDisplayCreateImage directly. Returns True if capture succeeds."""
+    CGWindowListCreateImage directly. Returns True if capture succeeds.
+
+    NOTE: CGWindowListCreateImage polling at 60fps locks the compositor and freezes
+    the UI. DisplayStreamBridge is disabled until a push-based CGDisplayStream
+    implementation replaces the polling loop. Returning False here disables it."""
+    return False  # TODO: replace with CGDisplayStream push API
     try:
         import ctypes, math
         cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
