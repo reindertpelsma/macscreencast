@@ -1193,27 +1193,32 @@ class InProcessSCKBridge:
                     try:
                         sb_ptr = _sb_to_ptr(sampleBuffer)
                         if not sb_ptr:
+                            log.debug("SCK audio: _sb_to_ptr returned 0")
                             return
                         block_buf = _cm.CMSampleBufferGetDataBuffer(sb_ptr)
                         if not block_buf:
+                            log.debug("SCK audio: CMSampleBufferGetDataBuffer returned null")
                             return
                         length_at = ctypes.c_size_t(0)
                         total_len = ctypes.c_size_t(0)
                         data_ptr  = ctypes.c_void_p(0)
-                        if _cm.CMBlockBufferGetDataPointer(
+                        status = _cm.CMBlockBufferGetDataPointer(
                                 block_buf, 0,
                                 ctypes.byref(length_at), ctypes.byref(total_len),
-                                ctypes.byref(data_ptr)) != 0:
+                                ctypes.byref(data_ptr))
+                        if status != 0:
+                            log.debug("SCK audio: CMBlockBufferGetDataPointer status=%d", status)
                             return
                         if not data_ptr.value or total_len.value == 0:
+                            log.debug("SCK audio: empty data ptr=%s len=%d", data_ptr.value, total_len.value)
                             return
                         raw = bytes((ctypes.c_char * total_len.value).from_address(data_ptr.value))
                         try:
                             _audio_raw_q.put_nowait(raw)
                         except queue.Full:
                             pass  # drop — encoder is behind
-                    except Exception:
-                        pass
+                    except Exception as _ae:
+                        log.debug("SCK audio callback: %s", _ae)
                     return
                 if outputType != 0:
                     return
@@ -1322,10 +1327,14 @@ class InProcessSCKBridge:
                     writer, 0, InProcessSCKBridge._sck_queue, None)
                 # Register audio output on the same queue (SCK type 1 = audio).
                 try:
-                    stream.addStreamOutput_type_sampleHandlerQueue_error_(
+                    ok_audio = stream.addStreamOutput_type_sampleHandlerQueue_error_(
                         writer, 1, InProcessSCKBridge._sck_queue, None)
-                except Exception:
-                    pass  # older macOS or audio not available
+                    if ok_audio:
+                        log.info("InProcessSCK: audio output registered")
+                    else:
+                        log.warning("InProcessSCK: audio output registration returned False — audio capture unavailable")
+                except Exception as e:
+                    log.warning("InProcessSCK: audio output registration failed: %s — audio capture unavailable", e)
 
                 _st_ev = threading.Event()
                 _serr  = [None]
@@ -1978,6 +1987,11 @@ async def client_session(ws, cfg, bridge):
                             if ks: bridge.send_key(down, ks)
                     elif t in ("paste", "setclip"):
                         text = ev.get("text","")
+                        if t == "paste":
+                            mac_rev = ev.get("mac_rev")
+                            if (mac_rev is not None
+                                    and mac_rev != bridge.server_clipboard_seq):
+                                continue  # client's view of Mac clipboard is stale — ignore
                         if text:
                             # pbcopy is more reliable than VNC ClientCutText on macOS 15+
                             # (ClientCutText may be silently ignored by screensharingd)
@@ -2039,7 +2053,8 @@ async def client_session(ws, cfg, bridge):
         # Send current Mac clipboard immediately on connect so side menu is populated.
         if bridge.server_clipboard:
             try:
-                await ws.send(json.dumps({"t": "clipboard", "text": bridge.server_clipboard}))
+                await ws.send(json.dumps({"t": "clipboard", "text": bridge.server_clipboard,
+                                          "seq": bridge.server_clipboard_seq}))
             except Exception:
                 pass
         nonlocal _enc_target_w, _enc_target_h, _reinit_deadline
@@ -2239,7 +2254,7 @@ async def client_session(ws, cfg, bridge):
                 if sc != known_clip and bridge.server_clipboard:
                     known_clip = sc
                     try:
-                        await ws.send(json.dumps({"t":"clipboard","text":bridge.server_clipboard}))
+                        await ws.send(json.dumps({"t":"clipboard","text":bridge.server_clipboard,"seq":sc}))
                     except Exception: pass
 
         except Exception as e:
@@ -2440,6 +2455,7 @@ let _lastAnyData=Date.now(); // updated on every WS message; stall-detect uses t
 let clipSynced=false;       // true only when navigator.clipboard.readText() permission is persistently granted
 let _lastMacClipboard='';   // last clipboard text known on Mac side; used to break browser↔Mac sync loop
 let _clipPollTimer=null;    // setInterval handle for browser-clipboard polling
+let _macClipboardSeq=-1;    // seq of the last Mac clipboard message seen; -1 = not seen yet
 let fitMode='fit';       // 'fit' = letterbox, 'cover' = fill/crop
 // Default ctrlToMeta ON for Windows/Linux (Ctrl+C/V → Cmd+C/V on Mac).
 // Default OFF on macOS browsers — user has a physical Cmd key, no remap needed.
@@ -2745,6 +2761,7 @@ function connect(){
           // Update _lastMacClipboard BEFORE _writeClipboard so the next
           // async poll sees it and skips re-sending the same text back.
           _lastMacClipboard=msg.text;
+          if(msg.seq!==undefined)_macClipboardSeq=msg.seq;
           clipTA.value=msg.text;
           _writeClipboard(msg.text);
           st.textContent='[clipboard] '+msg.text.substring(0,50);
@@ -2873,7 +2890,9 @@ canvas.addEventListener('touchend',e=>{
 function sendPasteText(text){
   if(text&&wsOpen){
     _lastMacClipboard=text; // optimistic: prevent the server-echo from looping back
-    send({t:'paste',text});
+    const m={t:'paste',text};
+    if(_macClipboardSeq>=0)m.mac_rev=_macClipboardSeq; // let server reject stale pastes
+    send(m);
   }
 }
 
@@ -3066,6 +3085,7 @@ function _applyHideCursor(){
   // Apply or remove cursor:none. Pointer lock also hides cursor; this is orthogonal.
   const hide=_hideCursor||_plockActive;
   canvas.style.cursor=hide?'none':'';
+  document.body.style.cursor=hide?'none':'';
   cur.style.display=hide?'none':'';
 }
 btnHideCursor.addEventListener('click',()=>{
@@ -3219,13 +3239,16 @@ document.getElementById('clip-paste').addEventListener('click',()=>{
 });
 document.getElementById('clip-clear').addEventListener('click',()=>{clipTA.value='';ki.focus();});
 
-// Bidirectional sync: when user edits clipTA, update Mac clipboard in real-time (debounced 400ms).
-// Set _lastMacClipboard to prevent the server echo from being re-sent back.
+// Bidirectional sync: when user edits clipTA, update Mac clipboard AND browser clipboard
+// (debounced 400ms). Keeping both in sync means Ctrl+V always sends what the textarea shows,
+// eliminating the stale-browser-clipboard paste bug.
 let _clipTATimer=null;
 clipTA.addEventListener('input',()=>{
   clearTimeout(_clipTATimer);
   _clipTATimer=setTimeout(()=>{
-    if(wsOpen){_lastMacClipboard=clipTA.value;send({t:'setclip',text:clipTA.value});}
+    const text=clipTA.value;
+    if(wsOpen){_lastMacClipboard=text;send({t:'setclip',text});}
+    _writeClipboard(text); // keep browser clipboard in sync so Ctrl+V sends this text
   },400);
 });
 
@@ -3372,6 +3395,7 @@ btnAudio.addEventListener('click',()=>{
 // Auto-connect on load if cookie is on (AudioContext will resume on first interaction).
 if(_audioEnabled)connectAudio();
 
+_updatePlockBtn(); // set initial visibility based on browser pointer lock support
 resize();connect();connectMetric();
 </script></body></html>
 """
