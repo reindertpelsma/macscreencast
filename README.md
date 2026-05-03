@@ -73,6 +73,9 @@ Browser                    Python server              macOS APIs
 
 **VNC is a bootstrap transport, not the primary path.** The server starts over VNC so you can see the screen and click the macOS permission dialogs. Once Screen Recording and Accessibility are granted (typically within 30 seconds of first launch), the server upgrades automatically to SCK capture and CGEvent input. VNC keeps running as a warm spare.
 
+> **VNC bootstrap requires screensharingd to already have Screen Recording permission.**
+> Cloud Mac providers (Scaleway, AWS EC2 Mac, MacStadium) pre-seed this permission in their base images, so VNC works immediately after `setup.sh`. On a **fresh physical Mac** that has never had Screen Recording granted, screensharingd cannot capture the display — the VNC bootstrap path is unavailable. You need one-time physical (or KVM) access to open System Settings → Privacy & Security → Screen Recording and grant it before running `setup.sh` remotely.
+
 ---
 
 ## Quick start

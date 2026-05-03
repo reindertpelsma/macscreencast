@@ -35,6 +35,7 @@ MACOS_PASS=""
 CODEC="h264"
 MAX_FPS=60
 SKIP_SCREEN_SHARING=0
+VNC_PRESEEDED=0   # 1 = screensharingd already live on port 5900 (cloud Mac)
 
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -70,21 +71,59 @@ die()    { red "ERROR: $*"; exit 1; }
 # Usage: sudo_s command [args...]
 sudo_s() { echo "$MACOS_PASS" | sudo -S "$@" 2>/dev/null; }
 
-# ── Step 1: macOS login password ──────────────────────────────────────────────
-# Prompted once here; reused for (a) sudo and (b) VNC input control.
-step "macOS login password"
+# ── Step 1: Detect environment + conditional password prompt ──────────────────
+#
+# The macOS password serves two purposes:
+#   (a) sudo — to enable screensharingd via launchctl
+#   (b) VNC input control — passed to the server as the VNC auth credential
+#
+# Both purposes only matter when screensharingd already has Screen Recording
+# TCC permission. On cloud Macs (Scaleway, AWS EC2 Mac, MacStadium) this is
+# pre-seeded in the base image so port 5900 is live from first boot. On a
+# fresh physical Mac, screensharingd has no TCC permission regardless of
+# whether the daemon is running — VNC cannot capture the display and the
+# password would be unused.
+#
+# We probe port 5900 first:
+#   live → cloud Mac, VNC is usable → prompt for password
+#   dead → fresh Mac, VNC is not usable → skip password, print guidance instead
 
-echo "  User: $MACOS_USER"
-if [[ -z "$MACOS_PASS" ]]; then
-    read -rsp "  Password (used for sudo + VNC input control): " MACOS_PASS
-    echo
+step "Detecting environment"
+
+if nc -z 127.0.0.1 5900 2>/dev/null; then
+    VNC_PRESEEDED=1
+    green "  screensharingd detected on port 5900 (cloud Mac — VNC pre-permitted)"
+else
+    VNC_PRESEEDED=0
+    yellow "  screensharingd not detected on port 5900"
+    yellow "  This is normal on a fresh physical Mac. macOS requires Screen Recording"
+    yellow "  permission to be granted once via physical/KVM access before VNC works."
+    yellow "  → System Settings → Privacy & Security → Screen Recording → allow Python"
+    yellow "  After granting, re-run setup.sh and VNC bootstrap will be available."
 fi
 
-# Validate and cache sudo credentials so later commands don't prompt again.
-if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
-    green "  Password verified"
+echo "  User: $MACOS_USER"
+
+if [[ "$VNC_PRESEEDED" -eq 1 ]]; then
+    # Cloud Mac: password needed for sudo (enable/restart screensharingd) and VNC auth.
+    if [[ -z "$MACOS_PASS" ]]; then
+        read -rsp "  macOS password (used for sudo + VNC input control): " MACOS_PASS
+        echo
+    fi
+    if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
+        green "  Password verified"
+    else
+        yellow "  Could not validate password with sudo — screensharingd restart may fail"
+    fi
 else
-    yellow "  Could not validate password with sudo — Screen Sharing enable may fail"
+    # Fresh Mac: no password needed — screensharingd cannot capture without TCC.
+    # sudo still available via the system prompt if the user has passwordless sudo.
+    if [[ -n "$MACOS_PASS" ]]; then
+        # Honour explicit --macos-pass flag even on fresh Mac (user knows what they're doing).
+        if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
+            green "  Password provided and verified"
+        fi
+    fi
 fi
 
 # ── Step 2: Find the best Python binary ───────────────────────────────────────
@@ -217,12 +256,12 @@ fi
 
 # ── Step 5: Enable Screen Sharing (screensharingd / VNC port 5900) ────────────
 if [[ "$SKIP_SCREEN_SHARING" -eq 0 ]]; then
-    step "Enabling Screen Sharing (VNC for input control)"
+    step "Screen Sharing (screensharingd)"
 
-    if nc -z 127.0.0.1 5900 2>/dev/null; then
-        green "  Screen Sharing already active on port 5900"
-    else
-        yellow "  Not detected on port 5900 — attempting to enable..."
+    if [[ "$VNC_PRESEEDED" -eq 1 ]]; then
+        green "  Already active on port 5900 — no action needed"
+    elif [[ -n "$MACOS_PASS" ]]; then
+        yellow "  Attempting to enable screensharingd..."
 
         # Method 1: launchctl (macOS 12+)
         sudo_s launchctl load -w \
@@ -232,12 +271,17 @@ if [[ "$SKIP_SCREEN_SHARING" -eq 0 ]]; then
         sudo_s /usr/sbin/systemsetup -setremotedesktop on || true
 
         if nc -z 127.0.0.1 5900 2>/dev/null; then
-            green "  Screen Sharing enabled"
+            green "  screensharingd started on port 5900"
+            yellow "  Note: VNC capture requires Screen Recording TCC permission."
+            yellow "  Without it, screensharingd runs but shows a blank screen."
+            yellow "  Grant permission once physically, then re-run setup.sh."
         else
-            yellow "  Could not confirm port 5900 is open."
-            yellow "  Enable manually: System Settings > General > Sharing > Screen Sharing"
-            yellow "  The server will still start; VNC input will connect once it is on."
+            yellow "  Could not start screensharingd — enable manually:"
+            yellow "  System Settings → General → Sharing → Screen Sharing"
         fi
+    else
+        yellow "  Skipping screensharingd (no password provided and port 5900 not pre-seeded)"
+        yellow "  On a fresh Mac, grant Screen Recording permission physically first."
     fi
 fi
 
@@ -320,14 +364,42 @@ if [[ $WAITED -ge 15 ]]; then
     yellow "  Server did not respond within 15s — check log: tail -f $LOG_PATH"
 fi
 
-# ── Step 8: Trigger macOS permission prompts now ──────────────────────────────
-# Both Screen Recording and Accessibility prompts appear as system dialogs in
-# the GUI session.  If the user runs setup.sh from an SSH terminal, the dialogs
-# are not visible there — but because the server LaunchAgent is already running
-# and owns a screen, the prompts surface inside the active display session.
-# We invoke a short Python helper to poke both APIs so the dialogs appear
-# immediately rather than waiting for the first web-UI connection.
+# ── Step 8: Trigger macOS permission prompts ──────────────────────────────────
+#
+# TCC permission dialogs appear in the GUI session on the Mac's display, NOT
+# in the SSH terminal where you ran this script. How you see and click them
+# depends on your setup:
+#
+#   Cloud Mac (VNC pre-seeded, e.g. Scaleway):
+#     Connect via VNC on port 5900 right now — the dialogs will be visible.
+#     URL: vnc://127.0.0.1:5900 (SSH-tunnel: ssh -L 5900:localhost:5900 ...)
+#
+#   Mac with display attached:
+#     Look at the screen — the dialogs will appear there momentarily.
+#
+#   Headless fresh Mac with no prior permission:
+#     Attach a display or KVM, grant Screen Recording to Python in
+#     System Settings → Privacy & Security → Screen Recording, then
+#     re-run setup.sh. That is a one-time step.
+#
+# We poke both APIs now so the dialogs surface immediately.
 step "Requesting macOS permissions (Screen Recording + Accessibility)"
+
+if [[ "$VNC_PRESEEDED" -eq 1 ]]; then
+    yellow "  ┌─ ACTION REQUIRED ────────────────────────────────────────────────┐"
+    yellow "  │ Connect via VNC to see and click the permission dialogs:         │"
+    yellow "  │   ssh -L 5900:localhost:5900 ${MACOS_USER}@<mac-ip>             │"
+    yellow "  │   then open:  vnc://127.0.0.1:5900                              │"
+    yellow "  │ Click Allow on: Screen Recording  and  Accessibility            │"
+    yellow "  └──────────────────────────────────────────────────────────────────┘"
+else
+    yellow "  ┌─ ACTION REQUIRED ────────────────────────────────────────────────┐"
+    yellow "  │ The permission dialogs will appear on the Mac's display.         │"
+    yellow "  │ If you have no display attached, you need physical/KVM access.   │"
+    yellow "  │ Grant: Screen Recording  and  Accessibility  → click Allow       │"
+    yellow "  │ This is a one-time step. Re-run setup.sh after granting.         │"
+    yellow "  └──────────────────────────────────────────────────────────────────┘"
+fi
 "$PYTHON_BINARY" - <<'PYEOF' 2>/dev/null &
 import sys, time
 # Screen Recording — CGRequestScreenCaptureAccess() pops the system dialog
