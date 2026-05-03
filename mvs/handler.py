@@ -602,30 +602,27 @@ async def client_session(ws, cfg, bridge):
 
                 last_send_time = target
                 _last_encoded_seq = _pipe_enc_seq
-                # Enforce a hard rate cap via rolling 1s window. Two ceilings:
-                #  - user_bw_cap (set by client, from the quality menu)
-                #  - 1.5x of the controller's adaptive target — this is the
-                #    "VBR overshoot guard": the encoder is VBR (constant_bit_rate=0)
-                #    and routinely overshoots target by 2-5x on complex content.
-                #    Without this guard, on a 2Mbps Chrome DevTools throttle
-                #    the queue stays full and lag steady-states at 2-3s even
-                #    after the controller has backed off to floor bitrate.
-                #
-                # Video frame drop strategy: drop the over-budget P-frame and
-                # mark _need_keyframe so the next encode rebuilds the decoder's
-                # reference chain. The decoder briefly stutters but doesn't go
-                # into block-echo corruption. On a constrained link this trade
-                # is correct — visible stutter ≪ 3-second lag.
-                _bw_cap_bps = ctrl.user_bw_cap or int(ctrl.bitrate * 1.5)
+                # Optional user_bw_cap enforcement (rolling 1s window).
+                # JPEG only — each JPEG is independent so dropping is safe.
+                # Video codecs are NOT dropped here. Once a P-frame is encoded
+                # the decoder needs it: TCP guarantees delivery, GOP=99999
+                # means the state-locked decoder has no I-frame fallback for
+                # ~28 minutes. Application-layer drops would force an I-frame
+                # to recover, and a forced I-frame on a constrained link
+                # actively makes the lag worse (single I-frame can be 100KB-
+                # 1MB). The correct primitive is the encoder's own rate
+                # control — we just have to use a codec/option pair that
+                # actually respects the bitrate target (see encoder.py for
+                # the VideoToolbox VBR limitation).
+                _bw_cap_bps = ctrl.user_bw_cap
                 if _bw_cap_bps:
                     _bw_now = time.monotonic()
                     _bw_sent = [(t, b) for t, b in _bw_sent if t > _bw_now - 1.0]
                     _frame_bytes = 18 + len(payload)  # 18 = struct.calcsize(">IQBBI")
                     if (sum(b for _, b in _bw_sent) + _frame_bytes) * 8 > _bw_cap_bps:
-                        _n_drop += 1
-                        if has_webcodecs:
-                            _need_keyframe = True   # re-sync decoder on next send
-                        continue
+                        if not has_webcodecs:
+                            _n_drop += 1
+                            continue   # JPEG: safe to drop, no reference frames
                     _bw_sent.append((_bw_now, _frame_bytes))
                 _n_diag += 1
                 seq_num += 1

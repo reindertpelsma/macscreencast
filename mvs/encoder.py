@@ -23,26 +23,62 @@ class EncoderPipeline:
     def _setup(self, width, height, bitrate):
         if not _AV_OK or self.target_codec == CODEC_JPEG:
             return
-        # VideoToolbox VBR (constant_bit_rate=0). CBR was tried and rejected:
-        # on simple content the encoder collapsed to ~10% of target rather
-        # than padding, killing dynamic range on the upside. VBR + the
-        # drain-pause / wb-aware backoff in congestion.py is the better
-        # combination — the encoder is allowed to use efficient compression
-        # on simple frames, and overshoots on complex frames are handled
-        # by the controller's wb-aware drain logic.
-        _vt_opts = {"realtime": "1", "allow_sw": "1", "constant_bit_rate": "0"}
+        # ── Apple VideoToolbox rate control: design failure documented ───────
+        # Every well-designed video encoder (libx264, libx265, libaom, NVENC,
+        # AMD VCE, Intel QSV) treats a strict bitrate target as binding —
+        # under VBV/HRD or CBR the encoder reduces quality (raises quantizer,
+        # coarsens motion vectors) until output fits the budget. That's the
+        # contract: "never overshoot the link, allow blurriness on motion."
+        #
+        # Apple's VideoToolbox VBR mode (constant_bit_rate=0, the default)
+        # does NOT do this. It treats bit_rate as an average target and
+        # overshoots 2-5× on complex content rather than reducing quality.
+        # This is documented Apple behavior, but it's a clear architectural
+        # gap in a real-time encoder: there is no built-in protection
+        # against filling a constrained link.
+        #
+        # Apple's only mitigation:
+        #   - constant_bit_rate=1 for h264_videotoolbox (macOS 13+ only).
+        #     Enforces strict CBR via DataRateLimits; respects the budget.
+        #   - For hevc_videotoolbox / av1_videotoolbox there is NO Apple-
+        #     supplied strict-rate option as of macOS Sequoia. Output WILL
+        #     overshoot on complex content.
+        #
+        # Software fallbacks (libx264/libx265) have proper VBV rate control
+        # but cost CPU. We prefer them only when constrained-link behavior
+        # matters more than encode latency (not auto-selected currently).
+        #
+        # Relevant Apple docs:
+        #   kVTCompressionPropertyKey_DataRateLimits
+        #   kVTCompressionPropertyKey_AverageBitRate
+        # FFmpeg implementation: libavcodec/videotoolboxenc.c
+        # ────────────────────────────────────────────────────────────────────
+        _h264_vt_opts = {"realtime": "1", "allow_sw": "1",
+                         # Apple-blessed strict CBR (h264 only, macOS 13+).
+                         # Encoder respects bitrate by adjusting quantizer
+                         # rather than overshooting.
+                         "constant_bit_rate": "1"}
+        _hevc_vt_opts = {"realtime": "1", "allow_sw": "1",
+                         # No CBR option exists for hevc_videotoolbox.
+                         # Output WILL overshoot on complex content; the
+                         # controller's lag-feedback loop is the only
+                         # backstop. Switch to libx265 if strict rate
+                         # control matters more than encode latency.
+                         "constant_bit_rate": "0"}
         candidates = {
             CODEC_H264: [
-                ("h264_videotoolbox", _vt_opts),
+                ("h264_videotoolbox", _h264_vt_opts),
                 ("libx264", {"preset": "fast", "tune": "zerolatency",
                              "x264-params": "bframes=0:rc-lookahead=0:aq-mode=1"}),
             ],
             CODEC_H265: [
-                ("hevc_videotoolbox", _vt_opts),
+                ("hevc_videotoolbox", _hevc_vt_opts),
                 ("libx265", {"preset": "fast", "tune": "zerolatency",
                              "x265-params": "bframes=0:rc-lookahead=0:aq-mode=1"}),
             ],
             CODEC_AV1: [
+                # av1_videotoolbox: same VBR overshoot issue as HEVC, no
+                # Apple-supplied strict-rate option.
                 ("av1_videotoolbox", {"realtime": "1", "allow_sw": "0"}),
                 ("libsvtav1", {"preset": "10",
                                "svtav1-params": "film-grain=0:irefresh-type=2"}),
