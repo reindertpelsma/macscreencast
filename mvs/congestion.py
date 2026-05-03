@@ -179,7 +179,14 @@ class AdaptiveController:
         Signal 2 — delta vs metric (secondary): RTT stable but elevated above the unloaded
         metric channel means a STATIC buffer exists. This catches the case where the gradient
         already fired and settled, or where we joined mid-congestion. A static buffer is an
-        unstable equilibrium; slight backoff drains it quickly."""
+        unstable equilibrium; slight backoff drains it quickly.
+
+        BOTH signals are disabled in buffer mode (lag_budget_override > 0): the user has
+        deliberately accepted queue formation up to their chosen buffer size, and gradient
+        backoff would actively fight that intent. The lag-report path with the user's
+        budget is the only backoff signal in buffer mode."""
+        if self.lag_budget_override > 0:
+            return
         with self._lock:
             # Smooth to suppress per-sample jitter before computing gradient
             self._ping_smooth = (self._ping_smooth * 0.6 + rtt_ms * 0.4

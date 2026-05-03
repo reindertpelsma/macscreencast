@@ -141,11 +141,13 @@ canvas{display:block;position:absolute}
         <option value="auto">Auto</option>
         <!-- populated after WebCodecs probe -->
       </select></div>
-      <div class="q-row"><label>Lag budget</label><select class="q-sel" id="q-lag">
-        <option value="0" selected>50ms (responsive)</option>
+      <div class="q-row"><label>Buffer</label><select class="q-sel" id="q-lag">
+        <option value="0" selected>responsive (no buffer)</option>
         <option value="100">100ms</option>
-        <option value="200">200ms (smooth video)</option>
-        <option value="500">500ms</option>
+        <option value="200">200ms</option>
+        <option value="500">500ms (smooth video)</option>
+        <option value="1000">1s</option>
+        <option value="3000">3s (cinema)</option>
       </select></div>
       <div class="q-row"><label>Scroll</label><select class="q-sel" id="q-scroll">
         <option value="0.25">0.25×</option>
@@ -626,6 +628,16 @@ let metricWs=null,metricOpen=false,metricRtt=0;
 let metricRttWindow=[],worstMetricRtt5s=0;  // rolling 5s worst-case metric RTT
 
 function connectMetric(){
+  // Buffer mode disables /metric: when the user has explicitly accepted a
+  // buffered queue (>= 100ms), the unloaded-RTT signal would conflict with
+  // the buffer-formation we want, AND we can't be certain that the metric
+  // WS shares the SSH-tunnel TCP pipe (separate channel ≠ guaranteed
+  // separate buffer behavior under all transports). Skip it and let the
+  // server's lag-report path do all the work.
+  if((_qLagMs|0) >= 100){
+    metricOpen=false;
+    return;
+  }
   const token=new URLSearchParams(location.search).get('token')||'';
   const url='ws://'+location.host+'/metric'+(token?'?token='+encodeURIComponent(token):'');
   metricWs=new WebSocket(url);
@@ -651,7 +663,14 @@ function connectMetric(){
   };
 }
 function sendMetricPing(){
+  // In buffer mode, /metric is disabled — drop any in-flight connection.
+  if((_qLagMs|0) >= 100){
+    if(metricWs){try{metricWs.close();}catch(e){} metricWs=null; metricOpen=false;}
+    return;
+  }
   if(metricOpen&&metricWs)metricWs.send(JSON.stringify({t:'ping',ts:Date.now()}));
+  // If we left buffer mode and there's no metric ws yet, reconnect.
+  if(!metricWs && !metricOpen) connectMetric();
 }
 setInterval(sendMetricPing,2000);
 // Stall detector: server sends a heartbeat every 2s even on a static screen.
@@ -1130,21 +1149,22 @@ let _audioWs=null,_audioWsOpen=false;
 let _audioCtx=null,_audioDecoder=null;
 let _nextAudioTime=0;
 
-// Adaptive jitter buffer: tracks inter-arrival time variance and keeps the
-// target latency at max(BASE, 4×σ). Floor 250ms because this product is for
-// remote desktop, not gaming — audio reaction-time is irrelevant; smooth
-// playback is everything. The original 120ms floor caused constant
-// underruns on jittery WiFi/WAN links: every underrun = ~120ms of silence,
-// and without bumping the jitter estimate the next spike under-ran again.
-const _AUDIO_BASE_LATENCY = 0.250;  // floor: 250ms — comfortable for remote-desktop use
-const _AUDIO_MAX_LATENCY  = 0.800;  // hard ceiling: reset if queue grows past 800ms
+// Adaptive jitter buffer.
+//   target = max(user_buffer | AUDIO_FLOOR, 4×σ_jitter), capped at MAX.
+// In responsive mode the floor is 250ms (no gaming on this product;
+// 250ms is comfortable, eliminates the 120ms-floor underrun glitches).
+// In buffer mode the user-set video buffer is the floor — so audio and
+// video are pinned to the same latency and stay in lockstep through
+// roams. Audio jitter EWA can still push higher if the link demands.
+const _AUDIO_FLOOR_MS    = 250;     // floor in responsive mode
+const _AUDIO_MAX_LATENCY = 4.000;   // hard ceiling: reset if queue grows past 4s
 let _audioLastArrival = 0;          // AudioContext time of previous packet arrival
-let _audioJitterEwa   = 0.060;      // EWA of inter-arrival jitter (σ estimate), init 60ms.
-                                    // Higher initial → buffer at floor from packet 1
-                                    // instead of growing into it over ~50 packets.
+let _audioJitterEwa   = 0.060;      // EWA of inter-arrival jitter (σ estimate)
 function _audioTargetLatency(){
+  const userMs = (_qLagMs|0);
+  const floorMs = userMs >= 100 ? userMs : _AUDIO_FLOOR_MS;
   // 4σ covers >99% of arrivals under a Gaussian jitter model
-  return Math.min(_AUDIO_MAX_LATENCY, Math.max(_AUDIO_BASE_LATENCY, 4 * _audioJitterEwa));
+  return Math.min(_AUDIO_MAX_LATENCY, Math.max(floorMs/1000, 4 * _audioJitterEwa));
 }
 
 function _audioSupported(){
