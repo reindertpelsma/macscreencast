@@ -102,6 +102,73 @@ Fixed in:
   lag-tracking machinery is reusable for a future libx265 fallback,
   but reverted as currently dead code.
 
+## Buffer mode (the "responsive vs cinema" knob) — load-bearing design
+
+The quality menu has a "Buffer" setting (UI label "Buffer", values:
+responsive / 100ms / 200ms / 500ms / 1s / 3s). It's not a tuning hint —
+it switches the product between two genuinely different modes. **Don't
+collapse them into one path.**
+
+### Responsive mode (`_qLagMs == 0`)
+
+- Server: `lag_budget_ms() = 50ms`, gradient detector (`on_ping_rtt`
+  Signal 1+2) ON, `/metric` ws active, full backoff aggressiveness
+- Client: video frames decoded immediately on receipt (no queue); audio
+  jitter buffer floor = 250ms
+- Optimized for remote-desktop interactive use. Every keystroke
+  visible "instantly" (≤ link RTT). Frames may drop / quality may
+  blur under stress to preserve responsiveness — that's correct.
+
+### Buffer mode (`_qLagMs >= 100`)
+
+- Server: `lag_budget_ms() = user_value`, gradient detector OFF
+  (`on_ping_rtt` early-returns when `lag_budget_override > 0`),
+  `/metric` ws disabled client-side. Lag is allowed to grow freely
+  up to the user's buffer; only lag *exceeding* the buffer triggers
+  backoff. The server stops fighting the buffer.
+- Client: incoming video frames are held in `_vidQueue` for `_qLagMs`
+  ms (performance.now()-relative `decodeAt`) before being submitted
+  to the decoder. Audio target latency floor = `_qLagMs` so A/V stay
+  in lockstep.
+- Optimized for actually watching video content (e.g. YouTube on the
+  remote Mac). No frame drops — the buffer absorbs jitter rather than
+  the encoder dropping quality. Mouse interaction is intentionally
+  laggy by `_qLagMs` ms; that's the trade.
+
+### Mode-switch handling (don't break this)
+
+- buffered → responsive: `_flushVideoBufferImmediately()` drains the
+  queue so the user sees real-time within one frame, not N seconds of
+  stale buffer playing out. Audio: `_nextAudioTime = 0` forces the
+  next packet through the underrun-reset path → lands at `now + new_target`.
+- responsive → buffered: queue starts filling on the next frame. Audio
+  ramps up via the same reset.
+- The reset hook is in the `lSel.addEventListener('change', …)` and the
+  `q-reset` button handler. If you change those handlers, preserve the
+  flush + audio reset.
+
+### Why /metric is disabled in buffer mode
+
+We can't be certain whether `/metric` is on the same SSH-tunnel TCP
+pipe as `/` (separate WS channel ≠ guaranteed separate buffer behavior
+across all transports). In buffer mode the user has explicitly accepted
+queue formation, so an "unloaded RTT" signal isn't actually unloaded
+and would conflict with the buffer the user wants. Better to ignore
+than misuse. Restored automatically on switch back to responsive.
+
+### What does NOT change between modes
+
+- Encoder pipeline (VBR, GOP=99999, bitrate ramp, etc.) — same in both modes
+- ping_monitor / drain pause / wb-aware backoff — same in both modes
+- Codec selection / WebCodecs decoder configuration — same in both modes
+- Video frame format on the wire — same in both modes (the buffer is
+  purely a client-side delay; the server doesn't know or care)
+
+The encoder runs at full quality regardless of mode. In buffer mode the
+encoder ramps up to high bitrate naturally because lag stays low (link
+RTT only — buffer absorbs everything else). On a fast link the buffer
+fills with high-quality frames, which is exactly what cinema mode wants.
+
 ## Things that probably WILL work, not yet attempted
 
 - **libx265 software encode for constrained links**. Has proper VBV
