@@ -30,8 +30,11 @@ TOKEN       = sys.argv[2]        if len(sys.argv) > 2 else ""
 MIN_FPS     = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
 MIN_MBPS    = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0   # 0 = no check
 RATE_BPS    = 2_000_000   # simulated 2 Mbps downstream
-DURATION    = 40.0        # total test duration (seconds)
-WARMUP_S    = 10.0        # ignore lag/bitrate during initial ramp-up/settle
+DURATION    = 70.0        # total test duration (seconds)
+WARMUP_S    = 25.0        # ignore lag/bitrate during initial ramp-up/settle.
+                          # AIMD recovery from a drain event can take ~15-20s,
+                          # and we want steady state to reflect post-recovery
+                          # equilibrium, not the dip.
 MAX_LAG_MS  = 2000        # steady-state max lag (after warmup)
 
 WS_URL = f"ws://{HOST}:{PORT}/" + (f"?token={TOKEN}" if TOKEN else "")
