@@ -60,6 +60,7 @@ jobs:
           nohup python3 server.py \
             --listen 127.0.0.1 \
             --port 6081 \
+            --password citest \
             --no-manage-screensharingd \
             > /tmp/macvncstream.log 2>&1 &
           echo "Server PID: $!"
