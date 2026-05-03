@@ -1131,12 +1131,17 @@ let _audioCtx=null,_audioDecoder=null;
 let _nextAudioTime=0;
 
 // Adaptive jitter buffer: tracks inter-arrival time variance and keeps the
-// target latency at max(BASE, 4×σ). On a clean LAN this stays near 120ms;
-// on a jittery WiFi/WAN link it expands automatically to absorb bursts.
-const _AUDIO_BASE_LATENCY = 0.120;  // floor: 120ms — enough for one missed packet
-const _AUDIO_MAX_LATENCY  = 0.600;  // hard ceiling: reset if queue grows past 600ms
+// target latency at max(BASE, 4×σ). Floor 250ms because this product is for
+// remote desktop, not gaming — audio reaction-time is irrelevant; smooth
+// playback is everything. The original 120ms floor caused constant
+// underruns on jittery WiFi/WAN links: every underrun = ~120ms of silence,
+// and without bumping the jitter estimate the next spike under-ran again.
+const _AUDIO_BASE_LATENCY = 0.250;  // floor: 250ms — comfortable for remote-desktop use
+const _AUDIO_MAX_LATENCY  = 0.800;  // hard ceiling: reset if queue grows past 800ms
 let _audioLastArrival = 0;          // AudioContext time of previous packet arrival
-let _audioJitterEwa   = 0.010;      // EWA of inter-arrival jitter (σ estimate), init 10ms
+let _audioJitterEwa   = 0.060;      // EWA of inter-arrival jitter (σ estimate), init 60ms.
+                                    // Higher initial → buffer at floor from packet 1
+                                    // instead of growing into it over ~50 packets.
 function _audioTargetLatency(){
   // 4σ covers >99% of arrivals under a Gaussian jitter model
   return Math.min(_AUDIO_MAX_LATENCY, Math.max(_AUDIO_BASE_LATENCY, 4 * _audioJitterEwa));
@@ -1166,6 +1171,13 @@ function _onAudioFrame(audioData){
     }
     _audioLastArrival=now;
     // Keep latency pinned to adaptive target; reset on underrun or runaway.
+    // On underrun, also bump the jitter estimate so the recovery target is
+    // bigger than the gap that caused the underrun — without this we keep
+    // resetting to the same too-small buffer and re-underrun on every jitter
+    // spike (the "constant disconnection" sound).
+    if(_nextAudioTime<now||_nextAudioTime-now>_AUDIO_MAX_LATENCY){
+      _audioJitterEwa=Math.max(_audioJitterEwa,0.080);   // floor σ at 80ms after underrun
+    }
     const target=_audioTargetLatency();
     if(_nextAudioTime<now||_nextAudioTime-now>_AUDIO_MAX_LATENCY){
       _nextAudioTime=now+target;

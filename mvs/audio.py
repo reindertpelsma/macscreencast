@@ -20,6 +20,20 @@ _audio_raw_q: queue.Queue = queue.Queue(maxsize=500)   # raw PCM chunks from SCK
 _audio_encoder_started: bool = False  # encoder thread started lazily on first subscriber
 
 
+def _put_drop_oldest(aq, msg):
+    """Put `msg` into asyncio.Queue `aq`, evicting the oldest item if full.
+    Runs in the event loop via call_soon_threadsafe."""
+    while aq.full():
+        try:
+            aq.get_nowait()
+        except Exception:
+            break
+    try:
+        aq.put_nowait(msg)
+    except Exception:
+        pass
+
+
 def _audio_encoder_thread():
     """Drain _audio_raw_q, encode PCM→Opus, fan-out to audio subscribers.
     Started lazily when the first audio WS client connects.
@@ -106,10 +120,14 @@ def _audio_encoder_thread():
                     with _audio_subs_lock:
                         subs = list(_audio_subs.values())
                     for aq, lp in subs:
+                        # Drop-oldest semantics: if a client is briefly slow,
+                        # the freshest audio wins. Old approach (silently fail
+                        # on full queue) held stale audio and dropped fresh,
+                        # so audio could lag behind video by the queue's depth.
                         try:
-                            lp.call_soon_threadsafe(aq.put_nowait, msg)
+                            lp.call_soon_threadsafe(_put_drop_oldest, aq, msg)
                         except Exception:
-                            pass  # subscriber gone or queue full
+                            pass  # subscriber loop gone
 
                 pts += FRAME_SAMPLES
             except Exception as e:
@@ -123,7 +141,10 @@ async def audio_session(ws):
     import uuid as _uuid
 
     qid = _uuid.uuid4().hex
-    aq  = asyncio.Queue(maxsize=200)
+    # 25 frames × 20 ms = 500 ms ceiling. Combined with drop-oldest
+    # semantics in the fan-out, a slow client drops to freshness rather
+    # than playing 4 seconds of stale audio out of sync with video.
+    aq  = asyncio.Queue(maxsize=25)
     lp  = asyncio.get_event_loop()
 
     with _audio_subs_lock:
