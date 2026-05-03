@@ -16,6 +16,20 @@ open "http://localhost:6081/?token=YOUR_TOKEN"
 
 ---
 
+## Who is this for
+
+The core offer: browser-based access to a macOS screen, through an SSH tunnel, with nothing in the path except your own server. That combination is not available anywhere else as a self-hosted tool.
+
+**Cloud and on-premise Mac infrastructure.** AWS EC2 Mac instances, MacStadium, Hetzner Mac minis, and rack-mounted Mac minis in CI rooms all need occasional GUI access — to click through a permission dialog, configure Xcode, or debug something that only reproduces on the physical display. SSH gets you a shell; this gets you a screen.
+
+**On the same network.** If you SSH into a Mac at home or in the office, you can add `-L 6081:localhost:6081` to that command and open a browser tab. No client to install, no account to create, no relay. This is the only self-hosted option that works this way.
+
+**Compliance-conscious teams.** TeamViewer, AnyDesk, and Chrome Remote Desktop route through third-party servers. If that's off-limits — SOC2, ISO 27001, air-gapped environments, or just principle — this runs entirely inside your existing SSH infrastructure.
+
+**Linux, Windows, and ChromeOS users.** Apple's built-in Screen Sharing only works Mac-to-Mac. From any machine with SSH and a modern browser, you get 60fps access in a tab.
+
+---
+
 ## Why this exists
 
 Every browser-based macOS remote desktop tool has the same problems:
@@ -75,9 +89,14 @@ cd mac-vnc-stream
 bash setup.sh
 ```
 
-Then on your laptop:
+**Installing on a remote Mac over SSH** — the `-t` flag allocates a TTY so the password prompt works:
 ```bash
-ssh -L 6081:localhost:6081 user@your-mac
+ssh -t user@your-mac 'bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh)'
+```
+
+Then connect from your laptop (works for both local and remote installs):
+```bash
+ssh -NL 6081:localhost:6081 user@your-mac
 open "http://localhost:6081/?token=YOUR_TOKEN"   # token shown at end of install
 ```
 
