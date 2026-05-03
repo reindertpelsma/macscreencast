@@ -38,11 +38,12 @@ jobs:
             sleep 1; echo -n "."
           done
 
-      - name: Drive screen activity for smoke test
+      - name: Drive screen activity
         run: |
-          # PyObjC color-cycling NSWindow at 60fps.
+          # Bouncing-shape NSWindow at 60fps (stress-level animation — see ci_animate.py).
           # Avoids osascript (blocks 2min on Terminal first launch) and Chrome
           # (5-10s startup). PyObjC is already installed by the step above.
+          # Kept alive across BOTH the smoke test and the 2Mbps stability test.
           nohup python3 tests/ci_animate.py > /tmp/animate.log 2>&1 &
           echo $! > /tmp/animate_pid
           # Audio loop for the audio smoke test
@@ -53,12 +54,23 @@ jobs:
           echo "Screen activity started (animate PID: $(cat /tmp/animate_pid))"
 
       - name: Run smoke tests (SCK video + audio)
+        run: python3 tests/ci_smoke.py 6081 citest
+
+      - name: Run 2Mbps stability test
         run: |
-          python3 tests/ci_smoke.py 6081 citest
-          STATUS=$?
+          # Simulates a Chrome DevTools 2Mbps throttle via virtual-clock pacing.
+          # Pass criteria (with stress animation still running):
+          #   - no disconnect
+          #   - steady-state lag < 2000ms (after 10s warmup)
+          #   - avg fps >= 20  (screen remains responsive)
+          #   - avg link >= 1.7Mbps  (controller found equilibrium, not throttled to floor)
+          python3 tests/test_2mbps.py 6081 citest 20 1.7
+
+      - name: Stop screen activity
+        if: always()
+        run: |
           kill "$(cat /tmp/animate_pid)" 2>/dev/null || true
-          kill "$(cat /tmp/say_pid)" 2>/dev/null || true
-          exit $STATUS
+          kill "$(cat /tmp/say_pid)"    2>/dev/null || true
 
       - name: Upload server log on failure
         if: failure()

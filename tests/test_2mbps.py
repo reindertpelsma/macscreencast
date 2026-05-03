@@ -6,22 +6,26 @@ sleep until that virtual arrival time, then report the simulated lag back to the
 server. This accurately models Chrome DevTools throttle (where the server's TCP
 write buffer stays empty but lag accumulates in Chrome's internal buffer).
 
-The server receives realistic lag reports and its congestion controller must
-keep lag below MAX_LAG_MS at steady state.
+The server receives realistic lag reports and its congestion controller must:
+  - keep lag below MAX_LAG_MS at steady state
+  - maintain at least MIN_FPS average fps (responsiveness)
+  - sustain at least MIN_MBPS average bitrate (proves effective link use,
+    not just throttled-to-floor operation)
 
 Usage:
-  python3 tests/test_2mbps.py [port] [token]
+  python3 tests/test_2mbps.py [port] [token] [min_fps] [min_mbps]
 """
 import asyncio, json, struct, sys, time
 
 HOST        = "127.0.0.1"
-PORT        = int(sys.argv[1]) if len(sys.argv) > 1 else 6081
-TOKEN       = sys.argv[2] if len(sys.argv) > 2 else ""
+PORT        = int(sys.argv[1])   if len(sys.argv) > 1 else 6081
+TOKEN       = sys.argv[2]        if len(sys.argv) > 2 else ""
+MIN_FPS     = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
+MIN_MBPS    = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0   # 0 = no check
 RATE_BPS    = 2_000_000   # simulated 2 Mbps downstream
 DURATION    = 40.0        # total test duration (seconds)
-WARMUP_S    = 10.0        # ignore lag during initial ramp-up/settle
+WARMUP_S    = 10.0        # ignore lag/bitrate during initial ramp-up/settle
 MAX_LAG_MS  = 2000        # steady-state max lag (after warmup)
-MIN_FPS     = 2.0         # minimum average fps over full run
 
 WS_URL = f"ws://{HOST}:{PORT}/" + (f"?token={TOKEN}" if TOKEN else "")
 RATE   = RATE_BPS / 8     # bytes per second
@@ -35,12 +39,13 @@ async def main():
         return
 
     print(f"2Mbps stability test → {WS_URL}  ({DURATION}s)")
-    print(f"  throttle={RATE_BPS//1000}kbps  warmup={WARMUP_S}s  max_lag={MAX_LAG_MS}ms")
+    print(f"  throttle={RATE_BPS//1000}kbps  warmup={WARMUP_S}s  "
+          f"max_lag={MAX_LAG_MS}ms  min_fps={MIN_FPS}  min_mbps={MIN_MBPS}")
 
     frames = 0
     max_lag_steady = 0
     lag_samples = []
-    start_wall = time.time()
+    steady_bytes = 0   # bytes received after warmup (for bitrate check)
     start_mono = time.monotonic()
     last_lag_sent = 0.0
     disconnected = False
@@ -83,12 +88,13 @@ async def main():
                 # Parse frame header — ts_ms is server wall-clock send time
                 _, ts_ms, ftype, _, _ = struct.unpack_from(">IQBBI", msg)
                 frames += 1
+                elapsed_mono = time.monotonic() - start_mono
+                if elapsed_mono >= WARMUP_S:
+                    steady_bytes += len(msg)
 
                 # Lag = (virtual arrival time) - (server send time).
                 # This matches exactly what the browser measures: frame age at decode time.
                 lag_ms = max(1, int(virtual_t * 1000) - ts_ms)
-
-                elapsed_mono = time.monotonic() - start_mono
 
                 # Send lag report at ~10/s (matching browser rate)
                 now_t = time.monotonic()
@@ -112,14 +118,17 @@ async def main():
         disconnected = True
 
     elapsed = time.monotonic() - start_mono
-    avg_fps = frames / max(elapsed, 0.001)
-    avg_lag = sum(lag_samples) / len(lag_samples) if lag_samples else 0
+    steady_s = max(elapsed - WARMUP_S, 0.001)
+    avg_fps  = frames / max(elapsed, 0.001)
+    avg_lag  = sum(lag_samples) / len(lag_samples) if lag_samples else 0
+    avg_mbps = steady_bytes * 8 / 1_000_000 / steady_s
 
     print()
     print(f"Results after {elapsed:.1f}s:")
     print(f"  frames={frames}  avg_fps={avg_fps:.1f}  disconnected={disconnected}")
-    print(f"  steady-state lag (after {WARMUP_S}s warmup):")
-    print(f"    max={max_lag_steady}ms  avg={avg_lag:.0f}ms  samples={len(lag_samples)}")
+    print(f"  steady-state (after {WARMUP_S}s warmup):")
+    print(f"    lag  max={max_lag_steady}ms  avg={avg_lag:.0f}ms  samples={len(lag_samples)}")
+    print(f"    link avg={avg_mbps:.2f}Mbps  (bytes={steady_bytes}  t={steady_s:.1f}s)")
 
     failures = []
     if disconnected:
@@ -128,6 +137,9 @@ async def main():
         failures.append(f"max lag {max_lag_steady}ms > {MAX_LAG_MS}ms limit")
     if avg_fps < MIN_FPS:
         failures.append(f"avg fps {avg_fps:.1f} < {MIN_FPS} minimum")
+    if MIN_MBPS > 0 and avg_mbps < MIN_MBPS:
+        failures.append(f"avg link {avg_mbps:.2f}Mbps < {MIN_MBPS}Mbps minimum "
+                        "(controller throttled to floor instead of finding equilibrium)")
 
     if failures:
         print(f"\nFAIL:")
