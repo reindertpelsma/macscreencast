@@ -101,6 +101,7 @@ All flags can be set via CLI or environment variable:
 |------|---------|---------|-------------|
 | `--macos-user` | `MACOS_USER` | current user | macOS username for VNC auth |
 | `--macos-pass` | `MACOS_PASS` | *(none)* | macOS login password for VNC auth |
+| `--vnc-pass` | `VNC_PASS` | *(none)* | VNC password (type-2 auth; alternative to macos-user/pass) |
 | `--listen` | `LISTEN` | `127.0.0.1` | Bind address (use SSH tunnel for remote access) |
 | `--port` | `PORT` | `6081` | HTTP/WebSocket port |
 | `--max-fps` | `MAX_FPS` | `60` | Maximum fps |
@@ -148,13 +149,13 @@ Measured on a Mac mini M1/M2 over localhost SSH tunnel:
 | VNC + H.264 | ~20fps | ~5ms/frame | ~5 Mbps |
 | SCK + H.264 | **60fps** | ~5ms/frame | ~5 Mbps |
 
-H.264/H.265 encoding uses Apple VideoToolbox (hardware media engine) — near-zero CPU.
+H.264/H.265 encoding uses Apple VideoToolbox (hardware media engine) — near-zero CPU. JPEG bandwidth is high because each frame is encoded independently with no temporal compression; H.264/H.265 only encode the pixels that changed.
 
 ### Browser compatibility
 
 | Browser | Video codec | Audio | Clipboard sync | Notes |
 |---------|------------|-------|---------------|-------|
-| Chrome 110+ | H.264, H.265, AV1 | ✅ | Full (live sync) | Best overall experience |
+| Chrome 110+ | H.264, H.265, AV1 | ✅ | Full (live sync) | AV1 hardware requires M3+/A17 Pro |
 | Firefox 130+ | H.264 | ✅ | Read-only (Ctrl+V) | No H.265 WebCodecs |
 | Safari 26+ | H.265, H.264 | ✅ | Read-only (Ctrl+V) | H.265 selected automatically |
 | Mobile Chrome | H.264 | ✅ | Partial | Touch events supported |
