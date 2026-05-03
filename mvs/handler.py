@@ -54,7 +54,7 @@ button:hover{background:#3b8fe0}
     <div style="display:flex;flex-direction:column;gap:.75rem">
       <input type="password" name="token" placeholder="Access token"
              autofocus autocomplete="current-password">
-      <p class="err" id="e">Invalid token — try again.</p>
+      <p class="err" id="e">Invalid token &mdash; try again.</p>
       <button type="submit">Connect</button>
     </div>
   </form>
