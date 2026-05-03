@@ -1777,12 +1777,16 @@ class AdaptiveController:
             if self.fps < fps_ceil:
                 self.fps = fps_ceil
             elif self.bitrate < self._max_br:
-                # Below ceiling: jump to 90% of it — the ceiling was the bitrate
-                # that just triggered congestion, so landing slightly below avoids
-                # an immediate re-trigger while still recovering fast.
-                # _ceil_bitrate == 0 means no congestion measured yet; probe cautiously.
-                if self._ceil_bitrate > 0 and self.bitrate < self._ceil_bitrate:
-                    self.bitrate = max(self._min_br, int(self._ceil_bitrate * 0.90))
+                # Ramp bitrate up toward the ceiling one step at a time.
+                # Cap each step at 2× current to match TCP slow-start's doubling rate.
+                # Jumping straight to the ceiling (old behaviour) produces data faster
+                # than TCP's cwnd can drain after a backoff, fills the kernel send buffer,
+                # inflates RTT, and triggers a false-positive gradient backoff on clean links.
+                target = int(self._ceil_bitrate * 0.90) if self._ceil_bitrate > 0 else self._max_br
+                target = min(target, self._max_br)
+                step_ceil = max(self.bitrate * 2, self.bitrate + 500_000)
+                if self.bitrate < target:
+                    self.bitrate = min(target, step_ceil)
                 elif self.bitrate < 20_000_000:
                     self.bitrate = min(self._max_br, int(self.bitrate * 1.10))
                 else:
@@ -1798,7 +1802,9 @@ class AdaptiveController:
             fps_ceil = float(self.fps_cap) if self.fps_cap > 0 else self.max_fps
             self.fps = fps_ceil
             if self._ceil_bitrate > 0 and self._ceil_bitrate > self.bitrate:
-                self.bitrate = max(self._min_br, int(self._ceil_bitrate * 0.90))
+                target = int(self._ceil_bitrate * 0.90)
+                step_ceil = max(self.bitrate * 2, self.bitrate + 500_000)
+                self.bitrate = max(self._min_br, min(target, step_ceil))
                 self.jpeg_quality = min(95, self.jpeg_quality + 20)
             self._last_fast = time.monotonic()
             log.debug("screen active: fps=%.1f br=%dk ceil=%dk", self.fps, self.bitrate//1000, self._ceil_bitrate//1000)
