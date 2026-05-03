@@ -99,20 +99,24 @@ jobs:
           # Add relay host key to known_hosts to avoid interactive prompt
           ssh-keyscan -H "$TUNNEL_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-          # Open reverse tunnel in background: relay:16081 → runner:6081
-          ssh -i ~/.ssh/tunfwd_key \
+          # Open reverse tunnel — nohup so it survives after this step's shell exits
+          nohup ssh -i ~/.ssh/tunfwd_key \
               -o StrictHostKeyChecking=yes \
               -o ServerAliveInterval=15 \
               -o ServerAliveCountMax=4 \
               -R 16081:localhost:6081 \
               -N \
-              "${TUNNEL_USER}@${TUNNEL_HOST}" &
-          TUNNEL_PID=$!
-          echo "Tunnel PID: $TUNNEL_PID"
+              "${TUNNEL_USER}@${TUNNEL_HOST}" > /tmp/tunnel.log 2>&1 &
+          echo $! > /tmp/tunnel.pid
+          echo "Tunnel PID: $(cat /tmp/tunnel.pid)"
 
-          sleep 3
-          echo "Tunnel open. On relay machine: http://localhost:16081/?token=citest"
-          echo "Tunnel PID=$TUNNEL_PID" >> /tmp/tunnel.pid
+          sleep 4
+          if kill -0 "$(cat /tmp/tunnel.pid)" 2>/dev/null; then
+            echo "Tunnel process alive. On relay: http://localhost:16081/?token=citest"
+          else
+            echo "Tunnel process died — check /tmp/tunnel.log:"
+            cat /tmp/tunnel.log
+          fi
 
       # ── tmate — SSH into this runner for manual inspection ────────────────
       # limit-access-to-actor: true restricts to your GitHub account's SSH key.
