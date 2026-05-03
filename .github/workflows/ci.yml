@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  smoke-test:
+    runs-on: macos-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: |
+          PIP="python3 -m pip install --quiet --user --break-system-packages"
+          $PIP 'websockets>=13.0' 'numpy>=1.24' 'Pillow>=10.0' 'cryptography>=41.0'
+          $PIP 'av>=12.0' 2>/dev/null && echo "av: installed" || echo "av: not available (JPEG fallback)"
+          $PIP pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz \
+               pyobjc-framework-AVFoundation pyobjc-framework-ScreenCaptureKit \
+               2>/dev/null && echo "PyObjC: installed" || echo "PyObjC: partial"
+
+      - name: Start mac-vnc-stream server
+        run: |
+          nohup python3 server.py \
+            --listen 127.0.0.1 \
+            --port 6081 \
+            --password citest \
+            --no-manage-screensharingd \
+            > /tmp/macvncstream.log 2>&1 &
+
+          echo -n "Waiting for server..."
+          for i in $(seq 1 20); do
+            nc -z 127.0.0.1 6081 2>/dev/null && echo " UP" && break
+            sleep 1; echo -n "."
+          done
+
+      - name: Run smoke tests (SCK video + audio)
+        run: python3 tests/ci_smoke.py 6081 citest
+
+      - name: Upload server log on failure
+        if: failure()
+        run: |
+          echo "=== Server log ==="
+          cat /tmp/macvncstream.log

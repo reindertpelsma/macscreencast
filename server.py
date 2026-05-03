@@ -3494,8 +3494,18 @@ let _audioEnabled=(()=>{const m=document.cookie.match(/mvs_audio=(\d)/);return m
 let _audioWs=null,_audioWsOpen=false;
 let _audioCtx=null,_audioDecoder=null;
 let _nextAudioTime=0;
-const _AUDIO_TARGET_LATENCY=0.060; // 60 ms jitter buffer
-const _AUDIO_MAX_LATENCY   =0.200; // reset if buffer grows beyond 200 ms
+
+// Adaptive jitter buffer: tracks inter-arrival time variance and keeps the
+// target latency at max(BASE, 4×σ). On a clean LAN this stays near 120ms;
+// on a jittery WiFi/WAN link it expands automatically to absorb bursts.
+const _AUDIO_BASE_LATENCY = 0.120;  // floor: 120ms — enough for one missed packet
+const _AUDIO_MAX_LATENCY  = 0.600;  // hard ceiling: reset if queue grows past 600ms
+let _audioLastArrival = 0;          // AudioContext time of previous packet arrival
+let _audioJitterEwa   = 0.010;      // EWA of inter-arrival jitter (σ estimate), init 10ms
+function _audioTargetLatency(){
+  // 4σ covers >99% of arrivals under a Gaussian jitter model
+  return Math.min(_AUDIO_MAX_LATENCY, Math.max(_AUDIO_BASE_LATENCY, 4 * _audioJitterEwa));
+}
 
 function _audioSupported(){
   return typeof AudioDecoder!=='undefined'&&typeof AudioContext!=='undefined';
@@ -3512,9 +3522,18 @@ function _onAudioFrame(audioData){
     }
     audioData.close();
     const now=_audioCtx.currentTime;
-    // Keep latency pinned to target; reset on underrun or runaway.
+    // Update inter-arrival jitter estimate (EWA with α=0.1)
+    if(_audioLastArrival>0){
+      const interArrival=now-_audioLastArrival;
+      const expectedInterval=buf.duration;
+      const jitter=Math.abs(interArrival-expectedInterval);
+      _audioJitterEwa=_audioJitterEwa*0.9+jitter*0.1;
+    }
+    _audioLastArrival=now;
+    // Keep latency pinned to adaptive target; reset on underrun or runaway.
+    const target=_audioTargetLatency();
     if(_nextAudioTime<now||_nextAudioTime-now>_AUDIO_MAX_LATENCY){
-      _nextAudioTime=now+_AUDIO_TARGET_LATENCY;
+      _nextAudioTime=now+target;
     }
     const src=_audioCtx.createBufferSource();
     src.buffer=buf;
