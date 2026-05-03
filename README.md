@@ -207,10 +207,10 @@ In `--api-only` mode, screensharingd is never contacted. If both Screen Recordin
 |-------|------------|--------------|---------------------|
 | 13 Ventura | ✅ | ✅ | ✅ |
 | 14 Sonoma | ✅ | ✅ | ✅ |
-| 15 Sequoia | ✅ | ✅ | ⚠️ view-only (Apple restriction) |
-| 26 Tahoe | ✅ | ✅ | ⚠️ view-only |
+| 15 Sequoia | ✅ | ✅ | ✅ |
+| 26 Tahoe | ✅ | ✅ | ✅ |
 
-macOS 15+ restricts VNC type-2 connections to view-only. CGEvent input is unaffected — it uses the Accessibility API directly.
+macOS 15+ restricts unauthenticated VNC (type-2, no-auth) to view-only. Authenticated VNC with a macOS username and password retains full input control. `setup.sh` prompts for your login password during install and passes it automatically — VNC input works out of the box for most users. CGEvent input is unaffected either way; it uses the Accessibility API directly and is the preferred input path.
 
 ---
 

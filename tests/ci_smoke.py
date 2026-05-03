@@ -16,8 +16,9 @@ TOKEN   = sys.argv[2] if len(sys.argv) > 2 else ""
 WS_URL  = f"ws://{HOST}:{PORT}/" + (f"?token={TOKEN}" if TOKEN else "")
 AUD_URL = f"ws://{HOST}:{PORT}/audio" + (f"?token={TOKEN}" if TOKEN else "")
 
-MIN_FRAMES     = 15   # in 8s — very conservative, catches "no capture" easily
-MIN_AUDIO_PKTS = 10   # in 5s — ~1 pkt per 20ms at 48kHz/960 samples
+MIN_FRAMES          = 240  # in 8s — 30fps minimum; Chrome bouncing-ball drives SCK
+MIN_AUDIO_PKTS      = 10   # total packets in 5s (includes DTX silence)
+MIN_REAL_AUDIO_PKTS = 30   # non-DTX packets — proves real audio is captured, not just silence
 
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
@@ -99,10 +100,15 @@ async def test_audio():
 
             elapsed = time.monotonic() - start
             real_pkts = pkts - dtx
-            if pkts >= MIN_AUDIO_PKTS:
-                print(f"  audio: {PASS}  {pkts} packets ({dtx} DTX silence) in {elapsed:.1f}s")
+            if pkts >= MIN_AUDIO_PKTS and real_pkts >= MIN_REAL_AUDIO_PKTS:
+                print(f"  audio: {PASS}  {pkts} packets ({real_pkts} real, {dtx} DTX) in {elapsed:.1f}s")
             else:
-                msg = f"audio: only {pkts} packets in {elapsed:.1f}s (need {MIN_AUDIO_PKTS})"
+                issues = []
+                if pkts < MIN_AUDIO_PKTS:
+                    issues.append(f"only {pkts} total packets (need {MIN_AUDIO_PKTS})")
+                if real_pkts < MIN_REAL_AUDIO_PKTS:
+                    issues.append(f"only {real_pkts} real (non-DTX) packets (need {MIN_REAL_AUDIO_PKTS})")
+                msg = "audio: " + "; ".join(issues)
                 print(f"  audio: {FAIL}  {msg}")
                 failures.append(msg)
     except Exception as e:

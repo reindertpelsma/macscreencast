@@ -38,8 +38,42 @@ jobs:
             sleep 1; echo -n "."
           done
 
+      - name: Drive screen activity for smoke test
+        run: |
+          cat > /tmp/stress.html << 'HTMLEOF'
+          <!DOCTYPE html><html><body style="background:#000;overflow:hidden;margin:0">
+          <canvas id="c"></canvas>
+          <script>
+          var c=document.getElementById('c');
+          c.width=window.innerWidth||800;c.height=window.innerHeight||600;
+          var ctx=c.getContext('2d'),x=200,y=200,vx=8,vy=5,r=40;
+          function loop(){
+            ctx.fillStyle='rgba(0,0,0,0.15)';ctx.fillRect(0,0,c.width,c.height);
+            x+=vx;y+=vy;
+            if(x<r||x>c.width-r)vx=-vx;
+            if(y<r||y>c.height-r)vy=-vy;
+            ctx.fillStyle='hsl('+(Date.now()/10%360)+',100%,60%)';
+            ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();
+            requestAnimationFrame(loop);
+          }
+          loop();
+          </script></body></html>
+          HTMLEOF
+          open -a "Google Chrome" --args --new-window "file:///tmp/stress.html" 2>/dev/null || \
+            open /tmp/stress.html 2>/dev/null || true
+          # Continuous TTS loop — survives step boundary via nohup
+          nohup bash -c 'while true; do say -v Samantha "audio test"; sleep 0.1; done' \
+            > /tmp/say.log 2>&1 &
+          echo $! > /tmp/say_pid
+          sleep 5
+          echo "Screen activity running (Chrome animation + audio loop)."
+
       - name: Run smoke tests (SCK video + audio)
-        run: python3 tests/ci_smoke.py 6081 citest
+        run: |
+          python3 tests/ci_smoke.py 6081 citest
+          STATUS=$?
+          kill "$(cat /tmp/say_pid)" 2>/dev/null || true
+          exit $STATUS
 
       - name: Upload server log on failure
         if: failure()
