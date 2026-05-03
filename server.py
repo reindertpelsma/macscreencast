@@ -3764,6 +3764,8 @@ def make_http_handler(cfg, bridge):
         from websockets.http11 import Response
         from websockets.datastructures import Headers
         path = request.path
+        log.info("http request: path=%r token_in_path=%s password=%r",
+                 path, ("token=" in path), cfg.password)
 
         # Debug eval endpoint: GET /dbg?js=<url-encoded-JS>  (localhost only)
         if path.startswith("/dbg"):
