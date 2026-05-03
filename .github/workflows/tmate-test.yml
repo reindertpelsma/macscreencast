@@ -40,17 +40,17 @@ jobs:
             pyobjc-framework-ScreenCaptureKit \
             2>/dev/null && echo "PyObjC: installed" || echo "PyObjC: partial (expected in headless CI)"
 
+      # ── Try to enable screensharingd (VNC on port 5900) ───────────────────
+      # GH macOS runners are real VMs with a GUI session, so screensharingd
+      # can be started with sudo. If it works, the server can use VNC mode
+      # to capture the screen (no Screen Recording permission needed for VNC).
+      - name: Enable screensharingd
+        run: |
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sleep 2
+          nc -z 127.0.0.1 5900 && echo "screensharingd UP on :5900" || echo "screensharingd not listening"
+
       # ── Start the server ──────────────────────────────────────────────────
-      # Notes on what works / doesn't in a headless GH macOS runner:
-      #   - HTTP server + web UI: YES
-      #   - Screen Recording (SCK): NO — no permission dialog possible headlessly
-      #   - screensharingd / VNC: NO — not running on GH runners
-      #   - Audio: NO — no audio device
-      # The server starts, serves the web UI, and logs that it can't get SCK.
-      # That's expected — we're testing the install path, not live capture.
-      #
-      # --no-manage-screensharingd: don't try to poke screensharingd
-      # --listen 127.0.0.1: loopback only; reach via tmate SSH tunnel below
       - name: Start mac-vnc-stream server
         env:
           MVS_PASSWORD: citest
@@ -73,26 +73,57 @@ jobs:
             sleep 1; echo -n "."
           done
 
-          # Show first lines of log so we can see startup state
           echo ""
-          echo "=== Server log (first 30 lines) ==="
-          head -30 /tmp/macvncstream.log || true
+          echo "=== Server log (first 40 lines) ==="
+          head -40 /tmp/macvncstream.log || true
 
-      # ── tmate — SSH into this runner ──────────────────────────────────────
-      # The session URL is printed to the step log.
-      # limit-access-to-actor: true restricts to your GitHub account's SSH key
-      # (add your key at github.com/settings/keys if not already there).
+      # ── Reverse SSH tunnel to relay host ──────────────────────────────────
+      # The runner SSHes to our relay machine (51.159.237.61) using a
+      # restricted keypair. The tunfwd user can only do port forwarding —
+      # no shell, no exec, no agent, no PTY (restrict + command=/bin/false).
       #
-      # To reach the server from your laptop once inside tmate:
-      #   ssh -L 6081:localhost:6081 <tmate-session-line>
-      # Then open: http://localhost:6081/?token=citest
+      # This creates:  relay:16081 → runner:localhost:6081
+      #
+      # On the relay machine, access the runner's web UI at:
+      #   http://localhost:16081/?token=citest
+      - name: Open reverse tunnel to relay
+        env:
+          TUNNEL_SSH_KEY: ${{ secrets.TUNNEL_SSH_KEY }}
+          TUNNEL_HOST: ${{ secrets.TUNNEL_HOST }}
+          TUNNEL_USER: ${{ secrets.TUNNEL_USER }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$TUNNEL_SSH_KEY" > ~/.ssh/tunfwd_key
+          chmod 600 ~/.ssh/tunfwd_key
+
+          # Add relay host key to known_hosts to avoid interactive prompt
+          ssh-keyscan -H "$TUNNEL_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+          # Open reverse tunnel in background: relay:16081 → runner:6081
+          ssh -i ~/.ssh/tunfwd_key \
+              -o StrictHostKeyChecking=yes \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=4 \
+              -R 16081:localhost:6081 \
+              -N \
+              "${TUNNEL_USER}@${TUNNEL_HOST}" &
+          TUNNEL_PID=$!
+          echo "Tunnel PID: $TUNNEL_PID"
+
+          sleep 3
+          echo "Tunnel open. On relay machine: http://localhost:16081/?token=citest"
+          echo "Tunnel PID=$TUNNEL_PID" >> /tmp/tunnel.pid
+
+      # ── tmate — SSH into this runner for manual inspection ────────────────
+      # limit-access-to-actor: true restricts to your GitHub account's SSH key.
+      # While tmate is running the tunnel is also running — access the web UI
+      # on the relay machine at http://localhost:16081/?token=citest
       #
       # Useful commands once connected:
-      #   tail -f /tmp/macvncstream.log     # live server log
-      #   python3 --version
+      #   tail -f /tmp/macvncstream.log
+      #   sudo launchctl list | grep screen
+      #   nc -z 127.0.0.1 5900 && echo "VNC up"
       #   python3 -c 'import av; print(av.__version__)'
-      #   python3 -c 'import objc; print("PyObjC ok")'
-      #   nc -z 127.0.0.1 6081 && echo "server up"
       - name: tmate (SSH into this runner)
         uses: mxschmitt/action-tmate@v3
         timeout-minutes: 25
