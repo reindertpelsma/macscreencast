@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Bouncing-shape NSWindow at 60fps to stress the H.264 encoder in CI.
 
-Run as a background subprocess before the smoke/2Mbps tests. Fifteen
-bouncing colored circles on a hue-cycling background force the macOS
-compositor to produce visually complex new frames every tick, so H.264
-P-frames are large enough to genuinely exercise the 2Mbps congestion
-controller (solid-color cycling produces ~3KB P-frames; this produces
-~30-80KB P-frames, which actually loads a 2Mbps link).
+Run as a background subprocess before the smoke/2Mbps tests. Six bouncing
+colored circles on a hue-cycling background force the macOS compositor
+to produce visually complex new frames every tick, so H.264 P-frames are
+large enough to genuinely exercise the 2Mbps congestion controller
+(solid-color cycling produces ~3KB P-frames; this produces ~15-40KB
+P-frames, which actually loads a 2Mbps link).
+
+Six balls is tuned for GitHub's macos-14 runners — heavy enough to give
+real encoder load, light enough that the compositor still feeds SCK at
+~20fps so the smoke and 2Mbps tests can hold an honest fps bar.
 """
 import sys, random
 
@@ -24,7 +28,7 @@ except ImportError:
 random.seed(42)   # reproducible layout across runs
 
 WIN_W, WIN_H = 900, 650
-NUM_BALLS    = 15
+NUM_BALLS    = 6
 TICK_HZ      = 60
 
 app = AppKit.NSApplication.sharedApplication()
