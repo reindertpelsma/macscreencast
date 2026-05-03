@@ -1,0 +1,97 @@
+name: tmate macOS scratch test
+
+# Manual trigger only — this is an interactive debugging/install-smoke workflow.
+# Run it from the Actions tab: Actions → tmate macOS scratch test → Run workflow
+on:
+  workflow_dispatch:
+
+jobs:
+  scratch-install:
+    runs-on: macos-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Install Python deps (mirrors what setup.sh does) ─────────────────
+      - name: Install Python dependencies
+        run: |
+          python3 -m pip install --quiet --user \
+            'websockets>=13.0' \
+            'numpy>=1.24' \
+            'Pillow>=10.0' \
+            'cryptography>=41.0'
+
+          if python3 -m pip install --quiet --user 'av>=12.0' 2>/dev/null; then
+            echo "av (PyAV/H.264): installed"
+          else
+            echo "av not available — server will fall back to JPEG"
+          fi
+
+          python3 -m pip install --quiet --user \
+            pyobjc-core \
+            pyobjc-framework-Cocoa \
+            pyobjc-framework-Quartz \
+            pyobjc-framework-AVFoundation \
+            pyobjc-framework-ScreenCaptureKit \
+            2>/dev/null && echo "PyObjC: installed" || echo "PyObjC: partial (expected in headless CI)"
+
+      # ── Start the server ──────────────────────────────────────────────────
+      # Notes on what works / doesn't in a headless GH macOS runner:
+      #   - HTTP server + web UI: YES
+      #   - Screen Recording (SCK): NO — no permission dialog possible headlessly
+      #   - screensharingd / VNC: NO — not running on GH runners
+      #   - Audio: NO — no audio device
+      # The server starts, serves the web UI, and logs that it can't get SCK.
+      # That's expected — we're testing the install path, not live capture.
+      #
+      # --no-manage-screensharingd: don't try to poke screensharingd
+      # --listen 127.0.0.1: loopback only; reach via tmate SSH tunnel below
+      - name: Start mac-vnc-stream server
+        env:
+          MVS_PASSWORD: citest
+          MACOS_USER: runner
+          MACOS_PASS: ""
+        run: |
+          nohup python3 server.py \
+            --listen 127.0.0.1 \
+            --port 6081 \
+            --no-manage-screensharingd \
+            > /tmp/macvncstream.log 2>&1 &
+          echo "Server PID: $!"
+
+          echo -n "Waiting for HTTP server..."
+          for i in $(seq 1 20); do
+            if nc -z 127.0.0.1 6081 2>/dev/null; then
+              echo " UP"
+              break
+            fi
+            sleep 1; echo -n "."
+          done
+
+          # Show first lines of log so we can see startup state
+          echo ""
+          echo "=== Server log (first 30 lines) ==="
+          head -30 /tmp/macvncstream.log || true
+
+      # ── tmate — SSH into this runner ──────────────────────────────────────
+      # The session URL is printed to the step log.
+      # limit-access-to-actor: true restricts to your GitHub account's SSH key
+      # (add your key at github.com/settings/keys if not already there).
+      #
+      # To reach the server from your laptop once inside tmate:
+      #   ssh -L 6081:localhost:6081 <tmate-session-line>
+      # Then open: http://localhost:6081/?token=citest
+      #
+      # Useful commands once connected:
+      #   tail -f /tmp/macvncstream.log     # live server log
+      #   python3 --version
+      #   python3 -c 'import av; print(av.__version__)'
+      #   python3 -c 'import objc; print("PyObjC ok")'
+      #   nc -z 127.0.0.1 6081 && echo "server up"
+      - name: tmate (SSH into this runner)
+        uses: mxschmitt/action-tmate@v3
+        timeout-minutes: 25
+        with:
+          limit-access-to-actor: true
