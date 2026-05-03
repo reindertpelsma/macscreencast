@@ -57,7 +57,9 @@ async def main():
     frames = 0
     max_lag_steady = 0
     lag_samples = []
-    steady_bytes = 0   # bytes received after warmup (for bitrate check)
+    steady_bytes = 0   # bytes received after warmup (whole-window avg)
+    tail_bytes   = 0   # bytes received in last TAIL_S — post-recovery equilibrium
+    TAIL_S       = 15.0
     start_mono = time.monotonic()
     last_lag_sent = 0.0
     disconnected = False
@@ -103,6 +105,8 @@ async def main():
                 elapsed_mono = time.monotonic() - start_mono
                 if elapsed_mono >= WARMUP_S:
                     steady_bytes += len(msg)
+                if elapsed_mono >= DURATION - TAIL_S:
+                    tail_bytes += len(msg)
 
                 # Lag = (virtual arrival time) - (server send time).
                 # This matches exactly what the browser measures: frame age at decode time.
@@ -134,14 +138,16 @@ async def main():
     steady_s = max(elapsed - WARMUP_S, 0.001)
     avg_fps  = frames / max(elapsed, 0.001)
     avg_lag  = sum(lag_samples) / len(lag_samples) if lag_samples else 0
-    avg_mbps = steady_bytes * 8 / 1_000_000 / steady_s
+    avg_mbps  = steady_bytes * 8 / 1_000_000 / steady_s
+    tail_mbps = tail_bytes   * 8 / 1_000_000 / TAIL_S
 
     print()
     print(f"Results after {elapsed:.1f}s:")
     print(f"  frames={frames}  avg_fps={avg_fps:.1f}  disconnected={disconnected}")
     print(f"  steady-state (after {WARMUP_S}s warmup):")
     print(f"    lag  max={max_lag_steady}ms  avg={avg_lag:.0f}ms  samples={len(lag_samples)}")
-    print(f"    link avg={avg_mbps:.2f}Mbps  (bytes={steady_bytes}  t={steady_s:.1f}s)")
+    print(f"    link avg     ={avg_mbps:.2f}Mbps  (bytes={steady_bytes}  t={steady_s:.1f}s)")
+    print(f"    link last{int(TAIL_S)}s={tail_mbps:.2f}Mbps  (post-recovery equilibrium)")
     print(f"  CPU peaks: {cpu.summary()}")
 
     failures = []
@@ -161,9 +167,14 @@ async def main():
         else:
             failures.append(f"avg fps {avg_fps:.1f} < {MIN_FPS} minimum "
                             f"(CPU partial-load: {cpu.summary()})")
-    if MIN_MBPS > 0 and avg_mbps < MIN_MBPS:
-        failures.append(f"avg link {avg_mbps:.2f}Mbps < {MIN_MBPS}Mbps minimum "
-                        "(controller throttled to floor instead of finding equilibrium)")
+    # Use tail bitrate (last TAIL_S) for the bar — that's post-recovery
+    # equilibrium. Using whole-window avg pulls in the controller's AIMD
+    # ramp from the dip after the first drain event, which masks whether
+    # it eventually saturated.
+    if MIN_MBPS > 0 and tail_mbps < MIN_MBPS:
+        failures.append(f"tail link {tail_mbps:.2f}Mbps < {MIN_MBPS}Mbps minimum "
+                        f"(controller didn't reach equilibrium near link cap; "
+                        f"whole-window avg was {avg_mbps:.2f}Mbps)")
 
     if failures:
         print(f"\nFAIL:")
