@@ -201,12 +201,17 @@ async def client_session(ws, cfg, bridge):
                         if has_webcodecs and (tw != _enc_target_w or th != _enc_target_h):
                             _reinit_deadline = time.monotonic() + 0.5
                     elif t == "quality":
+                        _old_bw_cap = ctrl.user_bw_cap
                         ctrl.on_quality(int(ev.get("cap_h", 0)), int(ev.get("fps", 0)),
                                         int(ev.get("maxkbps", 0)), int(ev.get("lag_ms", 0)))
+                        if ctrl.user_bw_cap != _old_bw_cap:
+                            _need_keyframe = True
                         nw, nh = bridge.dimensions
                         tw, th = ctrl.effective_target(nw or W, nh or H)
                         if has_webcodecs and (tw != _enc_target_w or th != _enc_target_h):
                             _reinit_deadline = time.monotonic() + 0.5
+                    elif t == "keyframe":
+                        _need_keyframe = True
                     elif t == "lag":
                         age = float(ev.get("age_ms", 0))
                         ctrl.on_lag(age, _get_wbuf(ws))
@@ -411,6 +416,7 @@ async def client_session(ws, cfg, bridge):
                 if wb > ctrl.lag_wb_budget():
                     ctrl.on_lag(0, wb)
                     _n_drop += 1
+                    _need_keyframe = True
                     if _pipe_task is not None:
                         try: await _pipe_task
                         except Exception: pass
@@ -505,6 +511,7 @@ async def client_session(ws, cfg, bridge):
                     if wb > ctrl.lag_wb_budget():
                         ctrl.on_lag(0, wb)
                         _n_drop += 1
+                        _need_keyframe = True
                         if _pipe_task is not None:
                             try: await _pipe_task
                             except Exception: pass
@@ -546,6 +553,8 @@ async def client_session(ws, cfg, bridge):
                 if _get_wbuf(ws) > ctrl.lag_wb_budget():
                     ctrl.on_lag(0, _get_wbuf(ws))
                     _n_drop += 1
+                    if not is_kf:
+                        _need_keyframe = True
                     continue
 
                 last_send_time = target
@@ -559,6 +568,8 @@ async def client_session(ws, cfg, bridge):
                     _frame_bytes = 18 + len(payload)  # 18 = struct.calcsize(">IQBBI")
                     if (sum(b for _, b in _bw_sent) + _frame_bytes) * 8 > _bw_cap_bps:
                         _n_drop += 1
+                        if not is_kf:
+                            _need_keyframe = True
                         continue
                     _bw_sent.append((_bw_now, _frame_bytes))
                 _n_diag += 1
