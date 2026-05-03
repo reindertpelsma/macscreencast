@@ -22,7 +22,7 @@ The core offer: browser-based access to a macOS screen, through an SSH tunnel, w
 
 **Cloud and on-premise Mac infrastructure.** AWS EC2 Mac instances, MacStadium, Hetzner Mac minis, and rack-mounted Mac minis in CI rooms all need occasional GUI access — to click through a permission dialog, configure Xcode, or debug something that only reproduces on the physical display. SSH gets you a shell; this gets you a screen.
 
-**On the same network.** If you SSH into a Mac at home or in the office, you can add `-L 6081:localhost:6081` to that command and open a browser tab. No client to install, no account to create, no relay. This is the only self-hosted option that works this way.
+**On the same network.** If you SSH into a Mac at home or in the office, you can add `-L 6081:localhost:6081` to that command and open a browser tab. No client to install, no account to create, no relay. It is the only self-hosted solution that combines ScreenCaptureKit capture, hardware H.264/H.265 encode, and WebCodecs browser decode without requiring relay infrastructure.
 
 **Compliance-conscious teams.** TeamViewer, AnyDesk, and Chrome Remote Desktop route through third-party servers. If that's off-limits — SOC2, ISO 27001, air-gapped environments, or just principle — this runs entirely inside your existing SSH infrastructure.
 
