@@ -74,32 +74,79 @@ sudo_s() { echo "$MACOS_PASS" | sudo -S "$@" 2>/dev/null; }
 # ── Step 1: Detect environment + conditional password prompt ──────────────────
 #
 # The macOS password serves two purposes:
-#   (a) sudo — to enable screensharingd via launchctl
+#   (a) sudo — to enable/restart screensharingd via launchctl
 #   (b) VNC input control — passed to the server as the VNC auth credential
 #
-# Both purposes only matter when screensharingd already has Screen Recording
-# TCC permission. On cloud Macs (Scaleway, AWS EC2 Mac, MacStadium) this is
-# pre-seeded in the base image so port 5900 is live from first boot. On a
-# fresh physical Mac, screensharingd has no TCC permission regardless of
-# whether the daemon is running — VNC cannot capture the display and the
-# password would be unused.
+# Both are only useful when screensharingd has Screen Recording TCC permission.
+# We detect this via two independent signals (either is sufficient):
 #
-# We probe port 5900 first:
-#   live → cloud Mac, VNC is usable → prompt for password
-#   dead → fresh Mac, VNC is not usable → skip password, print guidance instead
+#   Signal A — port 5900 open: screensharingd is running and has TCC permission
+#              (a daemon that lacks TCC starts but cannot bind for capture).
+#
+#   Signal B — TCC.db entry: screensharingd has permission but may not be
+#              running yet (e.g. daemon was disabled; we can launchctl-load it).
+#              Tries user DB first (no root needed), then system DB (no root on
+#              some cloud images; silent failure otherwise).
+#
+# If neither fires → fresh physical Mac, VNC unusable → skip password, explain.
 
 step "Detecting environment"
 
+_VNC_REASON=""
+
+# Signal A: daemon already listening
 if nc -z 127.0.0.1 5900 2>/dev/null; then
     VNC_PRESEEDED=1
-    green "  screensharingd detected on port 5900 (cloud Mac — VNC pre-permitted)"
+    _VNC_REASON="screensharingd running on port 5900"
+fi
+
+# Signal B: TCC.db has screensharingd approved (even if daemon is stopped)
+if [[ "$VNC_PRESEEDED" -eq 0 ]]; then
+    _TCC_SIGNAL="$(python3 - <<'PYEOF' 2>/dev/null
+import sqlite3, os, sys
+
+def _approved(db):
+    try:
+        c = sqlite3.connect('file:' + db + '?mode=ro', uri=True)
+        rows = c.execute(
+            "SELECT auth_value FROM access "
+            "WHERE service='kTCCServiceScreenCapture' "
+            "AND (client='com.apple.screensharing' "
+            "  OR client='com.apple.screensharing.agent' "
+            "  OR client LIKE '%screensharing%')"
+        ).fetchall()
+        c.close()
+        # auth_value 2 = allowed; 3 = limited (macOS 14+, also usable)
+        return any(r[0] in (2, 3) for r in rows)
+    except Exception:
+        return False
+
+# User-level TCC — always readable without root
+if _approved(os.path.expanduser(
+        '~/Library/Application Support/com.apple.TCC/TCC.db')):
+    print("user_tcc"); sys.exit(0)
+
+# System-level TCC — root-only on stock macOS; readable on some cloud images
+if _approved('/Library/Application Support/com.apple.TCC/TCC.db'):
+    print("system_tcc"); sys.exit(0)
+
+sys.exit(1)
+PYEOF
+)"
+    if [[ -n "$_TCC_SIGNAL" ]]; then
+        VNC_PRESEEDED=1
+        _VNC_REASON="screensharingd approved in TCC.db (${_TCC_SIGNAL}, daemon not yet running)"
+    fi
+fi
+
+if [[ "$VNC_PRESEEDED" -eq 1 ]]; then
+    green "  VNC usable — ${_VNC_REASON}"
 else
-    VNC_PRESEEDED=0
-    yellow "  screensharingd not detected on port 5900"
-    yellow "  This is normal on a fresh physical Mac. macOS requires Screen Recording"
-    yellow "  permission to be granted once via physical/KVM access before VNC works."
-    yellow "  → System Settings → Privacy & Security → Screen Recording → allow Python"
-    yellow "  After granting, re-run setup.sh and VNC bootstrap will be available."
+    yellow "  screensharingd not detected (port 5900 closed, no TCC.db entry found)"
+    yellow "  This is expected on a fresh physical Mac."
+    yellow "  One-time fix: grant Screen Recording to Python in"
+    yellow "  System Settings → Privacy & Security → Screen Recording"
+    yellow "  then re-run setup.sh — VNC bootstrap will be available."
 fi
 
 echo "  User: $MACOS_USER"
