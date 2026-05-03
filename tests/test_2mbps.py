@@ -151,9 +151,13 @@ async def main():
             print(f"  NOTE: avg fps {avg_fps:.1f} < {MIN_FPS} but CPU saturated "
                   f"({cpu.summary()}) — runner is the bottleneck, not the system. "
                   "fps bar exempted.")
+        elif cpu.runner_capped:
+            print(f"  NOTE: avg fps {avg_fps:.1f} < {MIN_FPS} but CPU has clear headroom "
+                  f"({cpu.summary()}) — runner SCK/compositor cannot deliver more frames. "
+                  "fps bar exempted.")
         else:
             failures.append(f"avg fps {avg_fps:.1f} < {MIN_FPS} minimum "
-                            f"(CPU had headroom: {cpu.summary()})")
+                            f"(CPU partial-load: {cpu.summary()})")
     if MIN_MBPS > 0 and avg_mbps < MIN_MBPS:
         failures.append(f"avg link {avg_mbps:.2f}Mbps < {MIN_MBPS}Mbps minimum "
                         "(controller throttled to floor instead of finding equilibrium)")

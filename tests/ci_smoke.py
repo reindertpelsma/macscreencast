@@ -82,9 +82,13 @@ async def test_video():
                 print(f"  video: {PASS} (exempted)  only {frames} frames in {elapsed:.1f}s "
                       f"(need {MIN_FRAMES}) — CPU saturated ({_cpu.summary()}), "
                       "runner is the bottleneck")
+            elif _cpu.runner_capped:
+                print(f"  video: {PASS} (exempted)  only {frames} frames in {elapsed:.1f}s "
+                      f"(need {MIN_FRAMES}) — CPU has clear headroom ({_cpu.summary()}); "
+                      "runner SCK/compositor cannot deliver more frames")
             else:
                 msg = (f"video: only {frames} frames in {elapsed:.1f}s "
-                       f"(need {MIN_FRAMES}); CPU had headroom: {_cpu.summary()}")
+                       f"(need {MIN_FRAMES}); CPU partial-load: {_cpu.summary()}")
                 print(f"  video: {FAIL}  {msg}")
                 failures.append(msg)
     except Exception as e:

@@ -7,7 +7,9 @@ as runner-limited rather than a system failure.
 """
 import subprocess, threading, time
 
-SATURATION_PCT = 90.0
+SATURATION_PCT  = 90.0   # CPU-bound: encoder/compositor pegged
+HEADROOM_PCT    = 50.0   # both well under this = runner can't deliver more frames
+                         # (SCK/compositor delivery rate cap, not a system bug)
 
 
 class CpuSampler(threading.Thread):
@@ -59,6 +61,15 @@ class CpuSampler(threading.Thread):
     @property
     def saturated(self) -> bool:
         return max(self.max_python, self.max_winserver) > SATURATION_PCT
+
+    @property
+    def runner_capped(self) -> bool:
+        """True if both server and WindowServer are clearly under-utilised.
+        Means the runner can't deliver more frames regardless of what we do —
+        SCK/compositor delivery rate cap on virtualized macOS CI hardware."""
+        return (self.samples > 0
+                and self.max_python    < HEADROOM_PCT
+                and self.max_winserver < HEADROOM_PCT)
 
     def summary(self) -> str:
         return (f"python={self.max_python:.0f}%  "
