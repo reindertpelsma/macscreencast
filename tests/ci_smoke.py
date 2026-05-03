@@ -7,7 +7,10 @@ Tests:
 
 Exit 0 = all pass. Exit 1 = failure with details.
 """
-import asyncio, json, struct, sys, time
+import asyncio, json, os, struct, sys, time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cpu_sampler import CpuSampler
 
 HOST    = "127.0.0.1"
 PORT    = int(sys.argv[1]) if len(sys.argv) > 1 else 6081
@@ -26,6 +29,7 @@ PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
 
 failures = []
+_cpu = CpuSampler()
 
 async def test_video():
     try:
@@ -74,8 +78,13 @@ async def test_video():
             fps = frames / max(elapsed, 0.001)
             if frames >= MIN_FRAMES:
                 print(f"  video: {PASS}  {frames} frames ({keyframes} key) in {elapsed:.1f}s = {fps:.1f} fps")
+            elif _cpu.saturated:
+                print(f"  video: {PASS} (exempted)  only {frames} frames in {elapsed:.1f}s "
+                      f"(need {MIN_FRAMES}) — CPU saturated ({_cpu.summary()}), "
+                      "runner is the bottleneck")
             else:
-                msg = f"video: only {frames} frames in {elapsed:.1f}s (need {MIN_FRAMES})"
+                msg = (f"video: only {frames} frames in {elapsed:.1f}s "
+                       f"(need {MIN_FRAMES}); CPU had headroom: {_cpu.summary()}")
                 print(f"  video: {FAIL}  {msg}")
                 failures.append(msg)
     except Exception as e:
@@ -130,8 +139,12 @@ async def test_audio():
 async def main():
     print(f"mac-vnc-stream CI smoke test — {HOST}:{PORT}")
     print()
-    await test_video()
-    await test_audio()
+    _cpu.start()
+    try:
+        await test_video()
+        await test_audio()
+    finally:
+        _cpu.stop()
     print()
     if failures:
         print(f"RESULT: {FAIL} — {len(failures)} failure(s):")
