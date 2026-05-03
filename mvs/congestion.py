@@ -44,25 +44,13 @@ class AdaptiveController:
         return time.monotonic() < self._drain_until
 
     def end_drain_if_clear(self, write_buf):
-        """Allow the sender to short-circuit the drain pause once the
-        downstream queue has actually cleared.
-
-        Two signals are required, because they capture different buffers:
-          * write_buf low — server-side TCP send buffer is empty (catches
-            real TCP backpressure scenarios like the tcp_throttle.py harness)
-          * recent low-age client report — browser is decoding fresh frames
-            (catches application-layer throttles like Chrome DevTools where
-            the server's wb stays at 0 even when the client-side queue is
-            deep — only the browser's own age_ms reports can confirm depth)
-        """
+        """Allow the sender to short-circuit the drain pause once the local
+        write buffer has actually cleared. The drain pause was sized for the
+        worst-case queue; if the link drained faster than estimated we don't
+        need to wait the full window."""
         if write_buf < self.lag_wb_budget() // 2:
             with self._lock:
-                # Wait for client confirmation of clear delivery; otherwise
-                # the queue may be sitting in the browser's read-throttle
-                # buffer where wb can't see it.
-                if (self._last_clear_t > 0
-                        and (time.monotonic() - self._last_clear_t) < 1.0
-                        and self._drain_until > time.monotonic()):
+                if self._drain_until > time.monotonic():
                     self._drain_until = 0.0
 
     @property
