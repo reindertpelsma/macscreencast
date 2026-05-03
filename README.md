@@ -1,8 +1,8 @@
 # mac-vnc-stream
 
-**60fps macOS remote desktop in your browser, over SSH.**
+**Browser-based macOS remote desktop at up to 60fps, over SSH.**
 
-No third-party accounts. No cloud relay. No dummy HDMI plug. Just a Python script and a browser.
+No third-party accounts. No cloud relay. Just a Python script and a browser.
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/mac-vnc-stream/main/install.sh)
@@ -143,13 +143,13 @@ All flags can be set via CLI or environment variable:
 
 Measured on a Mac mini M1/M2 over localhost SSH tunnel:
 
-| Mode | Frame rate | Encode time | Bandwidth |
-|------|-----------|-------------|-----------|
-| VNC + JPEG | ~20fps | ~17ms/frame | ~55 Mbps |
-| VNC + H.264 | ~20fps | ~5ms/frame | ~5 Mbps |
-| SCK + H.264 | **60fps** | ~5ms/frame | ~5 Mbps |
+| Capture | Codec | Frame rate | Encode time | Bandwidth |
+|---------|-------|-----------|-------------|-----------|
+| VNC (screensharingd) | JPEG | ~20fps | ~17ms/frame | ~55 Mbps |
+| VNC (screensharingd) | H.264 | ~20fps | ~5ms/frame | ~5 Mbps |
+| SCK (GPU compositor) | H.264 | **~60fps** | ~5ms/frame | ~5 Mbps |
 
-H.264/H.265 encoding uses Apple VideoToolbox (hardware media engine) — near-zero CPU. JPEG bandwidth is high because each frame is encoded independently with no temporal compression; H.264/H.265 only encode the pixels that changed.
+The frame rate jump comes from switching capture backends (screensharingd is capped by its own polling rate; SCK delivers directly from the GPU compositor). The codec switch from JPEG to H.264 mainly affects bandwidth — H.264 only encodes changed pixels, JPEG re-encodes the entire frame every time. H.264/H.265 encoding uses Apple VideoToolbox (hardware media engine) — near-zero CPU.
 
 ### Browser compatibility
 
@@ -158,10 +158,10 @@ H.264/H.265 encoding uses Apple VideoToolbox (hardware media engine) — near-ze
 | Chrome 110+ | H.264, H.265, AV1 | ✅ | Full (live sync) | AV1 hardware requires M3+/A17 Pro |
 | Firefox 130+ | H.264 | ✅ | Read-only (Ctrl+V) | No H.265 WebCodecs |
 | Safari 26+ | H.265, H.264 | ✅ | Read-only (Ctrl+V) | H.265 selected automatically |
-| Mobile Chrome | H.264 | ✅ | Partial | Touch events supported |
-| Mobile Safari | H.264, H.265 | ✅ | Read-only | Touch events supported |
+| Mobile Chrome | H.264 | ⚠️ | Partial | Touch events supported; audio suspends when tab is backgrounded |
+| Mobile Safari | H.264, H.265 | ⚠️ | Read-only | Touch events supported; audio suspends when tab is backgrounded |
 
-The server negotiates the best codec the browser reports it supports. JPEG fallback is used only when WebCodecs is unavailable (rare).
+The server negotiates the best codec the browser reports it supports. JPEG fallback is used only when WebCodecs is unavailable (rare). Mobile browsers aggressively suspend audio playback when the tab loses focus — audio is unreliable for background use on mobile.
 
 ### Tip: keep the screen non-static for best responsiveness
 
@@ -181,6 +181,7 @@ The server is designed to run unattended without manual restarts:
 - PID watcher checks every 5s — if the process dies, restarts it immediately via `sudo launchctl kickstart -k`
 - FBU stall detector — if screensharingd is alive but frozen (no frame updates for 30s), restarts it
 - Both use the macOS password already stored in the LaunchAgent environment
+- Note: screensharingd can still stall intermittently between watchdog cycles. The SCK capture path (`--api-only`) avoids this entirely and is preferred when both permissions are granted.
 
 **TCC permission watcher:**
 - Monitors `TCC.db` mtime every 5s
