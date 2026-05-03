@@ -13,7 +13,7 @@ class AdaptiveController:
     def __init__(self, cfg):
         self.fps = float(cfg.max_fps)
         self.max_fps = float(cfg.max_fps)
-        self.bitrate = 4_000_000     # start conservative — 1Mbps users reach stable in 2 halvings
+        self.bitrate = 1_000_000     # start at 1Mbps — ramps up via feedback gating, no initial burst
         self.jpeg_quality = 85
         self.client_w = 1920
         self.client_h = 1080
@@ -226,11 +226,15 @@ class AdaptiveController:
             # every 100ms (limited by the 0.1s tick above). Each +20% step is validated by the
             # client before the next — application-layer ACK-clocking.
             # Without metric_rtt or with stale clear signal: 2s fallback (original heuristic).
+            # clear_window = max(500ms, 2×RTT).  When metric_rtt is not yet measured (first
+            # ping hasn't completed) use the 500ms floor so lag reports from the initial
+            # connect can still gate the ramp — otherwise the first 2s would use the 2s
+            # fallback regardless of what the browser is reporting.
             if self._metric_rtt > 0:
                 clear_window = max(0.5, 2.0 * self._metric_rtt / 1000.0)
-                have_clear = (now - self._last_clear_t) < clear_window
             else:
-                have_clear = False
+                clear_window = 0.5
+            have_clear = (now - self._last_clear_t) < clear_window
             if not have_clear and now - self._last_fast < 2.0:
                 return
             self._last_fast = now

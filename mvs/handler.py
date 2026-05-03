@@ -106,6 +106,10 @@ async def client_session(ws, cfg, bridge):
 
     seq_num = 0
     last_send_time = time.monotonic()
+    # Shared between frame_sender (read/write) and input_reader (write).
+    # Must be in outer scope so both closures reference the same variable.
+    _need_keyframe = False
+    _last_lag_received = time.monotonic()  # proactive backoff when this goes stale
 
     def _upgrade_encoder(tw: int = 0, th: int = 0, explicit: bool = False):
         nonlocal encoder, has_webcodecs, _enc_target_w, _enc_target_h, _codec_error_msg
@@ -165,7 +169,7 @@ async def client_session(ws, cfg, bridge):
     loop = asyncio.get_event_loop()
 
     async def input_reader():
-        nonlocal has_webcodecs, target_codec, _reinit_deadline, _codec_error_msg
+        nonlocal has_webcodecs, target_codec, _reinit_deadline, _codec_error_msg, _need_keyframe, _last_lag_received
         cur_buttons = 0
         try:
             async for raw in ws:
@@ -216,6 +220,7 @@ async def client_session(ws, cfg, bridge):
                         age = float(ev.get("age_ms", 0))
                         wb = _get_wbuf(ws)
                         ctrl.on_lag(age, wb)
+                        _last_lag_received = time.monotonic()
                         # Positive path: low-lag report = client confirming path is clear.
                         # Unlocks next ramp step in on_fresh without waiting the full 2s heuristic.
                         if age > 0 and age < ctrl.lag_budget_ms() and wb < ctrl.lag_wb_budget():
@@ -366,10 +371,9 @@ async def client_session(ws, cfg, bridge):
                                           "seq": bridge.server_clipboard_seq}))
             except Exception:
                 pass
-        nonlocal _enc_target_w, _enc_target_h, _reinit_deadline
+        nonlocal _enc_target_w, _enc_target_h, _reinit_deadline, _need_keyframe, _last_lag_received
         last_encoder_codec = encoder.actual_codec
         _bw_sent = []       # list of (monotonic_time, bytes) for rolling 1s bandwidth measurement
-        _need_keyframe = False  # force I-frame after encoder rebuild to unblock fresh decoder
         _t_diag = time.monotonic(); _n_diag = 0; _n_drop = 0; _n_nosend = 0
         _last_vnc_fbu = bridge._fbu_count
         # Pipelined encode: start encoding during the rate-limit sleep so that
@@ -396,6 +400,17 @@ async def client_session(ws, cfg, bridge):
                     _n_diag = _n_drop = _n_nosend = 0
                 fps, bitrate, jq = ctrl.snapshot()
                 interval = 1.0 / max(1.0, fps)
+
+                # Proactive backoff: lag reports travel browser→server (upload direction) and
+                # usually arrive within RTT (~20ms). If they go silent for >500ms while we're
+                # actively sending, the download buffer is backed up to the point where the
+                # browser can't decode frames fast enough to produce lag reports. Treat this
+                # as a 500ms lag signal so the server backs off before the queue grows further.
+                # Triggers only when we're actually sending (n_diag > 3 = at least 3 frames
+                # sent this DIAG cycle) and not already in a drain pause.
+                if not ctrl.draining and _n_diag > 3 and now - _last_lag_received > 0.5:
+                    ctrl.on_lag(500.0, 0)
+                    _last_lag_received = now  # reset so backoff debounce has time to fire
 
                 # Detect encoder codec switch — drain in-flight encode and force I-frame.
                 # After encoder rebuild the warmup consumed the I-frame; without an explicit
