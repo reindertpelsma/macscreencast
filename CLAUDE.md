@@ -169,6 +169,32 @@ encoder ramps up to high bitrate naturally because lag stays low (link
 RTT only — buffer absorbs everything else). On a fast link the buffer
 fills with high-quality frames, which is exactly what cinema mode wants.
 
+## Validated under (real-world cross-continent test, 2026-05-04)
+
+The responsive/buffer split + the fps hard-cap + the wb-aware drain were
+all stress-tested end-to-end through the worst geometry we could build
+with what's lying around: Safari on a Scaleway mac mini M2 (Paris) →
+SSH-tunnelled to a relay VPS → SSH-tunnelled to a `macos-latest` GH
+Actions runner running mac-vnc-stream. Three TCP hops, WebSocket on top.
+
+Numbers observed (responsive mode, fps cap = 20, max BW = 2 Mbps):
+
+- **161 ms RTT** browser ↔ server.
+- **~200 ms input-to-glass latency** end-to-end (RTT + one frame interval).
+- **20 fps steady, no overshoot** (the fps hard-cap holds).
+- **~2 Mbps wire bandwidth** (the 0.65× soft-cap absorbed VBR overshoot).
+- **No client-side queue accumulation, no buffer growth, no stalls.**
+- YouTube playback inside the runner rendered cleanly through the chain.
+
+Why this matters: this is approximately a "hotel wifi" scenario — modest
+bandwidth, real intercontinental RTT, real TCP backpressure across three
+hops. At 161 ms RTT the BDP for a 2 Mbps stream is ~40 KB; the wb-aware
+drain budget and the gradient-detector OFF-in-buffer-mode design are what
+prevent that BDP being misread as congestion. This is the smoke that
+`tests/tcp_throttle.py` and the virtual-clock test cannot reproduce, so
+keep this configuration in mind as the de-facto "bad link, must still
+work" benchmark when changing rate-control or pacing logic.
+
 ## Things that probably WILL work, not yet attempted
 
 - **Token-bucket BW enforcer** for "Max BW" being a *hard* cap rather
