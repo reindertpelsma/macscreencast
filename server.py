@@ -157,6 +157,13 @@ def main():
     log.info("Mode: capture=%s  input=%s  manage_screensharingd=%s",
              cfg.capture, cfg.input, cfg.manage_screensharingd)
 
+    if cfg.password:
+        log.info("─" * 60)
+        log.info("Token:  %s", cfg.password)
+        log.info("URL:    http://localhost:%d/?token=%s", cfg.port, cfg.password)
+        log.info("SSH:    ssh -L %d:localhost:%d user@<host>", cfg.port, cfg.port)
+        log.info("─" * 60)
+
     _request_screen_capture_access()
     _request_accessibility()
     _start_compositor_keepalive()

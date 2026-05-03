@@ -23,6 +23,50 @@ _active_clients: int = 0
 # Read the frontend HTML at module load time (from the split-out file).
 _FRONTEND_HTML = (Path(__file__).parent.parent / "frontend" / "index.html").read_bytes()
 
+_LOGIN_HTML = b"""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mac-vnc-stream</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#111;color:#ddd;font-family:system-ui,sans-serif;
+     display:flex;align-items:center;justify-content:center;min-height:100vh}
+.card{background:#1e1e1e;border:1px solid #333;border-radius:10px;
+      padding:2rem 2.4rem;display:flex;flex-direction:column;gap:1rem;width:300px}
+h1{font-size:1rem;font-weight:600;color:#fff;letter-spacing:.01em}
+input{width:100%;padding:.55rem .75rem;background:#141414;border:1px solid #444;
+      border-radius:6px;color:#eee;font-size:.95rem;outline:none}
+input:focus{border-color:#4a9eff}
+button{width:100%;padding:.55rem;background:#4a9eff;border:none;border-radius:6px;
+       color:#fff;font-size:.95rem;cursor:pointer;font-weight:500}
+button:hover{background:#3b8fe0}
+.err{color:#f77;font-size:.85rem;display:none}
+.err.show{display:block}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>mac-vnc-stream</h1>
+  <form method="get" action="/">
+    <div style="display:flex;flex-direction:column;gap:.75rem">
+      <input type="password" name="token" placeholder="Access token"
+             autofocus autocomplete="current-password">
+      <p class="err" id="e">Invalid token — try again.</p>
+      <button type="submit">Connect</button>
+    </div>
+  </form>
+</div>
+<script>
+if(new URLSearchParams(location.search).has('token'))
+  document.getElementById('e').classList.add('show');
+</script>
+</body>
+</html>
+"""
+
 
 def _get_wbuf(ws):
     for attr in ("transport", ):
@@ -622,8 +666,16 @@ def make_http_handler(cfg, bridge):
             return Response(200, "OK", Headers([("Content-Type","text/plain")]), body)
 
         if not _check_token(path, cfg.password):
-            return Response(403, "Forbidden",
-                            Headers([("Content-Type","text/plain")]), b"Invalid token.\n")
+            # WebSocket upgrades: reject with 403 (no page)
+            if request.headers.get("Upgrade","").lower() == "websocket":
+                return Response(403, "Forbidden",
+                                Headers([("Content-Type","text/plain")]), b"Forbidden\n")
+            # HTTP GET: serve login page
+            return Response(200, "OK", Headers([
+                ("Content-Type", "text/html; charset=utf-8"),
+                ("Content-Length", str(len(_LOGIN_HTML))),
+                ("Cache-Control", "no-store"),
+            ]), _LOGIN_HTML)
         if request.headers.get("Upgrade","").lower() != "websocket":
             hdrs = Headers([
                 ("Content-Type","text/html; charset=utf-8"),
