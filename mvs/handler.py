@@ -214,7 +214,12 @@ async def client_session(ws, cfg, bridge):
                         _need_keyframe = True
                     elif t == "lag":
                         age = float(ev.get("age_ms", 0))
-                        ctrl.on_lag(age, _get_wbuf(ws))
+                        wb = _get_wbuf(ws)
+                        ctrl.on_lag(age, wb)
+                        # Positive path: low-lag report = client confirming path is clear.
+                        # Unlocks next ramp step in on_fresh without waiting the full 2s heuristic.
+                        if age > 0 and age < ctrl.lag_budget_ms() and wb < ctrl.lag_wb_budget():
+                            ctrl.on_client_clear()
                     elif t == "metric_rtt":
                         ctrl.on_metric_rtt(float(ev.get("rtt_ms", 0)))
                     elif t == "mm":
@@ -386,8 +391,8 @@ async def client_session(ws, cfg, bridge):
                     _vnc_fps = (_vnc_n - _last_vnc_fbu) / dt; _last_vnc_fbu = _vnc_n
                     _fb_age = int(time.time() * 1000) - bridge._fb_ms
                     await ws.send(json.dumps({"t": "stale", "ms": _fb_age}))
-                    log.info("DIAG: sent=%d/%.1fs=%.1ffps drop_wb=%d nosend=%d ctrl_fps=%.1f vnc=%.1ffps fb_age=%dms",
-                             _n_diag, dt, _n_diag/dt, _n_drop, _n_nosend, ctrl.fps, _vnc_fps, _fb_age)
+                    log.info("DIAG: sent=%d/%.1fs=%.1ffps drop_wb=%d nosend=%d ctrl_fps=%.1f ctrl_br=%dk vnc=%.1ffps fb_age=%dms drain=%s",
+                             _n_diag, dt, _n_diag/dt, _n_drop, _n_nosend, ctrl.fps, ctrl.bitrate // 1000, _vnc_fps, _fb_age, ctrl.draining)
                     _n_diag = _n_drop = _n_nosend = 0
                 fps, bitrate, jq = ctrl.snapshot()
                 interval = 1.0 / max(1.0, fps)
@@ -413,6 +418,22 @@ async def client_session(ws, cfg, bridge):
                     try: await ws.close()
                     except Exception: pass
                     break
+
+                # Drain pause: downstream buffer (SSH/sshd/bufferbloat path) is backed up.
+                # Stop sending entirely until ctrl clears the drain window so the queue
+                # can empty before we resume. Any in-flight encode is discarded safely
+                # (encode() was already called, so force a keyframe on resume to re-sync
+                # the decoder reference chain).
+                if ctrl.draining:
+                    if _pipe_task is not None:
+                        try: await _pipe_task
+                        except Exception: pass
+                        _pipe_task = None
+                        if has_webcodecs:
+                            _need_keyframe = True
+                    await asyncio.sleep(0.05)
+                    continue
+
                 if wb > ctrl.lag_wb_budget():
                     ctrl.on_lag(0, wb)
                     _n_drop += 1

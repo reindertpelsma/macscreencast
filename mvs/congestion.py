@@ -31,10 +31,17 @@ class AdaptiveController:
         self._ceil_bitrate = 0
         self._last_slow = 0.0
         self._last_fast = 0.0
+        self._drain_until = 0.0     # monotonic deadline: stop sending until this time
+        self._last_clear_t = 0.0   # monotonic time of last client "clear" (low-lag) confirmation
         self._lock = threading.Lock()
         self._ping_smooth = 0.0     # EWA-smoothed video ping RTT (jitter suppression)
         self._ping_history = []     # last 4 smoothed samples for gradient computation
         self._metric_rtt = 0.0      # EWA of unloaded metric-channel RTT; 0 = not measured yet
+
+    @property
+    def draining(self):
+        """True while a transmit pause is active (waiting for downstream buffers to drain)."""
+        return time.monotonic() < self._drain_until
 
     @property
     def frame_interval(self):
@@ -128,6 +135,17 @@ class AdaptiveController:
         severe = age_ms > budget * 3 or write_buf > self.lag_wb_budget() * 6
         with self._lock:
             self._backoff(severe)
+            # Transmit pause: when the browser reports severe lag, the buffer is sitting
+            # in Chrome's layer-7 network stack (SSH/sshd/hotel-WiFi bufferbloat path).
+            # Our write buffer reads zero because TCP backpressure hasn't reached us yet.
+            # Halving bitrate helps long-term but doesn't drain the existing queue fast.
+            # Pausing transmit for ~(age - budget) lets the downstream buffer clear before
+            # we resume — screen freezes briefly but recovers clean vs. 3+ seconds of lag.
+            if severe and age_ms > 300 and not self.draining:
+                pause_s = min(2.0, (age_ms - budget) / 1000.0)
+                self._drain_until = time.monotonic() + pause_s
+                log.debug("drain pause: %.0fms (age=%.0fms budget=%.0fms)",
+                          pause_s * 1000, age_ms, budget)
 
     def on_ping_rtt(self, rtt_ms):
         """Two-signal congestion detection via video-channel RTT.
@@ -170,6 +188,15 @@ class AdaptiveController:
                     log.debug("ping delta=%.1fms rtt=%.1fms metric=%.1fms budget=%.0fms",
                               delta, s, self._metric_rtt, budget)
 
+    def on_client_clear(self):
+        """Client lag report confirmed path is clear — allow next ramp step promptly.
+
+        Called when browser reports age_ms < budget: not a backoff signal but a positive
+        'path is clear' confirmation. Used to unlock early ramp steps instead of waiting
+        the full 2s heuristic interval."""
+        with self._lock:
+            self._last_clear_t = time.monotonic()
+
     def on_metric_rtt(self, rtt_ms):
         """RTT on the unloaded metric channel — pure link latency, no video queuing.
         Fast EWA (0.7/0.3) so link changes from WiFi↔5G roaming are reflected in ~4s."""
@@ -182,25 +209,46 @@ class AdaptiveController:
     def on_fresh(self):
         with self._lock:
             now = time.monotonic()
-            if now - self._last_fast < 2.0:
+            # Minimum tick: 100ms — lag reports are throttled to 10/s; no point checking faster.
+            if now - self._last_fast < 0.1:
                 return
-            if now - self._last_slow < 2.0:
-                return  # recent backoff — wait for stability before probing up
+            # Post-congestion settle: require 2s quiet after BOTH last backoff and drain end.
+            # _last_slow is set at backoff START, not drain end — without the drain_until term
+            # we'd ramp 0.65s after a 1.35s drain, immediately re-filling the cleared buffer.
+            settle_until = max(self._last_slow + 2.0, self._drain_until + 2.0)
+            if now < settle_until:
+                return
+            # Step interval: short when client actively confirms "clear" via lag reports,
+            # long when flying blind (no metric_rtt or no recent clear signal).
+            #
+            # clear_window = max(500ms, 2×RTT): how recently a clear report must have arrived.
+            # On a 20ms SSH tunnel, reports arrive every 100ms → clear_window=500ms → we step
+            # every 100ms (limited by the 0.1s tick above). Each +20% step is validated by the
+            # client before the next — application-layer ACK-clocking.
+            # Without metric_rtt or with stale clear signal: 2s fallback (original heuristic).
+            if self._metric_rtt > 0:
+                clear_window = max(0.5, 2.0 * self._metric_rtt / 1000.0)
+                have_clear = (now - self._last_clear_t) < clear_window
+            else:
+                have_clear = False
+            if not have_clear and now - self._last_fast < 2.0:
+                return
             self._last_fast = now
             fps_ceil = float(self.fps_cap) if self.fps_cap > 0 else self.max_fps
             if self.fps < fps_ceil:
                 self.fps = fps_ceil
             elif self.bitrate < self._max_br:
-                # Ramp bitrate up toward the ceiling one step at a time.
-                # Cap each step at 2× current to match TCP slow-start's doubling rate.
-                # Jumping straight to the ceiling (old behaviour) produces data faster
-                # than TCP's cwnd can drain after a backoff, fills the kernel send buffer,
-                # inflates RTT, and triggers a false-positive gradient backoff on clean links.
+                # Ramp bitrate in +20% steps per 2s tick rather than jumping to the ceiling
+                # in one hop. At 3Mbps after a 6Mbps congestion event this takes ~8 ticks
+                # (~16s) to reach 5.4Mbps, giving time for lag reports to fire if we overshoot
+                # before the queue builds to the drain-threshold again.
+                # Below the known ceiling (where we've congested before): +20%/tick.
+                # Above the ceiling (probing new territory): +10%/tick below 20Mbps, +5% above.
                 target = int(self._ceil_bitrate * 0.90) if self._ceil_bitrate > 0 else self._max_br
                 target = min(target, self._max_br)
-                step_ceil = max(self.bitrate * 2, self.bitrate + 500_000)
                 if self.bitrate < target:
-                    self.bitrate = min(target, step_ceil)
+                    step = max(int(self.bitrate * 1.20), self.bitrate + 200_000)
+                    self.bitrate = min(target, step)
                 elif self.bitrate < 20_000_000:
                     self.bitrate = min(self._max_br, int(self.bitrate * 1.10))
                 else:
