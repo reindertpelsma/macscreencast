@@ -3888,10 +3888,11 @@ async def _main(cfg, ds=None, vnc=None):
 
     cap_mode = "SCK" if (ds and ds.is_running()) else "VNC"
     handler = lambda ws: ws_handler(ws)
-    log.info("Listening %s:%d  codec=%s  max_fps=%d  capture=%s  input=%s  manage_ssd=%s",
+    log.info("Listening %s:%d  codec=%s  max_fps=%d  capture=%s  input=%s  manage_ssd=%s  token=%s",
              cfg.listen, cfg.port, cfg.codec, cfg.max_fps, cap_mode,
              "CGEvent" if _cg_kb_ok else "VNC",
-             cfg.manage_screensharingd)
+             cfg.manage_screensharingd,
+             repr(cfg.password) if cfg.password else "(none)")
 
     loop = asyncio.get_event_loop()
 
