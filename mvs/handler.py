@@ -446,8 +446,13 @@ async def client_session(ws, cfg, bridge):
                         _pipe_task = None
                         if has_webcodecs:
                             _need_keyframe = True
-                    await asyncio.sleep(0.05)
-                    continue
+                    # Short-circuit drain once the queue has actually cleared
+                    # — the controller sized the pause for worst-case but the
+                    # link may have drained faster.
+                    ctrl.end_drain_if_clear(_get_wbuf(ws))
+                    if ctrl.draining:
+                        await asyncio.sleep(0.05)
+                        continue
 
                 if wb > ctrl.lag_wb_budget():
                     ctrl.on_lag(0, wb)

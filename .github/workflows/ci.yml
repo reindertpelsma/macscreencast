@@ -95,6 +95,30 @@ jobs:
           #                        leaves 0.5Mbps margin for runner variance)
           python3 tests/test_2mbps.py 6081 citest 20 1.5
 
+      - name: Run real-TCP 2Mbps throttle test (Chrome DevTools-equivalent)
+        run: |
+          # Regression test for the disconnect bug: Chrome DevTools' 2Mbps
+          # throttle injects real TCP backpressure (unlike our virtual-clock
+          # test which only models the throttle client-side). The proxy below
+          # replicates that — server→proxy is localhost (no backpressure),
+          # proxy drains to client at 2Mbps with realistic latency/jitter,
+          # so the server's TCP send buffer fills naturally and exposes any
+          # VBR-overshoot or write-buffer-blowup bugs.
+          #
+          # 40ms latency + 30ms jitter approximates a hotel WiFi link.
+          nohup python3 tests/tcp_throttle.py 6082 6081 2000 \
+            --latency 40 --jitter 30 \
+            > /tmp/throttle.log 2>&1 &
+          echo $! > /tmp/throttle_pid
+          sleep 2
+          # Pass criteria: NO disconnect over the 70s test, lag stays bounded,
+          # tail link does NOT need to hit 1.5Mbps here (the throttle adds
+          # real-network jitter so the controller's equilibrium is lower).
+          # 0.6Mbps minimum is "controller didn't collapse to floor under
+          # real backpressure" — the bar this test exists to defend.
+          python3 tests/test_2mbps.py 6082 citest 20 0.6
+          kill "$(cat /tmp/throttle_pid)" 2>/dev/null || true
+
       - name: Stop screen activity
         if: always()
         run: |

@@ -43,6 +43,16 @@ class AdaptiveController:
         """True while a transmit pause is active (waiting for downstream buffers to drain)."""
         return time.monotonic() < self._drain_until
 
+    def end_drain_if_clear(self, write_buf):
+        """Allow the sender to short-circuit the drain pause once the local
+        write buffer has actually cleared. The drain pause was sized for the
+        worst-case queue; if the link drained faster than estimated we don't
+        need to wait the full window."""
+        if write_buf < self.lag_wb_budget() // 2:
+            with self._lock:
+                if self._drain_until > time.monotonic():
+                    self._drain_until = 0.0
+
     @property
     def frame_interval(self):
         return 1.0 / max(1.0, self.fps)
@@ -135,17 +145,29 @@ class AdaptiveController:
         severe = age_ms > budget * 3 or write_buf > self.lag_wb_budget() * 6
         with self._lock:
             self._backoff(severe)
-            # Transmit pause: when the browser reports severe lag, the buffer is sitting
-            # in Chrome's layer-7 network stack (SSH/sshd/hotel-WiFi bufferbloat path).
-            # Our write buffer reads zero because TCP backpressure hasn't reached us yet.
-            # Halving bitrate helps long-term but doesn't drain the existing queue fast.
-            # Pausing transmit for ~(age - budget) lets the downstream buffer clear before
-            # we resume — screen freezes briefly but recovers clean vs. 3+ seconds of lag.
-            if severe and age_ms > 300 and not self.draining:
-                pause_s = min(2.0, (age_ms - budget) / 1000.0)
+            # Transmit pause: when severe lag is reported (either via browser
+            # age_ms or via local wb), the queue is sitting in some downstream
+            # buffer. Halving bitrate helps long-term but doesn't drain the
+            # existing queue fast. Pause sending so it can drain before we
+            # resume — screen freezes briefly but recovers clean.
+            #
+            # Trigger on EITHER age (browser-side queue) OR wb (server-side
+            # TCP backpressure). The wb-only path was previously gated by
+            # age_ms > 300, which never fires when the lag signal is wb=0
+            # because TCP backpressure reached us before the lag report did.
+            wb_severe = write_buf > self.lag_wb_budget() * 12
+            if (age_ms > 300 or wb_severe) and severe and not self.draining:
+                # Pause length: take the LARGER of age-based and wb-based
+                # drain estimates. wb at 2Mbps with 4MB queued = 16s of
+                # buffered video — old 2s cap couldn't clear deep queues
+                # and drains chained. 5s cap with realistic estimate per
+                # signal closes the loop.
+                age_pause = (age_ms - budget) / 1000.0
+                wb_pause  = (write_buf * 8) / max(self.bitrate, 1)
+                pause_s = min(5.0, max(age_pause, wb_pause))
                 self._drain_until = time.monotonic() + pause_s
-                log.debug("drain pause: %.0fms (age=%.0fms budget=%.0fms)",
-                          pause_s * 1000, age_ms, budget)
+                log.debug("drain pause: %.0fms (age=%.0fms wb=%dKB budget=%.0fms)",
+                          pause_s * 1000, age_ms, write_buf // 1024, budget)
 
     def on_ping_rtt(self, rtt_ms):
         """Two-signal congestion detection via video-channel RTT.
