@@ -399,6 +399,12 @@ async def client_session(ws, cfg, bridge):
                              _n_diag, dt, _n_diag/dt, _n_drop, _n_nosend, ctrl.fps, ctrl.bitrate // 1000, _vnc_fps, _fb_age, ctrl.draining)
                     _n_diag = _n_drop = _n_nosend = 0
                 fps, bitrate, jq = ctrl.snapshot()
+                # Defensive: hard-cap fps at user's fps_cap regardless of how
+                # ctrl.fps was computed. If the user set "20 fps" the actual
+                # send rate must be ≤ 20, even if some controller path
+                # transiently raised self.fps above the cap.
+                if ctrl.fps_cap > 0:
+                    fps = min(fps, float(ctrl.fps_cap))
                 interval = 1.0 / max(1.0, fps)
 
                 # Proactive backoff: lag reports travel browser→server (upload direction) and

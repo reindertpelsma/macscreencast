@@ -122,10 +122,11 @@ canvas{display:block;position:absolute}
       <div style="color:#666;font:10px monospace;margin-bottom:3px">Stream quality (maximums)</div>
       <div class="q-row"><label>Res</label><select class="q-sel" id="q-res"><option value="0">Auto</option></select></div>
       <div class="q-row"><label>FPS</label><select class="q-sel" id="q-fps">
-        <option value="0">Auto</option>
+        <option value="0">Max (60 fps)</option>
         <option value="60">60 fps</option>
         <option value="30">30 fps</option>
         <option value="20">20 fps</option>
+        <option value="10">10 fps</option>
       </select></div>
       <div class="q-row"><label>Max BW</label><select class="q-sel" id="q-bw">
         <option value="0">Unlimited</option>
@@ -148,6 +149,10 @@ canvas{display:block;position:absolute}
         <option value="500">500ms (smooth video)</option>
         <option value="1000">1s</option>
         <option value="3000">3s (cinema)</option>
+      </select></div>
+      <div class="q-row"><label>Status overlay</label><select class="q-sel" id="q-hud">
+        <option value="0" selected>Off</option>
+        <option value="1">On (top-right)</option>
       </select></div>
       <div class="q-row"><label>Scroll</label><select class="q-sel" id="q-scroll">
         <option value="0.25">0.25×</option>
@@ -194,11 +199,16 @@ let codecName='';               // current codec name
 let ageWindow=[];               // rolling 5s frame-age samples [{ts,age}]
 let worstAge5s=0;               // worst-case frame age in last 5s
 let staleMs=0;                  // server-reported screen content age (ms)
-let hudMode=0;                  // 0=full 1=dim 2=hidden (cycles on click)
+let hudMode=0;                  // 0=full 1=dim (cycles on click when shown)
+let _hudShown=false;            // master visibility (menu toggle); default off
 
+function _applyHudVisibility(){
+  hud.className = !_hudShown ? 'hide' : (hudMode===1 ? 'dim' : '');
+}
 hud.addEventListener('click',()=>{
-  hudMode=(hudMode+1)%3;
-  hud.className=hudMode===1?'dim':hudMode===2?'hide':'';
+  if(!_hudShown) return;            // hidden → menu toggle is the only way back
+  hudMode = (hudMode + 1) % 2;      // toggle dim/full
+  _applyHudVisibility();
 });
 
 // ---------------------------------------------------------------------------
@@ -430,23 +440,26 @@ let _qCapH=0,_qFps=0,_qBwKbps=25000,_qCodec='auto',_qLagMs=0,_scrollMul=1.0,_qMe
 let _probedCodecs=[]; // filled after WebCodecs probe; used to populate codec select
 
 function _qCookie(){
+  // v7 format: cap_h,fps,bw,codec,lag,scroll,hud
+  const m7=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+),([^,;]+),(\d+),([\d.]+),(\d+)/);
+  if(m7)return{cap_h:parseInt(m7[1]),fps:parseInt(m7[2]),bw:parseInt(m7[3]),codec:m7[4]||'auto',lag:parseInt(m7[5]),scroll:parseFloat(m7[6])||1,hud:parseInt(m7[7])||0};
   // v6 format: cap_h,fps,bw,codec,lag,scroll
   const m6=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+),([^,;]+),(\d+),([\d.]+)/);
-  if(m6)return{cap_h:parseInt(m6[1]),fps:parseInt(m6[2]),bw:parseInt(m6[3]),codec:m6[4]||'auto',lag:parseInt(m6[5]),scroll:parseFloat(m6[6])||1};
+  if(m6)return{cap_h:parseInt(m6[1]),fps:parseInt(m6[2]),bw:parseInt(m6[3]),codec:m6[4]||'auto',lag:parseInt(m6[5]),scroll:parseFloat(m6[6])||1,hud:0};
   // v5: cap_h,fps,bw,codec,lag
   const m=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+),([^,;]+),(\d+)/);
-  if(m)return{cap_h:parseInt(m[1]),fps:parseInt(m[2]),bw:parseInt(m[3]),codec:m[4]||'auto',lag:parseInt(m[5]),scroll:1};
+  if(m)return{cap_h:parseInt(m[1]),fps:parseInt(m[2]),bw:parseInt(m[3]),codec:m[4]||'auto',lag:parseInt(m[5]),scroll:1,hud:0};
   // v4: cap_h,fps,bw,codec
   const m4=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+),([^;]*)/);
-  if(m4)return{cap_h:parseInt(m4[1]),fps:parseInt(m4[2]),bw:parseInt(m4[3]),codec:m4[4]||'auto',lag:0,scroll:1};
+  if(m4)return{cap_h:parseInt(m4[1]),fps:parseInt(m4[2]),bw:parseInt(m4[3]),codec:m4[4]||'auto',lag:0,scroll:1,hud:0};
   // legacy
   const m2=document.cookie.match(/mvs_q=(\d+),(\d+),(\d+)/);
-  if(m2)return{cap_h:parseInt(m2[1]),fps:parseInt(m2[2]),bw:parseInt(m2[3]),codec:'auto',lag:0,scroll:1};
+  if(m2)return{cap_h:parseInt(m2[1]),fps:parseInt(m2[2]),bw:parseInt(m2[3]),codec:'auto',lag:0,scroll:1,hud:0};
   const m3=document.cookie.match(/mvs_q=(\d+),(\d+)/);
-  return m3?{cap_h:parseInt(m3[1]),fps:parseInt(m3[2]),bw:25000,codec:'auto',lag:0,scroll:1}:{cap_h:0,fps:0,bw:25000,codec:'auto',lag:0,scroll:1};
+  return m3?{cap_h:parseInt(m3[1]),fps:parseInt(m3[2]),bw:25000,codec:'auto',lag:0,scroll:1}:{cap_h:0,fps:0,bw:25000,codec:'auto',lag:0,scroll:1,hud:0};
 }
 function _qSaveCookie(){
-  document.cookie='mvs_q='+_qCapH+','+_qFps+','+_qBwKbps+','+_qCodec+','+_qLagMs+','+_scrollMul+';max-age='+(365*86400)+';SameSite=Strict';
+  document.cookie='mvs_q='+_qCapH+','+_qFps+','+_qBwKbps+','+_qCodec+','+_qLagMs+','+_scrollMul+','+(_hudShown?1:0)+';max-age='+(365*86400)+';SameSite=Strict';
 }
 function sendQuality(){
   send({t:'quality',cap_h:_qCapH,fps:_qFps,maxkbps:_qBwKbps,lag_ms:_qLagMs});
@@ -528,6 +541,7 @@ function _populateCodecSelect(probed){
   const cSel=document.getElementById('q-codec');
   const lSel=document.getElementById('q-lag');
   const sSel=document.getElementById('q-scroll');
+  const hSel=document.getElementById('q-hud');
   // Restore settings from cookie immediately (codec select populated after probe).
   const saved=_qCookie();
   _qFps=saved.fps;fSel.value=String(_qFps);
@@ -538,6 +552,8 @@ function _populateCodecSelect(probed){
   if(lSel.value!==String(_qLagMs)){lSel.value='0';_qLagMs=0;}
   _scrollMul=saved.scroll||1;sSel.value=String(_scrollMul);
   if(sSel.value!==String(_scrollMul)){sSel.value='1';_scrollMul=1;}
+  _hudShown=(saved.hud|0)===1;hSel.value=_hudShown?'1':'0';
+  _applyHudVisibility();
   rSel.addEventListener('change',()=>{
     _qCapH=parseInt(rSel.value)||0;_qSaveCookie();sendQuality();
   });
@@ -567,11 +583,15 @@ function _populateCodecSelect(probed){
   sSel.addEventListener('change',()=>{
     _scrollMul=parseFloat(sSel.value)||1;_qSaveCookie();
   });
+  hSel.addEventListener('change',()=>{
+    _hudShown=hSel.value==='1';_qSaveCookie();_applyHudVisibility();
+  });
   document.getElementById('q-reset').addEventListener('click',()=>{
     const oldLag=_qLagMs;
-    _qCapH=0;_qFps=0;_qBwKbps=25000;_qCodec='auto';_qLagMs=0;_scrollMul=1;
+    _qCapH=0;_qFps=0;_qBwKbps=25000;_qCodec='auto';_qLagMs=0;_scrollMul=1;_hudShown=false;
     document.cookie='mvs_q=;max-age=0;SameSite=Strict';
-    rSel.value='0';fSel.value='0';bSel.value='25000';cSel.value='auto';lSel.value='0';sSel.value='1';
+    rSel.value='0';fSel.value='0';bSel.value='25000';cSel.value='auto';lSel.value='0';sSel.value='1';hSel.value='0';
+    _applyHudVisibility();
     sendQuality();
     sendCaps();
     if(oldLag>=100)_flushVideoBufferImmediately();

@@ -72,8 +72,16 @@ class AdaptiveController:
             ceil = float(self.fps_cap) if self.fps_cap > 0 else self.max_fps
             self.fps = min(self.fps, ceil)
             if max_kbps > 0:
-                self._max_br = max_kbps * 1000
-                self.user_bw_cap = self._max_br
+                # Apple VideoToolbox VBR overshoots the encoder's bit_rate
+                # target by ~50-150% on complex content (see encoder.py for
+                # full notes). To make "Max BW = 2 Mbps" match what the user
+                # actually sees on the wire, target the encoder at 0.65× the
+                # user value — VBR overshoot then lands near the user setting.
+                # This is a soft cap; for a strict cap we'd need a software
+                # encoder (libx264/libx265 with VBV).
+                _APPLE_VBR_FACTOR = 0.65
+                self.user_bw_cap = max_kbps * 1000   # for explicit-drop path (JPEG only)
+                self._max_br = int(max_kbps * 1000 * _APPLE_VBR_FACTOR)
                 self.bitrate = min(self.bitrate, self._max_br)
             else:
                 self._max_br = 50_000_000
