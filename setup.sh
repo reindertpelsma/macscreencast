@@ -151,6 +151,34 @@ if [[ "$_OS" != "Darwin" ]]; then
 fi
 unset _OS
 
+# ── Root user handling ───────────────────────────────────────────────────────
+# If invoked as root (uid=0), the rest of setup.sh would target gui/0 (which
+# doesn't exist on macOS — root has no Aqua session) and write the LaunchAgent
+# to /var/root/Library/LaunchAgents/, which is meaningless for desktop remote
+# access. Two cases:
+#   • sudo bash setup.sh as user X → $SUDO_USER is set to X. Re-derive the
+#     target user, MACOS_USER, HOME, and re-exec ourselves under that user
+#     via sudo -u (so all the remaining ~whoami/~id-based logic Just Works).
+#   • Direct root login (rare on macOS) → refuse with a clear message.
+# Done after OS guard but BEFORE arg parsing / Python detection so the entire
+# script body runs in the right identity from the start.
+if [[ "$(id -u)" -eq 0 ]]; then
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        # Re-exec under the real user. Preserve $@. Pass --macos-pass through
+        # if set (otherwise sudo -u would lose it). The user can then sudo
+        # internally for the few steps that need root (TCC reset, pf rule,
+        # /Applications install).
+        exec sudo -u "$SUDO_USER" -E -H bash "$0" "$@"
+    else
+        printf '\033[31mERROR: setup.sh should not be run as root directly.\033[0m\n' >&2
+        printf '\033[33mRun as your regular user account; sudo is invoked internally for the\n' >&2
+        printf 'few privileged steps (LaunchAgent install, TCC reset, pf rule).\033[0m\n' >&2
+        printf '\033[33mIf you need to run via sudo for some reason, do:\n' >&2
+        printf '  sudo -u <your-user> bash setup.sh\033[0m\n' >&2
+        exit 1
+    fi
+fi
+
 # Re-open /dev/tty so prompts work when piped via curl|bash.
 if [[ ! -t 0 ]] && [[ -e /dev/tty ]] && [[ "$HEADLESS" -eq 0 ]]; then
     exec </dev/tty
@@ -1173,56 +1201,108 @@ else
     sleep 2
 
     # Try the bootstrap. If it fails with "Domain does not support specified
-    # action" (rc=125), gui/$UID doesn't exist — this happens on cloud Macs
-    # where the user has only SSH access, no prior physical / VNC login,
-    # and no other LaunchAgent is keeping gui/$UID alive. Fix: do a brief
-    # VNC handshake against screensharingd ourselves; the auth-as-side-effect
-    # creates gui/$UID. Then retry.
+    # action" (rc=125), gui/$UID doesn't exist — happens on cloud Macs where
+    # the user has only SSH access, no prior physical / VNC login, no other
+    # LaunchAgent keeping gui/$UID alive.
+    #
+    # Recovery: spawn the bundle's --vnc-prime as a BACKGROUND DAEMON. It
+    # authenticates against screensharingd (RFB Apple-DH) and stays
+    # connected — the persistent connection is what makes screensharingd
+    # actually materialize gui/$UID (a connect-and-disconnect probe was
+    # observed insufficient on Scaleway: vnc_prime_ok printed but gui/$UID
+    # still missing 2s later). Setup.sh polls launchctl for gui/$UID for up
+    # to 20 seconds, retries bootstrap once it appears, then kills the
+    # daemon (the bundle's own --enable-vnc-fallback bridge takes over
+    # keeping the session warm).
     _bootstrap_out="$(launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1 || true)"
-    _bootstrap_rc=$?
     if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
         LOAD_DOMAIN="gui/$(id -u)"
         green "  Loaded into ${LOAD_DOMAIN}"
     elif echo "$_bootstrap_out" | grep -qiE "Domain does not support|125:"; then
-        # gui/$UID needs to be conjured. We have MACOS_USER + MACOS_PASS
-        # (verified earlier in the password-prompt block). Use the bundle
-        # binary's --vnc-prime mode to do RFB Apple-DH auth against
-        # screensharingd → screensharingd creates gui/$UID for our user.
         if [[ -n "$MACOS_PASS" ]] && [[ -x "$LAUNCHAGENT_BINARY" ]]; then
-            yellow "  gui/$(id -u) not present — priming via VNC handshake against"
-            yellow "  screensharingd to create the Aqua session..."
-            _prime_out="$( "$LAUNCHAGENT_BINARY" --vnc-prime \
-                --macos-user "$MACOS_USER" --macos-pass "$MACOS_PASS" 2>&1 || true)"
-            if echo "$_prime_out" | grep -q "vnc_prime_ok"; then
-                green "  $(echo "$_prime_out" | grep vnc_prime_ok)"
-                sleep 2  # let screensharingd finish spawning AppleVNCServer
-                if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1; then
-                    LOAD_DOMAIN="gui/$(id -u)"
-                    green "  Loaded into ${LOAD_DOMAIN} (after VNC-prime)"
-                else
-                    die "launchctl bootstrap retry failed even after VNC-prime —
-gui/$(id -u) may still be unavailable. Check screensharingd:
-  sudo launchctl print system/com.apple.screensharing | head"
+            yellow "  gui/$(id -u) not present — priming via persistent VNC connection"
+            yellow "  to screensharingd (Apple DH auth)..."
+            # Pipe vnc-prime stdout to a temp file so we can detect the
+            # "vnc_prime_ok=" line without blocking on the daemon process.
+            _prime_log="$(mktemp /tmp/mvs-prime.XXXXXX.log)"
+            "$LAUNCHAGENT_BINARY" --vnc-prime \
+                --macos-user "$MACOS_USER" --macos-pass "$MACOS_PASS" \
+                > "$_prime_log" 2>&1 &
+            _prime_pid=$!
+            # Wait up to 10s for vnc_prime_ok to appear in the log
+            _prime_ok=0
+            for _i in $(seq 1 100); do
+                if grep -q "vnc_prime_ok" "$_prime_log" 2>/dev/null; then
+                    _prime_ok=1; break
                 fi
-            else
-                die "VNC-prime failed: ${_prime_out}
+                if grep -q "vnc_prime_error" "$_prime_log" 2>/dev/null; then
+                    break
+                fi
+                kill -0 "$_prime_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+            if [[ "$_prime_ok" -ne 1 ]]; then
+                kill "$_prime_pid" 2>/dev/null || true
+                _prime_msg="$(cat "$_prime_log" 2>/dev/null | tail -3)"
+                rm -f "$_prime_log"
+                die "VNC-prime failed: ${_prime_msg}
 Cannot auto-create gui/$(id -u) without working VNC auth. Either:
-  • Log in via Apple Screen Sharing.app from another Mac to vnc://$(ipconfig getifaddr en0):5900
+  • Log in via Apple Screen Sharing.app from another Mac to vnc://$(ipconfig getifaddr en0 2>/dev/null || echo '<mac-ip>'):5900
   • Or attach a display + login locally
 Then re-run setup.sh."
             fi
-            unset _prime_out
+            green "  vnc_prime_ok — daemon holding session (pid $_prime_pid)"
+            # Poll for gui/$UID to materialize. screensharingd takes time to
+            # spawn AppleVNCServer + register the user session with launchd.
+            _gui_seen=0
+            for _i in $(seq 1 40); do  # 40 * 0.5s = 20s
+                if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+                    _gui_seen=1; break
+                fi
+                sleep 0.5
+            done
+            if [[ "$_gui_seen" -eq 1 ]]; then
+                green "  gui/$(id -u) detected — retrying bootstrap"
+                if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1; then
+                    LOAD_DOMAIN="gui/$(id -u)"
+                    green "  Loaded into ${LOAD_DOMAIN} (after VNC-prime)"
+                    # Bundle's own --enable-vnc-fallback bridge will keep the
+                    # session alive going forward; vnc-prime daemon is now
+                    # redundant. Kill it to free the connection slot.
+                    kill "$_prime_pid" 2>/dev/null || true
+                    rm -f "$_prime_log"
+                else
+                    kill "$_prime_pid" 2>/dev/null || true
+                    rm -f "$_prime_log"
+                    die "launchctl bootstrap retry failed even after gui/$(id -u) appeared.
+Inspect: launchctl print gui/$(id -u) | head"
+                fi
+            else
+                kill "$_prime_pid" 2>/dev/null || true
+                rm -f "$_prime_log"
+                die "gui/$(id -u) did not materialize within 20s despite VNC-prime auth.
+Possible causes:
+  • screensharingd's AppleVNCServer spawn was blocked
+    (check 'sudo launchctl print system/com.apple.screensharing | head')
+  • A loginwindow / SACL policy is blocking the session
+  • macOS version-specific behavior we haven't seen before
+
+Recover by logging in via Apple Screen Sharing.app from another Mac to
+  vnc://$(ipconfig getifaddr en0 2>/dev/null || echo '<mac-ip>'):5900
+then re-run setup.sh."
+            fi
+            unset _prime_log _prime_pid _prime_ok _gui_seen _i _prime_msg
         else
             die "launchctl bootstrap into gui/$(id -u) failed (no Aqua session).
 No --macos-pass available to auto-prime via VNC handshake. Either:
   • Re-run setup.sh with --macos-pass=<your-password> so we can prime VNC
-  • Or log in via Apple Screen Sharing once to vnc://$(ipconfig getifaddr en0):5900
+  • Or log in via Apple Screen Sharing once to vnc://$(ipconfig getifaddr en0 2>/dev/null || echo '<mac-ip>'):5900
     then re-run setup.sh"
         fi
     else
         die "launchctl bootstrap into gui/$(id -u) failed: $_bootstrap_out"
     fi
-    unset _bootstrap_out _bootstrap_rc
+    unset _bootstrap_out
 
     echo -n "  Waiting for server"
     WAITED=0

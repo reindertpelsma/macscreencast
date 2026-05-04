@@ -34,6 +34,20 @@ red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 step()   { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die()    { red "ERROR: $*"; exit 1; }
 
+# Root-user handling: same logic as setup.sh — if running under sudo,
+# re-exec as the real user. If direct root login, refuse.
+if [[ "$(id -u)" -eq 0 ]]; then
+    if [[ -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+        exec sudo -u "$SUDO_USER" -E -H bash "$0" "$@"
+    else
+        red "ERROR: install.sh should not be run as root directly."
+        yellow "Run as your regular user account; sudo is invoked internally."
+        yellow "If you need to run via sudo for some reason, do:"
+        yellow "  sudo -u <your-user> bash install.sh"
+        exit 1
+    fi
+fi
+
 # ── OS guard ─────────────────────────────────────────────────────────────────
 # This is the macOS-only repo. Linux/Windows users get a friendly
 # redirect to the (forthcoming) sibling repo instead of confusing

@@ -222,12 +222,68 @@ def parse_args():
             # to ensure screensharingd has fully spawned AppleVNCServer for
             # this user (the spawn is what creates gui/$UID).
             s.send(b"\x01")  # shared=1
+            # Receive ServerInit (24+ bytes: framebuffer dims, pixel format, name length + name).
             try:
-                _recv_all(s, 4)   # framebuffer width+height (just confirms server is alive)
+                fb_dims = _recv_all(s, 4)
+                _recv_all(s, 16)  # pixel format
+                name_len = _st.unpack("!I", _recv_all(s, 4))[0]
+                if 0 < name_len < 1024:
+                    _recv_all(s, name_len)
             except Exception:
                 pass
-            s.close()
+            # Send SetEncodings + FramebufferUpdateRequest so screensharingd
+            # treats us as a real client, not a connect-and-disconnect probe.
+            try:
+                # SetEncodings (msg=2): Raw (0), CopyRect (1) — minimal but valid
+                s.send(_st.pack("!BBHii", 2, 0, 2, 0, 1))
+                # FramebufferUpdateRequest (msg=3): incremental=0, x=0,y=0,w=64,h=64
+                s.send(_st.pack("!BBHHHH", 3, 0, 0, 0, 64, 64))
+            except Exception:
+                pass
             print("vnc_prime_ok=apple_dh_auth")
+            _sys.stdout.flush()
+            # Stay connected so screensharingd has time to fully spawn
+            # AppleVNCServer + register gui/$UID with launchd. Disconnecting
+            # immediately after auth was insufficient — observed live on
+            # Scaleway, gui/$UID still wasn't available 2 seconds after
+            # vnc_prime_ok, causing the subsequent launchctl bootstrap retry
+            # to fail with the same rc=125 error.
+            #
+            # Daemon mode: setup.sh runs us in the background and reads
+            # vnc_prime_ok from our stdout, then proceeds with bootstrap
+            # while we keep the VNC session alive. Once the bundle's own
+            # LaunchAgent is up with --enable-vnc-fallback, ITS VNC bridge
+            # takes over and we can exit. Setup.sh kills us on success.
+            #
+            # SIGTERM handling: when setup.sh kills us, exit cleanly.
+            import signal as _sig
+            def _bye(*_):
+                try: s.close()
+                except Exception: pass
+                _sys.exit(0)
+            _sig.signal(_sig.SIGTERM, _bye)
+            _sig.signal(_sig.SIGINT, _bye)
+            # Keep draining incoming frames so screensharingd's send buffer
+            # doesn't fill up and stall. 5 minute hard cap as safety —
+            # setup.sh's bootstrap should finish in <30s on any sane Mac.
+            import time as _t
+            _deadline = _t.time() + 300
+            s.settimeout(2)
+            while _t.time() < _deadline:
+                try:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break  # server closed
+                except _sock.timeout:
+                    # Periodically poke screensharingd to keep the session alive
+                    try:
+                        s.send(_st.pack("!BBHHHH", 3, 1, 0, 0, 64, 64))
+                    except Exception:
+                        break
+                except Exception:
+                    break
+            try: s.close()
+            except Exception: pass
             _sys.exit(0)
         except Exception as e:
             print("vnc_prime_error=" + str(e).replace("\n", " "))
