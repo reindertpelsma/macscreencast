@@ -954,8 +954,8 @@ if [[ "$NEEDS_VNC_FOR_GRANT" -eq 1 || "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 ]]; t
         #     is asking them to re-grant).
         if [[ "$TCC_GRANTED" -eq 0 ]]; then
             yellow "  Optional VNC bootstrap. Provides a live desktop view in your browser"
-            yellow "  while you grant TCC permissions. Skip with empty password if you'll"
-            yellow "  grant via another method (physical screen, Apple Screen Sharing.app)."
+            yellow "  while you grant TCC permissions. Skip with empty password if you can"
+            yellow "  grant locally at the Mac's keyboard (physical screen)."
         fi
         if [[ "$HEADLESS" -eq 1 ]]; then
             [[ -n "$MACOS_PASS" ]] && VNC_FALLBACK=1
@@ -1522,15 +1522,30 @@ fi
 step "Connection info"
 MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
 
-# Final-banner TCC state: trust TCC_GRANTED (set by either the keep-path
-# probe or the bootstrap-Enter loop). Re-running --tcc-check here would
-# double-jeopardise on hosts where the probe is unreliable (e.g. GH macos
-# runners pre-grant /bin/bash, parent-shell inheritance fools CG/SCSC
-# probes into reporting "granted" even when our bundle's TCC.db row is
-# auth_value=0 — the kernel SCStream call still fails -3801). After a
-# rebuild without bootstrap-Enter, TCC_GRANTED stays 0 and the banner
-# correctly steers the user to the manual-grant path.
-TCC_OK="$TCC_GRANTED"
+# Final-banner mode detection: read the LIVE log to see what mode the
+# server is actually running in. Previously this trusted TCC_GRANTED
+# which was optimistically set by the keep-path branch — leading to a
+# bug where the banner reported "Mode: SCK 60fps" while the bundle was
+# actually in --vnc-only fallback (verified live on Scaleway after fresh
+# install where the bundle was VNC-bridge-only but banner said SCK).
+#
+# Three states:
+#   ACTUAL_MODE = "sck"       — log shows "InProcessSCK: stream active"
+#                                or "capture=SCK" (post-Listening line)
+#   ACTUAL_MODE = "vnc"       — log shows "capture=VNC" but no SCK active
+#   ACTUAL_MODE = "unknown"   — log doesn't have a Listening line yet
+#                                (server slow to start, just-bootstrapped)
+#
+# We treat the most recent Listening line as authoritative — auto-upgrade
+# logs a new "Listening" with capture=SCK when it transitions VNC→SCK.
+ACTUAL_MODE="unknown"
+if grep -E "InProcessSCK: stream active|SCK capture activated" "$LOG_PATH" 2>/dev/null | tail -1 | grep -q "."; then
+    ACTUAL_MODE="sck"
+elif grep -E "capture=VNC" "$LOG_PATH" 2>/dev/null | tail -1 | grep -q "."; then
+    ACTUAL_MODE="vnc"
+fi
+TCC_OK=0
+[[ "$ACTUAL_MODE" == "sck" ]] && TCC_OK=1
 
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -1546,11 +1561,20 @@ else
 fi
 echo
 
-if [[ "$TCC_OK" -eq 1 ]]; then
+if [[ "$ACTUAL_MODE" == "sck" ]]; then
     green "  Mode: SCK 60fps + CGEvent input via signed bundle"
     green "  Bundle id: ${LABEL} — TCC has honored your grants. Production path."
+elif [[ "$ACTUAL_MODE" == "vnc" ]]; then
+    yellow "  Mode: VNC fallback — for granting permissions only."
+    yellow "  Once you grant Screen Recording + Accessibility (instructions"
+    yellow "  below), the bundle auto-upgrades to SCK 60fps within ~30s. The"
+    yellow "  current VNC bridge runs at ~15-21fps — fine for the grant"
+    yellow "  ceremony, not the daily-use experience this project ships."
 else
-    yellow "  Mode: signed bundle awaiting TCC grants"
+    yellow "  Mode: signed bundle starting up — log doesn't show a capture"
+    yellow "  mode yet. Run 'tail -f $LOG_PATH' to watch progress."
+fi
+if [[ "$ACTUAL_MODE" != "sck" ]]; then
     yellow "  ┌─ Grant permissions in System Settings ▸ Privacy & Security ──────┐"
     yellow "  │  • Screen Recording  → toggle ON for 'mac-vnc-stream'             │"
     yellow "  │  • Accessibility     → toggle ON for 'mac-vnc-stream'             │"

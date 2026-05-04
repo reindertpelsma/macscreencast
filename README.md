@@ -46,7 +46,7 @@ This tool solves all of it by going below screensharingd:
 | Problem | Solution |
 |---------|----------|
 | 2fps ZRLE (JS) | Server decodes ZRLE in Python, re-encodes as H.264/H.265, browser uses WebCodecs hardware decode; primary path uses SCK directly at 60fps |
-| screensharingd freezes | Watchdog auto-restarts it within 5s; CGEvent input doesn't need it at all |
+| screensharingd freezes | Watchdog auto-restarts it within ~30s; CGEvent input doesn't need it at all |
 | Broken clipboard | pbpaste polling + native browser paste event; no permission required |
 | Broken key mapping | CGEvent keyboard injection with Mac virtual key codes; bypasses VNC keysym translation entirely |
 | Inverted/stuck modifiers | CGEvent tracks modifier state explicitly; no screensharingd state involved |
@@ -108,7 +108,7 @@ open "http://localhost:6081/?token=YOUR_TOKEN"   # token shown at end of install
 When you open the web UI:
 1. Two macOS permission dialogs appear: **Screen Recording** and **Accessibility**
 2. Click **Allow** on both
-3. The server automatically upgrades to 60fps SCK capture and CGEvent input within 5 seconds
+3. The server automatically upgrades to 60fps SCK capture and CGEvent input within 30 seconds
 
 If you close the dialogs by accident, open **System Settings → Privacy & Security** and grant them manually. The server detects the change and upgrades without restart.
 
@@ -224,8 +224,8 @@ The server is designed to run unattended without manual restarts:
 
 **TCC permission watcher:**
 - Monitors `TCC.db` mtime every 5s
-- When Screen Recording is granted: upgrades from VNC capture to SCK within 5s, no restart
-- When Accessibility is granted: upgrades from VNC input to CGEvent within 5s, no restart
+- When Screen Recording is granted: upgrades from VNC capture to SCK within ~30s, no restart
+- When Accessibility is granted: upgrades from VNC input to CGEvent within ~30s, no restart
 - When either is revoked: logs a warning and falls back gracefully
 
 **VNC reconnection:**
