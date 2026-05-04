@@ -420,7 +420,16 @@ def main():
     # compositor refresh — the keepalive is unnecessary, AND it can't run at
     # all from inside a py2app bundle (the embedded python binary's
     # @executable_path-relative rpath breaks when subprocess.Popen'd).
-    if not cfg.api_only:
+    # The keepalive is for WindowServer compositor throttling — only relevant
+    # when SCK is actually doing the capture. In --vnc-only mode (cfg.capture
+    # == "vnc"), SCK is disabled, so the keepalive is unnecessary AND it
+    # actively harms: on a Mac without an Aqua session (gui/$UID missing —
+    # cloud Mac fresh-install pattern), Launch Services fails to spawn the
+    # keepalive subprocess and surfaces multiple "Launch failed" alert
+    # dialogs in the macOS GUI. User reported being spammed with "see the
+    # py2app website for debugging launch issues" popups in the VNC view.
+    # Skip the keepalive in vnc-only mode AND when --api-only is set.
+    if not cfg.api_only and cfg.capture != "vnc":
         _start_compositor_keepalive()
 
     # Resolve initial CGEvent availability

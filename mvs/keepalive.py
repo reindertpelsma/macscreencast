@@ -92,9 +92,37 @@ except Exception:
 
 def _start_compositor_keepalive():
     """Spawn a tiny subprocess that keeps macOS's display compositor warm at 30fps.
-    Falls back silently if the display or tkinter is unavailable (headless, SSH-only)."""
+    Falls back silently if the display or tkinter is unavailable (headless, SSH-only).
+
+    SKIPS spawn entirely if gui/$UID isn't available: on Macs without an
+    Aqua session (cloud-Mac fresh-install pattern), Launch Services fails
+    to spawn this subprocess and surfaces a "Launch failed — see the
+    py2app website for debugging launch issues" alert dialog in the
+    macOS GUI, which spams the user's VNC view. The keepalive is a
+    nice-to-have for SCK compositor throttling — when it can't run, just
+    silently skip it instead of producing user-visible alert noise.
+    """
     try:
         import subprocess, threading, time as _time
+        # gui/$UID precheck — skip if the domain doesn't exist. The
+        # subprocess we'd spawn needs Aqua services (NSWindow, CALayer);
+        # without gui/$UID, launchd refuses to launch it AND surfaces a
+        # user-visible alert in the GUI for each retry.
+        try:
+            uid = os.getuid()
+            r = subprocess.run(
+                ["launchctl", "print", f"gui/{uid}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+            if r.returncode != 0:
+                log.info("compositor keepalive: skipping (gui/%d not available — "
+                         "Aqua session not created yet)", uid)
+                return
+        except Exception:
+            # If the precheck itself fails (timeout, etc), proceed
+            # optimistically rather than blocking the bundle's startup.
+            pass
         # Inside a py2app .app bundle, sys.executable is .app/Contents/MacOS/python
         # whose dyld dependencies use @executable_path-relative references to
         # the embedded Python3.framework. When spawned with no cwd, dyld may

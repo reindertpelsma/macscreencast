@@ -1567,9 +1567,12 @@ if [[ "$ACTUAL_MODE" == "sck" ]]; then
 elif [[ "$ACTUAL_MODE" == "vnc" ]]; then
     yellow "  Mode: VNC fallback — for granting permissions only."
     yellow "  Once you grant Screen Recording + Accessibility (instructions"
-    yellow "  below), the bundle auto-upgrades to SCK 60fps within ~30s. The"
-    yellow "  current VNC bridge runs at ~15-21fps — fine for the grant"
-    yellow "  ceremony, not the daily-use experience this project ships."
+    yellow "  below), the bundle auto-upgrades to SCK 60fps within ~30s."
+    yellow "  The current VNC bridge runs slowly (often feels like ~5fps —"
+    yellow "  macOS's screensharingd is the bottleneck, not our code). It's"
+    yellow "  fine for the one-time grant ceremony, NOT the daily-use"
+    yellow "  experience this project ships. Grant the permissions and the"
+    yellow "  upgrade to 60fps SCK happens automatically."
 else
     yellow "  Mode: signed bundle starting up — log doesn't show a capture"
     yellow "  mode yet. Run 'tail -f $LOG_PATH' to watch progress."
