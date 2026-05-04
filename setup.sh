@@ -829,9 +829,38 @@ else
     echo "    then open: http://127.0.0.1:${PORT}/?token=${MVS_PASSWORD}"
 fi
 echo
-echo "  Capture: SCK 60fps (or VNC fallback until Screen Recording is allowed)"
-echo "  Input:   CGEvent native (or VNC fallback until Accessibility is allowed)"
-echo "  The server upgrades automatically within 5s after permissions are granted."
+if [[ "$TCC_BOTH_GRANTED" -eq 1 ]]; then
+    green "  Mode: SCK 60fps + CGEvent input (--api-only). Production path."
+else
+    echo "  Capture: SCK 60fps (or VNC fallback until Screen Recording is allowed)"
+    echo "  Input:   CGEvent native (or VNC fallback until Accessibility is allowed)"
+    echo
+    yellow "  ┌─ Granting permissions ────────────────────────────────────────────┐"
+    yellow "  │  The server may pick up your grants in-process within ~30 s, but  │"
+    yellow "  │  this is NOT guaranteed (TCC daemon caches denials, MDM can       │"
+    yellow "  │  block, etc.). The reliable path: grant the permissions, then     │"
+    yellow "  │  re-run setup.sh — the TCC pre-check skips the VNC bootstrap and  │"
+    yellow "  │  installs in --api-only mode for good.                            │"
+    yellow "  │                                                                   │"
+    yellow "  │  TWO panes to grant Python on (System Settings ▸ Privacy & Sec):  │"
+    yellow "  │    • Screen Recording  (for 60 fps SCK capture)                   │"
+    yellow "  │    • Accessibility     (for native CGEvent input)                 │"
+    yellow "  │                                                                   │"
+    yellow "  │  If 'Python' is already in the list — toggle it ON. Done.         │"
+    yellow "  │                                                                   │"
+    yellow "  │  If Python is NOT in the list (common on cloud Macs and Tahoe —   │"
+    yellow "  │  TCC won't auto-register an interpreter binary called from a      │"
+    yellow "  │  LaunchDaemon/system context):                                    │"
+    yellow "  │    1. Click '+' at the bottom-left of the pane.                   │"
+    yellow "  │    2. Press Cmd+Shift+G ('Go to Folder' — on a non-Mac keyboard   │"
+    yellow "  │       this is usually Ctrl+Shift+G in the file picker).           │"
+    yellow "  │    3. Paste the path:                                             │"
+    yellow "  │         $PYTHON_BINARY"
+    yellow "  │    4. Click Open, then toggle Python ON in the list.              │"
+    yellow "  │    5. Repeat for the other pane.                                  │"
+    yellow "  │    6. Re-run setup.sh.                                            │"
+    yellow "  └───────────────────────────────────────────────────────────────────┘"
+fi
 echo
 echo "  Python: $PYTHON_BINARY"
 echo "  Log:    tail -f $LOG_PATH"
