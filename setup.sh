@@ -51,7 +51,9 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NO_LAUNCHAGENT=0
 BUILD_FROM_SOURCE=0
-ASSUME_TCC=""    # "granted" | "denied" | "" (probe normally)
+ASSUME_TCC=""              # "granted" | "denied" | "" (probe normally)
+START_SSD_MODE=""          # "yes" | "lockdown" | "no" | "" (prompt)
+NO_BOOTSTRAP_WAIT=0        # 1 = transition to production immediately, no Enter wait
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)        PORT="$2"; shift 2 ;;
@@ -65,6 +67,13 @@ while [[ $# -gt 0 ]]; do
         --build-from-source) BUILD_FROM_SOURCE=1; shift ;;
         --assume-tcc-granted) ASSUME_TCC="granted"; shift ;;
         --no-tcc-probe|--assume-tcc-not-granted) ASSUME_TCC="denied"; shift ;;
+        --start-screensharingd)
+            START_SSD_MODE="$2"
+            case "$START_SSD_MODE" in
+                yes|lockdown|no) shift 2 ;;
+                *) die "--start-screensharingd needs yes|lockdown|no, got: $START_SSD_MODE" ;;
+            esac ;;
+        --no-bootstrap-wait) NO_BOOTSTRAP_WAIT=1; shift ;;
         -h|--help)
             cat <<HELP
 setup.sh — install mac-vnc-stream from this git checkout.
@@ -88,8 +97,26 @@ setup.sh — install mac-vnc-stream from this git checkout.
                           NOT have valid grants. Forces VNC bootstrap path.
                           Safe default for headless / scripted use.
                           (Alias: --assume-tcc-not-granted)
+  --start-screensharingd MODE   skip the screensharingd start prompt. MODE:
+                          • yes      — start it, don't install pf rule
+                          • lockdown — start it AND install pf rule blocking
+                                       external :5900 (loopback only)
+                          • no       — don't start it (skip VNC fallback)
+  --no-bootstrap-wait     don't pause for the user-grants-then-Enter step.
+                          After starting the bundle, transition to production
+                          immediately. The server's runtime auto-upgrade loop
+                          (server.py:170-194) detects late-arriving grants
+                          within ~30s. Useful for fully-unattended installs;
+                          loses the "probe confirms grants applied" feedback.
 
 Reads MVS_HEADLESS, MACOS_PASS, MVS_PASSWORD from env if unset.
+
+Headless defaults: --headless implies opinionated cloud-Mac defaults so
+unattended installs don't get stuck:
+  • --start-screensharingd=lockdown   (assume cloud Mac without security group)
+  • --no-tcc-probe                    (probe is unreliable in headless contexts)
+  • --no-bootstrap-wait               (no human to press Enter)
+Override individually by passing the explicit flags after --headless.
 
 TCC probe policy: --tcc-check is ONLY run on the keep path (existing
 bundle whose grants might still be valid). After a rebuild the CDHash is
@@ -113,6 +140,16 @@ done
 # Re-open /dev/tty so prompts work when piped via curl|bash.
 if [[ ! -t 0 ]] && [[ -e /dev/tty ]] && [[ "$HEADLESS" -eq 0 ]]; then
     exec </dev/tty
+fi
+
+# --headless implies opinionated cloud-Mac defaults — pick safe choices for
+# every prompt setup.sh would otherwise show. User can override individually
+# by passing the explicit flag after --headless. We only fill in defaults
+# that haven't been explicitly set, so user intent always wins.
+if [[ "$HEADLESS" -eq 1 ]]; then
+    [[ -z "$ASSUME_TCC" ]]      && ASSUME_TCC="denied"      # rebuild path always; keep path: assume not granted (safer)
+    [[ -z "$START_SSD_MODE" ]]  && START_SSD_MODE="lockdown" # cloud-Mac default
+    NO_BOOTSTRAP_WAIT=1                                      # no human to press Enter
 fi
 
 step "mac-vnc-stream installer"
@@ -470,46 +507,56 @@ ensure_screensharingd() {
         yellow "  Start manually: sudo launchctl kickstart -k system/com.apple.screensharing"
         return 1
     fi
-    echo
-    yellow "  screensharingd is configured but stopped (port 5900 closed)."
-    yellow "  Reason it's needed: $reason"
-    yellow "  Will run: sudo launchctl kickstart -k system/com.apple.screensharing"
-    yellow "  Note: screensharingd binds to 0.0.0.0:5900 (system default; macOS"
-    yellow "  doesn't expose a bind-addr knob). Our bundle only connects via"
-    yellow "  127.0.0.1, so external :5900 is just brute-force surface area."
-    yellow "    y  = start it (rely on cloud-provider firewall to block external)"
-    yellow "    l  = start AND lock down :5900 to localhost via pf (recommended"
-    yellow "         on cloud Macs without a security group)"
-    yellow "    N  = skip"
-    # Default-to-Y on hosts where VNC is essential (no display + SSH). On
-    # those hosts, pressing Enter to skip would trap the user in api-only
-    # mode with no way to grant TCC remotely. Default-to-N on other hosts
-    # (personal Mac with display) where the user has alternative paths.
-    local _vnc_essential=0
-    if [[ "$DISPLAY_ATTACHED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
-        _vnc_essential=1
-    fi
-    local _start_prompt
-    if [[ "$_vnc_essential" -eq 1 ]]; then
-        _start_prompt="[Y/n/l]   (default Y on this headless+SSH host)"
-    else
-        _start_prompt="[y/N/l]"
-    fi
-    read -rp "  Start screensharingd now? $_start_prompt " _ans
-    case "$_ans" in
-        [Ll]*) WANT_PF_LOCKDOWN=1 ;;
-        [Yy]*) WANT_PF_LOCKDOWN=0 ;;
-        [Nn]*) unset _ans _vnc_essential _start_prompt; return 1 ;;
+    # --start-screensharingd flag short-circuits the prompt for headless /
+    # scripted use. Three values: yes (start, no pf), lockdown (start + pf),
+    # no (don't start). Mirrors the [y/N/l] interactive choices.
+    case "$START_SSD_MODE" in
+        no)       yellow "  --start-screensharingd=no → skipping screensharingd start"; return 1 ;;
+        yes)      WANT_PF_LOCKDOWN=0; green "  --start-screensharingd=yes → starting (no pf rule)" ;;
+        lockdown) WANT_PF_LOCKDOWN=1; green "  --start-screensharingd=lockdown → starting + pf lockdown" ;;
         "")
-            if [[ "$_vnc_essential" -eq 1 ]]; then
-                WANT_PF_LOCKDOWN=0   # Enter = Y on essential-VNC hosts
-            else
-                unset _ans _vnc_essential _start_prompt; return 1
+            echo
+            yellow "  screensharingd is configured but stopped (port 5900 closed)."
+            yellow "  Reason it's needed: $reason"
+            yellow "  Will run: sudo launchctl kickstart -k system/com.apple.screensharing"
+            yellow "  Note: screensharingd binds to 0.0.0.0:5900 (system default; macOS"
+            yellow "  doesn't expose a bind-addr knob). Our bundle only connects via"
+            yellow "  127.0.0.1, so external :5900 is just brute-force surface area."
+            yellow "    y  = start it (rely on cloud-provider firewall to block external)"
+            yellow "    l  = start AND lock down :5900 to localhost via pf (recommended"
+            yellow "         on cloud Macs without a security group)"
+            yellow "    N  = skip"
+            # Default-to-Y on hosts where VNC is essential (no display + SSH). On
+            # those hosts, pressing Enter to skip would trap the user in api-only
+            # mode with no way to grant TCC remotely. Default-to-N on other hosts
+            # (personal Mac with display) where the user has alternative paths.
+            local _vnc_essential=0
+            if [[ "$DISPLAY_ATTACHED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
+                _vnc_essential=1
             fi
+            local _start_prompt
+            if [[ "$_vnc_essential" -eq 1 ]]; then
+                _start_prompt="[Y/n/l]   (default Y on this headless+SSH host)"
+            else
+                _start_prompt="[y/N/l]"
+            fi
+            read -rp "  Start screensharingd now? $_start_prompt " _ans
+            case "$_ans" in
+                [Ll]*) WANT_PF_LOCKDOWN=1 ;;
+                [Yy]*) WANT_PF_LOCKDOWN=0 ;;
+                [Nn]*) unset _ans _vnc_essential _start_prompt; return 1 ;;
+                "")
+                    if [[ "$_vnc_essential" -eq 1 ]]; then
+                        WANT_PF_LOCKDOWN=0   # Enter = Y on essential-VNC hosts
+                    else
+                        unset _ans _vnc_essential _start_prompt; return 1
+                    fi
+                    ;;
+                *) unset _ans _vnc_essential _start_prompt; return 1 ;;
+            esac
+            unset _vnc_essential _start_prompt
             ;;
-        *) unset _ans _vnc_essential _start_prompt; return 1 ;;
     esac
-    unset _vnc_essential _start_prompt
     unset _ans
     if [[ -n "$MACOS_PASS" ]]; then
         echo "$MACOS_PASS" | sudo -S launchctl kickstart -k system/com.apple.screensharing 2>&1 | head -2
@@ -854,7 +901,7 @@ fi
 # Headless mode: skip the interactive wait. The user re-runs setup.sh when
 # they're ready to transition (or the bootstrap state runs indefinitely
 # until they do — VNC stays available).
-if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 ]]; then
+if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0 ]]; then
     MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
     URL="http://localhost:${PORT}/?token=${MVS_PASSWORD}"
     if [[ "$LISTEN" == "127.0.0.1" ]]; then
