@@ -29,6 +29,93 @@ def _find_console_uid():
         pass
     return None
 
+
+# SCShareableContent probe script. Runs in user context via `launchctl asuser`
+# to make TCC register the calling Python binary in the Screen Recording list.
+# CGRequestScreenCaptureAccess does NOT trigger TCC registration on Tahoe;
+# only the actual SCK API does. The script blocks briefly so TCC has time to
+# write the entry, then exits.
+_SCK_TCC_REG_SCRIPT = r"""
+import sys, time, threading
+try:
+    import ScreenCaptureKit as SCK
+    from Foundation import NSRunLoop, NSDate, NSDefaultRunLoopMode
+    _done = threading.Event()
+    def _cb(content, error): _done.set()
+    try:
+        SCK.SCShareableContent.getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(False, True, _cb)
+    except AttributeError:
+        SCK.SCShareableContent.getExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(False, True, _cb)
+    t0 = time.time()
+    while not _done.is_set() and time.time() - t0 < 5:
+        NSRunLoop.mainRunLoop().runMode_beforeDate_(NSDefaultRunLoopMode,
+                                                   NSDate.dateWithTimeIntervalSinceNow_(0.1))
+except Exception as e:
+    sys.stderr.write(str(e) + chr(10))
+"""
+
+
+def _trigger_sck_tcc_registration():
+    """Force TCC to register the current Python binary in the Screen Recording
+    list by invoking SCShareableContent from the user's Aqua context.
+
+    From a LaunchDaemon (system context, root), neither
+    CGRequestScreenCaptureAccess() nor SCShareableContent registers the binary
+    — TCC treats system-context callers differently. Spawning the same call
+    via `launchctl asuser <uid>` routes it through the user's session domain,
+    where TCC does register the binary.
+
+    Result: Python appears in the Screen Recording toggle list, so the user
+    enables it with one click instead of having to '+' add it by path.
+
+    Quietly no-op when not running as root (LaunchAgent path already runs
+    in user context) or when no console user is logged in (TCC reg can't
+    land in that case anyway)."""
+    if not _os_geteuid_is_root():
+        return
+    uid = _find_console_uid()
+    if uid is None:
+        return
+    try:
+        import subprocess as _sp, sys as _sys
+        _sp.Popen(["launchctl", "asuser", str(uid),
+                   _sys.executable, "-c", _SCK_TCC_REG_SCRIPT])
+        log.info("TCC: triggered Screen Recording registration via launchctl asuser %d", uid)
+    except Exception as e:
+        log.debug("asuser SCK TCC reg: %s", e)
+
+
+def start_console_user_watcher(on_user_login):
+    """Watch for a console user becoming available (e.g. via VNC login on a
+    headless cloud Mac). Calls on_user_login(uid) once per detected login.
+
+    The daemon starts before any user is logged in. We need to detect the
+    moment a user logs in via VNC so we can fire the SCK TCC registration
+    via launchctl asuser — and later, the LaunchDaemon → LaunchAgent
+    self-promotion when both Screen Recording and Accessibility are granted.
+
+    Implementation: poll _find_console_uid() every 5s. On transition from
+    None → uid, fire the callback. Best-effort; runs as a daemon thread."""
+    def _loop():
+        import time as _t
+        last = None
+        while True:
+            try:
+                uid = _find_console_uid()
+                if uid is not None and uid != last:
+                    log.info("Console user detected: uid=%d", uid)
+                    try:
+                        on_user_login(uid)
+                    except Exception as e:
+                        log.debug("console-user callback: %s", e)
+                    last = uid
+                elif uid is None:
+                    last = None
+            except Exception:
+                pass
+            _t.sleep(5)
+    threading.Thread(target=_loop, daemon=True, name="console-user-watcher").start()
+
 _COMPOSITOR_KEEPALIVE_SCRIPT = """\
 # Keeps macOS's display compositor running at the display refresh rate.
 # Without this, WindowServer throttles to ~3Hz on idle screens, causing
@@ -172,26 +259,8 @@ def _request_screen_capture_access():
         except Exception:
             pass
         result = cg.CGRequestScreenCaptureAccess()
-        # When running in system context (LaunchDaemon), the call above won't
-        # register Python with TCC because the originating process isn't in a
-        # user/Aqua session. Result: the Screen Recording pane opens but Python
-        # isn't in the togglable list. Re-attempt the request via launchctl
-        # asuser, which routes the API call through the user's session — that
-        # registration *does* land. Best-effort; quietly skipped if not running
-        # as root (LaunchAgent path doesn't need this).
-        if not result and _os_geteuid_is_root():
-            try:
-                import subprocess as _sp, os as _os, sys as _sys
-                # Find a logged-in non-system uid to dispatch the API call into.
-                uid = _find_console_uid()
-                if uid is not None:
-                    _sp.Popen(["launchctl", "asuser", str(uid),
-                               _sys.executable, "-c",
-                               "import ctypes; cg=ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics');"
-                               "cg.CGRequestScreenCaptureAccess.restype=ctypes.c_bool;"
-                               "cg.CGRequestScreenCaptureAccess()"])
-            except Exception as _e:
-                log.debug("asuser SR registration: %s", _e)
+        if not result:
+            _trigger_sck_tcc_registration()
         if not result:
             import sys as _sys, os as _os
             py = _sys.executable
@@ -238,6 +307,147 @@ def _request_screen_capture_access():
     except Exception as e:
         log.debug("screen capture access request: %s", e)
         return False
+
+
+def _gui_domain_accepts_bootstrap(uid):
+    """Probe whether gui/<uid> accepts a no-op LaunchAgent bootstrap. Used to
+    decide if the daemon can self-promote into a user-context LaunchAgent."""
+    import subprocess, tempfile, os as _os
+    f = tempfile.NamedTemporaryFile(mode='w', suffix='.plist', delete=False)
+    try:
+        f.write(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0"><dict>\n'
+            '  <key>Label</key><string>com.macvncstream.probe</string>\n'
+            '  <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>\n'
+            '  <key>RunAtLoad</key><false/>\n'
+            '</dict></plist>\n')
+        f.close()
+        subprocess.run(["launchctl", "asuser", str(uid),
+                        "launchctl", "bootout", f"gui/{uid}/com.macvncstream.probe"],
+                       capture_output=True, timeout=3)
+        r = subprocess.run(["launchctl", "asuser", str(uid),
+                            "launchctl", "bootstrap", f"gui/{uid}", f.name],
+                           capture_output=True, timeout=5)
+        subprocess.run(["launchctl", "asuser", str(uid),
+                        "launchctl", "bootout", f"gui/{uid}/com.macvncstream.probe"],
+                       capture_output=True, timeout=3)
+        return r.returncode == 0
+    except Exception:
+        return False
+    finally:
+        try: _os.unlink(f.name)
+        except Exception: pass
+
+
+def maybe_promote_to_launchagent(uid, label="com.macvncstream.server"):
+    """If running as a LaunchDaemon (root), Screen Recording is granted, and
+    gui/<uid> accepts a bootstrap, write a clean LaunchAgent plist and spawn
+    a detached helper that boots the daemon out and the agent in.
+
+    Returns True if promotion was scheduled (current process should exit
+    shortly); False if any precondition isn't met."""
+    if not _os_geteuid_is_root():
+        return False
+    daemon_plist = f"/Library/LaunchDaemons/{label}.plist"
+    if not os.path.exists(daemon_plist):
+        return False  # not a LaunchDaemon install — already an Agent
+    try:
+        import ctypes
+        cg = ctypes.CDLL('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+        cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+        if not cg.CGPreflightScreenCaptureAccess():
+            return False
+    except Exception:
+        return False
+    if not _gui_domain_accepts_bootstrap(uid):
+        return False
+
+    log.info("Promotion: SCK granted + gui/%d ready — migrating LaunchDaemon → LaunchAgent", uid)
+
+    # Build the LaunchAgent plist from the daemon plist, stripping the
+    # daemon-only keys. Reading the live daemon plist preserves whatever
+    # custom args the user passed to setup.sh.
+    try:
+        import plistlib, getpass
+        with open(daemon_plist, 'rb') as f:
+            d = plistlib.load(f)
+        d.pop("UserName", None)
+        d.pop("GroupName", None)
+        d.pop("WorkingDirectory", None)
+        # Drop the VNC-only flags so the agent boots with auto-mode.
+        args = d.get("ProgramArguments", [])
+        cleaned = []
+        skip = False
+        for a in args:
+            if skip: skip = False; continue
+            if a in ("--capture", "--input"):
+                skip = True
+                continue
+            if a == "vnc":  # bare 'vnc' that escaped the --capture/--input pair
+                continue
+            cleaned.append(a)
+        d["ProgramArguments"] = cleaned
+        # Also drop MACOS_PASS — LaunchAgent doesn't need it (no VNC fallback
+        # post-promotion since SCK works). Keep MACOS_USER and MVS_PASSWORD.
+        env = d.get("EnvironmentVariables", {})
+        env.pop("MACOS_PASS", None)
+        env.pop("HOME", None)  # LaunchAgent inherits HOME from user session
+        env.pop("USER", None)
+        d["EnvironmentVariables"] = env
+
+        # Write to a per-user LaunchAgents dir.
+        import pwd
+        home = pwd.getpwuid(uid).pw_dir
+        agents_dir = os.path.join(home, "Library/LaunchAgents")
+        os.makedirs(agents_dir, exist_ok=True)
+        agent_plist = os.path.join(agents_dir, f"{label}.plist")
+        with open(agent_plist, 'wb') as f:
+            plistlib.dump(d, f)
+        os.chown(agent_plist, uid, _gid_for_uid(uid))
+        os.chmod(agent_plist, 0o600)
+    except Exception as e:
+        log.warning("Promotion: failed to build agent plist: %s", e)
+        return False
+
+    # Spawn the migration helper. It runs detached so the current daemon
+    # process can exit cleanly first (otherwise launchctl bootout deadlocks
+    # waiting for us). Helper has 30s to complete; if anything fails it
+    # leaves the daemon plist intact so KeepAlive restarts it.
+    helper = f"""\
+#!/bin/bash
+set -e
+sleep 2
+launchctl bootout system/{label} 2>&1 || true
+sleep 1
+rm -f {daemon_plist}
+launchctl asuser {uid} launchctl bootstrap gui/{uid} {agent_plist}
+"""
+    try:
+        import subprocess
+        helper_path = f"/tmp/{label}.promote.sh"
+        with open(helper_path, 'w') as f:
+            f.write(helper)
+        os.chmod(helper_path, 0o755)
+        # nohup + setsid so the helper survives our exit.
+        subprocess.Popen(["/usr/bin/nohup", "/bin/bash", helper_path],
+                         stdout=open("/tmp/macvncstream.promote.log", "a"),
+                         stderr=subprocess.STDOUT,
+                         start_new_session=True)
+        log.info("Promotion: helper scheduled, daemon exiting in 2s")
+        return True
+    except Exception as e:
+        log.warning("Promotion: helper spawn failed: %s", e)
+        return False
+
+
+def _gid_for_uid(uid):
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_gid
+    except Exception:
+        return 20  # 'staff' on macOS
 
 
 def _request_accessibility():

@@ -23,7 +23,9 @@ from mvs.handler import make_http_handler, make_ws_handler
 from mvs.cgevent import _check_cg_kb, _poll_cg_kb
 import mvs.cgevent as _cge
 from mvs.keepalive import (_start_compositor_keepalive, _request_screen_capture_access,
-                            _request_accessibility, _check_screen_capture)
+                            _request_accessibility, _check_screen_capture,
+                            start_console_user_watcher, _trigger_sck_tcc_registration,
+                            maybe_promote_to_launchagent)
 from mvs.codec import _AV_OK
 
 
@@ -141,8 +143,28 @@ async def _main(cfg, ds=None, vnc=None):
         # Screen Recording / SCK capture — only try upgrade if not already running
         if cfg.capture != "vnc" and (bridge._d is None or not bridge._d.is_running()):
             asyncio.run_coroutine_threadsafe(_sck_upgrade(), loop)
+        # LaunchDaemon → LaunchAgent self-promotion. When SCK is granted AND
+        # gui/$UID accepts a bootstrap (i.e. user has logged in via VNC), the
+        # daemon writes a LaunchAgent plist + spawns a detached helper to
+        # migrate, then exits. No-op when not running as a daemon (see
+        # maybe_promote_to_launchagent for preconditions).
+        from mvs.keepalive import _find_console_uid
+        uid = _find_console_uid()
+        if uid is not None and maybe_promote_to_launchagent(uid):
+            import sys as _sys
+            log.info("Promotion scheduled — daemon exiting in 2s for clean migration")
+            loop.call_later(1.5, lambda: _sys.exit(0))
 
     TCCWatcher(on_tcc_change=_on_tcc_change).start()
+
+    # Console-user watcher: fires when a user logs in (e.g. VNC login on a
+    # headless cloud Mac). On login, trigger an SCShareableContent probe via
+    # `launchctl asuser <uid>` so TCC registers the Python binary in the
+    # Screen Recording list — the user can then enable it with one click
+    # instead of having to '+ Add' it by path.
+    def _on_user_login(uid):
+        _trigger_sck_tcc_registration()
+    start_console_user_watcher(_on_user_login)
 
     async with serve(handler, cfg.listen, cfg.port,
                      process_request=http_handler,
