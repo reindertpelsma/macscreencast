@@ -508,26 +508,15 @@ if [[ "$SIP_DISABLED" -eq 0 ]]; then
         fi
         APP_BUILT="$APP_DEST"
         green "  Bundle installed at $APP_DEST (com.macvncstream.server, ad-hoc signed)"
-
-        # CDHash changed → any prior TCC grants are tied to the OLD CDHash and
-        # will be silently denied by tccd even though System Settings shows
-        # "Allowed". Resetting forces a fresh registration on the new bundle's
-        # next SCK / AX call, and the user's grant after that records the
-        # current CDHash. Without this, we end up in the loop the user just
-        # hit: Settings says granted, but every actual SCK call returns -3801.
-        echo
-        yellow "  About to reset stale TCC grants for com.macvncstream.server"
-        yellow "  (CDHash just changed — old grants don't apply to the new bundle):"
-        yellow "    sudo tccutil reset ScreenCapture com.macvncstream.server"
-        yellow "    sudo tccutil reset Accessibility com.macvncstream.server"
-        if [[ -n "$MACOS_PASS" ]]; then
-            echo "$MACOS_PASS" | sudo -S tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1
-            echo "$MACOS_PASS" | sudo -S tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1
-        else
-            sudo tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1
-            sudo tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1
-        fi
-        green "  TCC reset — your next toggle in Settings will record the new CDHash"
+        # tccutil reset is unconditional on rebuild (CDHash definitely
+        # changed → grants definitely stale). The keep-path equivalent
+        # is handled later, gated on the --tcc-check probe result.
+        NEEDS_TCC_RESET=1
+    else
+        # Keep path. Whether we need a TCC reset depends on whether the
+        # existing bundle's grants actually work — set later, after the
+        # --tcc-check probe.
+        NEEDS_TCC_RESET=0
     fi
 
     LAUNCHAGENT_BINARY="$APP_BUILT/Contents/MacOS/mac-vnc-stream"
@@ -558,16 +547,45 @@ if [[ "$SIP_DISABLED" -eq 1 ]]; then
     TCC_ALREADY_OK=1   # SIP off → TCC isn't enforcing → effectively granted
 elif [[ "$DID_REBUILD" -eq 0 && -n "$LAUNCHAGENT_BINARY" && -x "$LAUNCHAGENT_BINARY" ]]; then
     # Keep path: probe the existing bundle's TCC state by running it with
-    # --tcc-check. Exit 0 = both granted; non-zero = needs bootstrap.
+    # --tcc-check. Exit 0 = both granted with valid CDHash match;
+    # non-zero = needs bootstrap. CGPreflight returns False not just for
+    # "no TCC entry" but also for "TCC entry exists but its csreq CDHash
+    # list doesn't include the binary's current CDHash" — so this catches
+    # both fresh-install and stale-grant scenarios in one probe.
     if "$LAUNCHAGENT_BINARY" --tcc-check >/dev/null 2>&1; then
         TCC_ALREADY_OK=1
-        green "  Existing bundle has both TCC grants — production mode"
+        green "  Existing bundle has valid TCC grants — production mode"
     else
-        yellow "  Existing bundle is missing TCC grants — bootstrap mode"
+        yellow "  Existing bundle is missing or stale TCC grants — bootstrap mode"
+        # Stale grant detected → reset so the next user toggle records the
+        # CURRENT CDHash. Without this, the user re-toggles in Settings but
+        # tccd just rewrites the same CDHash-mismatched entry.
+        NEEDS_TCC_RESET=1
     fi
 fi
 if [[ "$TCC_ALREADY_OK" -eq 0 && "$WANTS_VNC" -eq 1 ]]; then
     BOOTSTRAP_MODE=1
+fi
+
+# Apply the TCC reset (fires on rebuild OR on stale-grant detection).
+# Doing it here, AFTER the keep/rebuild decision but BEFORE the plist
+# write + bootstrap, means the bundle's first launch in bootstrap mode
+# triggers fresh TCC registration against the current CDHash.
+if [[ "${NEEDS_TCC_RESET:-0}" -eq 1 && "$SIP_DISABLED" -eq 0 ]]; then
+    echo
+    yellow "  About to reset TCC grants for com.macvncstream.server"
+    yellow "  (CDHash mismatch — stale entries would be silently denied even"
+    yellow "  though System Settings shows them as granted):"
+    yellow "    sudo tccutil reset ScreenCapture com.macvncstream.server"
+    yellow "    sudo tccutil reset Accessibility com.macvncstream.server"
+    if [[ -n "$MACOS_PASS" ]]; then
+        echo "$MACOS_PASS" | sudo -S tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1
+        echo "$MACOS_PASS" | sudo -S tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1
+    else
+        sudo tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1
+        sudo tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1
+    fi
+    green "  TCC reset — next toggle in Settings will record the current CDHash"
 fi
 
 # ── Step 7: write_plist function (called once or twice depending on mode) ─────
