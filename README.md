@@ -286,7 +286,8 @@ The token travels in the URL query string (`?token=…`). This is safe when acce
 ### Uninstalling
 
 ```bash
-launchctl bootout "gui/$(id -u)/com.macvncstream.server"
+launchctl bootout "gui/$(id -u)/com.macvncstream.server" 2>/dev/null || \
+  launchctl bootout "user/$(id -u)/com.macvncstream.server"
 rm ~/Library/LaunchAgents/com.macvncstream.server.plist
 rm -rf ~/mac-vnc-stream
 ```

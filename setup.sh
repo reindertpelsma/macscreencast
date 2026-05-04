@@ -426,9 +426,29 @@ step "Starting mac-vnc-stream service"
 
 # bootout + bootstrap ensures the plist is fully re-read (kickstart reuses
 # the cached program path and ignores plist changes).
+#
+# Domain choice: gui/$UID requires an active Aqua console session. On a
+# fresh-install cloud Mac with no console login (only SSH), gui/$UID does
+# not exist and bootstrap fails with "125: Domain does not support specified
+# action". user/$UID exists for any login session including SSH, and is
+# enough for VNC capture/input — the cloud-Mac case. Try gui first (gives
+# SCK access when available), fall back to user.
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootout "user/$(id -u)/$LABEL" 2>/dev/null || true
 sleep 1
-launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+LOAD_DOMAIN=""
+if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>/dev/null; then
+    LOAD_DOMAIN="gui/$(id -u)"
+    green "  Loaded into $LOAD_DOMAIN (full GUI session — SCK/CGEvent available)"
+elif launchctl bootstrap "user/$(id -u)" "$PLIST_PATH" 2>/dev/null; then
+    LOAD_DOMAIN="user/$(id -u)"
+    yellow "  No Aqua session detected — loaded into $LOAD_DOMAIN (VNC capture only)"
+    yellow "  After you log in via VNC at least once, re-run setup.sh to switch to gui/\$UID"
+    yellow "  for SCK capture and CGEvent input."
+else
+    die "launchctl bootstrap failed in both gui/$(id -u) and user/$(id -u). Run with -d for details:
+  launchctl bootstrap user/$(id -u) $PLIST_PATH"
+fi
 
 echo -n "  Waiting for server"
 WAITED=0
@@ -542,5 +562,5 @@ echo "  The server upgrades automatically within 5s after permissions are grante
 echo
 echo "  Python: $PYTHON_BINARY"
 echo "  Log:    tail -f $LOG_PATH"
-echo "  Restart: launchctl kickstart -k gui/\$(id -u)/$LABEL"
+echo "  Restart: launchctl kickstart -k $LOAD_DOMAIN/$LABEL"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
