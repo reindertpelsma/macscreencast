@@ -209,11 +209,17 @@ fi
 # SIP-state branch.
 SCREENSHARINGD_PRESENT=0
 DID_WE_CHECKED_SCREENSHARINGD=0
-# Gate on DISPLAY_ATTACHED only — RUNNING_FROM_SSH is unreliable inside
-# tmate/tmux (env vars stripped) and DISPLAY_ATTACHED=0 is the meaningful
-# "is the user remote" signal regardless of transport.
-if [[ "$DISPLAY_ATTACHED" -eq 0 \
-        && -f /System/Library/LaunchDaemons/com.apple.screensharing.plist ]]; then
+# screensharingd is needed when the user can't see the desktop locally:
+#   • RUNNING_FROM_SSH=1 — user is remote even if a display is attached
+#     (Scaleway / cloud Macs with HDMI dongles register a "display" that
+#     shows up identically to a real monitor in system_profiler, but the
+#     remote user can't see it; they still need the bundle's VNC bridge
+#     as a browser viewer)
+#   • DISPLAY_ATTACHED=0 — no display at all (truly headless)
+# Either signal means VNC fallback path is the user's only route to
+# System Settings; we need screensharingd as the local source.
+if [[ -f /System/Library/LaunchDaemons/com.apple.screensharing.plist ]] \
+   && { [[ "$RUNNING_FROM_SSH" -eq 1 ]] || [[ "$DISPLAY_ATTACHED" -eq 0 ]]; }; then
     SCREENSHARINGD_PRESENT=1
 fi
 
@@ -1229,11 +1235,26 @@ else
     if [[ "$VNC_FALLBACK" -eq 1 ]]; then
         green "  VNC bootstrap is active — you can already see the desktop in your"
         green "  browser. Use it to grant the permissions above."
-    elif [[ "$DISPLAY_ATTACHED" -eq 1 ]]; then
-        # Personal Mac with physical screen — user grants at the keyboard.
+    elif [[ "$DISPLAY_ATTACHED" -eq 1 && "$RUNNING_FROM_SSH" -eq 0 ]]; then
+        # Personal Mac with physical screen, user is at the keyboard
+        # locally — grant directly via System Settings on the Mac.
         yellow "  Personal Mac path: grant the permissions on the Mac itself"
         yellow "  (we detected an attached display). The browser will be black"
         yellow "  until both grants are toggled on."
+    elif [[ "$DISPLAY_ATTACHED" -eq 1 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
+        # Mac with display dongle but user is remote — they CAN'T see the
+        # dongle's screen. They need VNC bridge (which wasn't enabled here)
+        # or another way to reach Settings. This is the Scaleway pattern.
+        red    "  ┌─ DISPLAY DETECTED BUT USER IS REMOTE — NO PATH TO SETTINGS ─────┐"
+        yellow "  │  We detected an attached display, but you're SSH'd in — you    │"
+        yellow "  │  can't see the desktop on that display. VNC bootstrap was       │"
+        yellow "  │  needed but didn't activate (likely no macOS password provided).│"
+        yellow "  │                                                                  │"
+        yellow "  │  Re-run setup.sh and pass your macOS password:                  │"
+        yellow "  │    bash setup.sh --macos-pass=<your-password>                   │"
+        yellow "  │                                                                  │"
+        yellow "  │  That enables the VNC bridge so you can grant TCC remotely.    │"
+        red    "  └──────────────────────────────────────────────────────────────────┘"
     else
         # Headless cloud Mac without VNC and without a display: the browser
         # WILL show a permissions-needed page (server.py serves that when
