@@ -92,11 +92,46 @@ def parse_args():
         import sys as _sys, ctypes as _ct
         try:
             cg = _ct.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
-            cg.CGPreflightScreenCaptureAccess.restype = _ct.c_bool
             ax = _ct.cdll.LoadLibrary(
                 "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
             ax.AXIsProcessTrusted.restype = _ct.c_bool
-            sr_ok = bool(cg.CGPreflightScreenCaptureAccess())
+
+            # Screen Recording: use CGWindowListCreateImage as a real probe
+            # rather than CGPreflightScreenCaptureAccess. CGPreflight is
+            # known to return True optimistically even when TCC actually
+            # denies — observed on GH macos-latest runners reporting
+            # screen_recording=1 with NO grants in TCC.db, leading
+            # setup.sh to skip VNC bootstrap and the server to immediately
+            # hit SCStreamErrorDomain -3801 ("user declined TCCs").
+            # CGWindowListCreateImage uses the same kernel ScreenRecording
+            # gate that SCK uses, so its result agrees with runtime SCK:
+            # non-NULL CGImageRef = TCC granted + capturable display
+            # available; NULL = either TCC denied OR no display backend.
+            # For our use case both failure modes are equivalent ("SCK
+            # won't work, fall back to VNC bootstrap"), so a single bool
+            # is the right signal.
+            class _CGPoint(_ct.Structure):
+                _fields_ = [("x", _ct.c_double), ("y", _ct.c_double)]
+            class _CGSize(_ct.Structure):
+                _fields_ = [("width", _ct.c_double), ("height", _ct.c_double)]
+            class _CGRect(_ct.Structure):
+                _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
+            cg.CGWindowListCreateImage.restype = _ct.c_void_p
+            cg.CGWindowListCreateImage.argtypes = [
+                _CGRect, _ct.c_uint32, _ct.c_uint32, _ct.c_uint32]
+            rect = _CGRect()
+            rect.origin.x = 0.0; rect.origin.y = 0.0
+            rect.size.width = 1.0; rect.size.height = 1.0
+            # kCGWindowListOptionOnScreenOnly=1, kCGNullWindowID=0,
+            # kCGWindowImageDefault=0
+            img = cg.CGWindowListCreateImage(rect, 1, 0, 0)
+            sr_ok = bool(img)
+            if sr_ok:
+                cf = _ct.CDLL(
+                    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+                cf.CFRelease.argtypes = [_ct.c_void_p]
+                cf.CFRelease(img)
+
             ax_ok = bool(ax.AXIsProcessTrusted())
             print("screen_recording=" + ("1" if sr_ok else "0"))
             print("accessibility=" + ("1" if ax_ok else "0"))
