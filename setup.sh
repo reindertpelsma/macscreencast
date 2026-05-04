@@ -273,15 +273,41 @@ if [[ -n "${MACOS_PASS:-}" ]]; then
     unset _mdm_dump
 fi
 if [[ -n "$MDM_TCC_PROFILE_ID" ]]; then
+    # Try to find the *enrollment* profile too — that's the one we can actually
+    # remove. The MDM-pushed Settings profile (which contains the TCC policy)
+    # has installedByMDM=TRUE and Tahoe refuses local removal even when its
+    # removalDisallowed flag is FALSE. But removing the parent enrollment
+    # profile cascade-removes everything the MDM pushed. Verified on Scaleway
+    # M2 Tahoe 2026-05-04: removing com.github.micromdm.micromdm.enroll
+    # zeroed both system profiles in one shot.
+    _enroll_id=$(echo "$MACOS_PASS" | sudo -S profiles show 2>/dev/null | \
+        awk '/profileIdentifier:/{id=$NF} /com.apple.mdm$/{print id; exit}')
     echo
-    yellow "  MDM TCC policy detected: $MDM_TCC_PROFILE_ID"
-    yellow "  This MDM may override your Privacy grants for non-whitelisted binaries"
-    yellow "  (Python interpreter is rarely whitelisted). If you grant Screen"
-    yellow "  Recording to Python and the upgrade still doesn't happen, the MDM is"
-    yellow "  the cause. Reversible escape hatch (re-installable by your provider):"
-    yellow "    sudo profiles remove -p $MDM_TCC_PROFILE_ID"
-    yellow "  Then re-run setup.sh. (The proper long-term fix is a signed .app"
-    yellow "  bundle with our own bundle identity — tracked separately.)"
+    yellow "  MDM TCC policy detected (profile: $MDM_TCC_PROFILE_ID)."
+    yellow "  This MDM overrides Privacy grants for non-whitelisted binaries."
+    yellow "  Python interpreter is rarely whitelisted, so 'Allow Python' in"
+    yellow "  System Settings ▸ Screen Recording will silently NOT take effect"
+    yellow "  — the actual SCK call returns -3801 (TCC declined) regardless."
+    echo
+    yellow "  Two-step escape hatch (reversible — provider re-enrolls on next"
+    yellow "  reinstall):"
+    if [[ -n "$_enroll_id" ]]; then
+        yellow "    1. sudo profiles -R -p $_enroll_id"
+        yellow "       (cascade-removes both the enrollment profile and the MDM"
+        yellow "        Settings/TCC profile; the latter alone refuses removal)"
+    else
+        yellow "    1. sudo profiles -R -p <enrollment-profile-id>"
+        yellow "       (find via 'sudo profiles show' — type=com.apple.mdm)"
+    fi
+    yellow "    2. Open System Settings ▸ Privacy & Security ▸ Screen Recording"
+    yellow "       and re-toggle Python (the previous grant is wiped with the MDM)."
+    yellow "    3. Re-run this setup.sh. The TCC pre-check should now skip the"
+    yellow "       VNC bootstrap and install the LaunchAgent in --api-only mode."
+    echo
+    yellow "  Long-term fix: a signed .app bundle with our own bundle identity"
+    yellow "  (com.macvncstream.server) — sysadmins can whitelist that, they"
+    yellow "  can't whitelist com.apple.python3. Tracked separately."
+    unset _enroll_id
 fi
 
 # ── Step 2: Find the best Python binary ───────────────────────────────────────
