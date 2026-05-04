@@ -98,44 +98,79 @@ if [[ "$FORCE_BUILD_FROM_SOURCE" -eq 0 ]]; then
 
     if [[ -n "$ASSET_URL" ]]; then
         green "  Found release ${RELEASE_TAG:-?} → ${ASSET_NAME}"
-        yellow "  Downloading..."
-        TMP_DIR="$(mktemp -d /tmp/mvs.XXXXXX)"
-        TMP_TAR="$TMP_DIR/$ASSET_NAME"
-        if curl -fsSL "$ASSET_URL" -o "$TMP_TAR"; then
-            green "  Downloaded $(du -sh "$TMP_TAR" | awk '{print $1}')"
 
-            step "Installing $APP_DEST"
-            sudo rm -rf "$APP_DEST"
-            sudo tar -xzf "$TMP_TAR" -C /Applications/ \
-                || die "tar extract failed"
-            rm -rf "$TMP_DIR"
-            # Strip Gatekeeper quarantine — we ad-hoc sign at build time
-            # rather than Apple-notarize. Without this, macOS would refuse
-            # to launch the bundle ("Apple cannot check it for malicious
-            # software"). Removing the quarantine attribute tells macOS
-            # this didn't come over the network for Gatekeeper purposes.
-            sudo xattr -dr com.apple.quarantine "$APP_DEST" 2>/dev/null || true
-            green "  $APP_DEST installed (ad-hoc signed, quarantine cleared)"
+        # Existing-bundle detection — never auto-overwrite. A user running
+        # install.sh without knowing the install state of the Mac (e.g.
+        # they're not sure if they ran it before, or this is shared host)
+        # should NOT have their working bundle destroyed silently. Default
+        # to keep; explicit opt-in for reinstall.
+        DO_REINSTALL=1
+        if [[ -d "$APP_DEST" ]]; then
+            echo
+            yellow "  Existing bundle at $APP_DEST"
+            yellow "  Latest release: $RELEASE_TAG"
+            if [[ "$HEADLESS" -eq 1 ]]; then
+                green "  Headless mode — keeping existing bundle (default)"
+                DO_REINSTALL=0
+            else
+                read -rp "  [k]eep existing or [r]einstall from release? [K/r] " _ans
+                if [[ "$_ans" =~ ^[Rr]$ ]]; then
+                    DO_REINSTALL=1
+                else
+                    DO_REINSTALL=0
+                fi
+                unset _ans
+            fi
+        fi
 
-            # Hand off to setup.sh in install-only mode (it'll detect the
-            # existing $APP_DEST and just write+load the LaunchAgent without
-            # rebuilding). Fetch setup.sh at the SAME tag as the bundle
-            # artifact rather than `main`, for two reasons:
-            #   • tag content is immutable, so CDN caching is fine and
-            #     guaranteed-correct (vs `main` where raw.githubusercontent
-            #     serves a 5-min-stale cache and users hit "I just pushed
-            #     a fix but install.sh got the old setup.sh")
-            #   • setup.sh from the same tag is guaranteed in-sync with the
-            #     bundle artifact's expectations — no mismatch between
-            #     v0.1.0 bundle behaviors and v0.2.0 main setup.sh
+        if [[ "$DO_REINSTALL" -eq 0 ]]; then
+            green "  Keeping existing bundle — skipping download (~53 MB saved)"
+        else
+            yellow "  Downloading..."
+            TMP_DIR="$(mktemp -d /tmp/mvs.XXXXXX)"
+            TMP_TAR="$TMP_DIR/$ASSET_NAME"
+            if ! curl -fsSL "$ASSET_URL" -o "$TMP_TAR"; then
+                yellow "  Download failed — falling through to from-source install"
+                rm -rf "$TMP_DIR"
+                # Drop out of the fast-path block; the from-source path
+                # below handles git clone + build.
+                ASSET_URL=""
+            else
+                green "  Downloaded $(du -sh "$TMP_TAR" | awk '{print $1}')"
+
+                step "Installing $APP_DEST"
+                sudo rm -rf "$APP_DEST"
+                sudo tar -xzf "$TMP_TAR" -C /Applications/ \
+                    || die "tar extract failed"
+                rm -rf "$TMP_DIR"
+                # Strip Gatekeeper quarantine — we ad-hoc sign at build time
+                # rather than Apple-notarize. Without this, macOS would refuse
+                # to launch the bundle ("Apple cannot check it for malicious
+                # software"). Removing the quarantine attribute tells macOS
+                # this didn't come over the network for Gatekeeper purposes.
+                sudo xattr -dr com.apple.quarantine "$APP_DEST" 2>/dev/null || true
+                green "  $APP_DEST installed (ad-hoc signed, quarantine cleared)"
+            fi
+        fi
+
+        # Hand off to setup.sh — same code path for keep + reinstall.
+        # The bundle in $APP_DEST is now either:
+        #   • the freshly-downloaded latest release (DO_REINSTALL=1), OR
+        #   • the previously-installed bundle (DO_REINSTALL=0; user kept it)
+        # Setup.sh's job is identical in both cases: write+load the
+        # LaunchAgent. ASSET_URL gets blanked on download failure (above)
+        # so we drop out to from-source path in that case.
+        if [[ -n "$ASSET_URL" ]]; then
+            # Fetch setup.sh at the SAME tag as the bundle artifact rather
+            # than `main`. Tag content is immutable so CDN caching is
+            # guaranteed-correct, and setup.sh is in-sync with the bundle
+            # artifact's expectations.
             SETUP_TMP="$(mktemp -d /tmp/mvs-setup.XXXXXX)"
             curl -fsSL "$REPO_URL/raw/${RELEASE_TAG}/setup.sh" -o "$SETUP_TMP/setup.sh" \
                 || die "failed to fetch setup.sh from ${RELEASE_TAG}"
             chmod +x "$SETUP_TMP/setup.sh"
             export MVS_PREBUILT_APP="$APP_DEST"
             exec bash "$SETUP_TMP/setup.sh" "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
-        else
-            yellow "  Download failed — falling through to from-source install"
         fi
     else
         yellow "  No matching release asset (${ASSET_NAME}) — using from-source install"
