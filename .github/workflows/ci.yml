@@ -38,6 +38,31 @@ jobs:
             sleep 1; echo -n "."
           done
 
+      - name: Confirm SCK is the active capture path (not VNC fallback)
+        run: |
+          # Sanity check: the GitHub macos-latest runner image pre-grants
+          # /bin/bash Screen Recording in TCC.db. A python3 child of bash
+          # inherits the grant via the responsible-app chain, so SCK works
+          # end-to-end on the runner without any TCC interaction. The smoke
+          # tests below assert >= 20fps which only SCK can deliver here, but
+          # if Apple ever changes inheritance behavior we want this to fail
+          # loudly with a clear error rather than silently switching to VNC
+          # fallback (which on the runner doesn't even have a working VNC
+          # server unless explicitly started).
+          sleep 3
+          if grep -qE "InProcessSCK: stream active|capture=SCK|SCK capture activated" /tmp/macvncstream.log; then
+            echo "✓ SCK capture is active — runner bash-grant inheritance still works"
+          elif grep -qE "SCStreamErrorDomain|user declined TCCs" /tmp/macvncstream.log; then
+            echo "✗ SCK denied (-3801) on the runner. The macos-latest image's"
+            echo "  /bin/bash pre-grant of Screen Recording was the assumption — if"
+            echo "  Apple has changed responsible-app inheritance behaviour, the"
+            echo "  CI smoke needs an explicit grant injection step."
+            cat /tmp/macvncstream.log
+            exit 1
+          else
+            echo "? SCK status unclear in log; proceeding (smoke tests will catch a true regression)"
+          fi
+
       - name: Drive screen activity
         run: |
           # Bouncing-shape NSWindow at 60fps (stress-level animation — see ci_animate.py).
