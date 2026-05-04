@@ -723,6 +723,21 @@ apply_pf_lockdown_5900() {
     command -v pfctl >/dev/null 2>&1 || { yellow "  pfctl missing — skipping pf rule"; return 0; }
     [[ -z "$MACOS_PASS" ]] && { yellow "  No password — skipping pf rule"; return 0; }
 
+    # Idempotency: if the anchor file already has our content AND the
+    # anchor is loaded in pf, skip the rewrite + reload. Avoids noisy
+    # "pfctl may have rejected" warning on subsequent setup.sh runs that
+    # haven't actually broken anything.
+    local _expected_body
+    _expected_body=$'pass in quick proto tcp from 127.0.0.0/8 to any port 5900\nblock in quick proto tcp from any to any port 5900'
+    local _current_loaded
+    _current_loaded="$(echo "$MACOS_PASS" | sudo -S pfctl -a com.macvncstream -sr 2>/dev/null | grep -E '5900' || true)"
+    if [[ -f "$PF_ANCHOR_PATH" ]] \
+       && [[ "$(echo "$MACOS_PASS" | sudo -S cat "$PF_ANCHOR_PATH" 2>/dev/null)" == *"pass in quick"*"127.0.0.0/8"*"5900"* ]] \
+       && [[ -n "$_current_loaded" ]]; then
+        green "  pf rule already installed and loaded — skipping (idempotent)"
+        return 0
+    fi
+
     yellow "  Writing ${PF_ANCHOR_PATH} (sudo) and updating /etc/pf.conf..."
     # pf rule ordering matters: 'quick' makes a decision and stops further
     # evaluation. With block-quick BEFORE pass-quick, ALL traffic to :5900
@@ -743,10 +758,16 @@ anchor "com.macvncstream"
 load anchor "com.macvncstream" from "${PF_ANCHOR_PATH}"
 EOF
     fi
-    if echo "$MACOS_PASS" | sudo -S pfctl -ef /etc/pf.conf 2>&1 | grep -qE "Token|enabled|already enabled|loaded"; then
+    # pfctl -ef on macOS produces verbose stderr ("Use of -f option, could
+    # result in flushing of rules…", "pf already enabled") — none of which
+    # are errors. Verify success by checking whether the rule actually
+    # loaded into our anchor instead of pattern-matching the noisy output.
+    echo "$MACOS_PASS" | sudo -S pfctl -ef /etc/pf.conf >/dev/null 2>&1 || true
+    sleep 1
+    if [[ -n "$(echo "$MACOS_PASS" | sudo -S pfctl -a com.macvncstream -sr 2>/dev/null | grep -E '5900' || true)" ]]; then
         green "  pf rule installed — external :5900 now blocked, localhost still works"
     else
-        yellow "  pfctl may have rejected the rule — check 'sudo pfctl -sr | grep 5900'"
+        yellow "  pf rule didn't take — check 'sudo pfctl -a com.macvncstream -sr'."
         yellow "  Anchor file remains at ${PF_ANCHOR_PATH} for manual inspection."
     fi
 }
@@ -861,8 +882,10 @@ fi
 unset _vnc_reason
 
 # Optional MDM TCC profile detection (informational only — no auto-action).
+# Silent unless an MDM TCC profile is actually present. Earlier this printed
+# the "About to run sudo profiles show" warning unconditionally, which on
+# the common case (no MDM) just added noise to every setup.sh run.
 if [[ -n "${MACOS_PASS:-}" ]]; then
-    yellow "  About to run 'sudo profiles show' (read-only) to check for MDM TCC management..."
     if echo "$MACOS_PASS" | sudo -S profiles show 2>/dev/null \
             | grep -q "com.apple.TCC.configuration-profile-policy"; then
         yellow "  Note: MDM TCC profile installed. If grants don't take effect, ask"
@@ -1003,14 +1026,26 @@ PLIST
 # ── Step 8: Write the appropriate plist + (re)load ────────────────────────────
 step "Installing LaunchAgent: $PLIST_PATH"
 # Two args to write_plist: include_vnc_flag, include_password_env.
-# vnc_flag: VNC_FALLBACK (bootstrap OR permanent display-warmer needs it)
-# password: BOOTSTRAP_MODE only (transient — gone after grants)
-write_plist "$VNC_FALLBACK" "$BOOTSTRAP_MODE"
+# vnc_flag      = VNC_FALLBACK                 (bootstrap OR permanent display-warmer needs it)
+# password      = BOOTSTRAP_MODE OR NEEDS_VNC_AS_DISPLAY_WARMER
+#   • bootstrap-mode: transient — gone after grants land
+#   • display-warmer: permanent — bundle's VNC bridge needs MACOS_PASS to
+#     authenticate against screensharingd; without it --enable-vnc-fallback
+#     just makes the bundle crash-loop on auth error
+INCLUDE_PASSWORD=0
+if [[ "$BOOTSTRAP_MODE" -eq 1 ]] || [[ "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 ]]; then
+    INCLUDE_PASSWORD=1
+fi
+write_plist "$VNC_FALLBACK" "$INCLUDE_PASSWORD"
 if [[ "$BOOTSTRAP_MODE" -eq 1 ]]; then
-    yellow "  Plist: BOOTSTRAP mode — temporarily includes --enable-vnc-fallback"
-    yellow "  and MACOS_PASS env. Both are removed after you grant permissions."
+    yellow "  Plist: bootstrap mode (VNC fallback + MACOS_PASS — both transient)"
+elif [[ "$VNC_FALLBACK" -eq 1 && "$INCLUDE_PASSWORD" -eq 1 ]]; then
+    green "  Plist: production + VNC display-warmer (--enable-vnc-fallback + MACOS_PASS)"
+elif [[ "$VNC_FALLBACK" -eq 1 ]]; then
+    yellow "  Plist: production with --enable-vnc-fallback but NO password — bundle"
+    yellow "  may fail on VNC auth. Re-run with --macos-pass to fix."
 else
-    green "  Plist: production mode — no VNC flag, no stored password"
+    green "  Plist: production — no VNC flag, no stored password (local Mac)"
 fi
 
 if [[ "$NO_LAUNCHAGENT" -eq 1 ]]; then
