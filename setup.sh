@@ -491,8 +491,14 @@ if [[ -d "$APP_DEST" ]]; then
                 #      bash-inheritance lying), but better than nothing.
                 #   3. Bundle predates --tcc-check entirely (no marker line):
                 #      assume grants valid (user picked keep, trust them).
-                _probe_state="$(tcc_probe)"
-                _probe_rc=$?
+                # Capture rc + stdout WITHOUT triggering set -e on non-zero
+                # return (bash 3.2 — macOS default — propagates the function's
+                # non-zero exit code through `_var="$(fn)"; rc=$?` differently
+                # than bash 4+, and set -euo pipefail aborts the script).
+                # Calling inside `if` puts the function call in conditional
+                # context where set -e is suppressed.
+                _probe_rc=0
+                if _probe_state="$(tcc_probe)"; then :; else _probe_rc=$?; fi
                 if [[ "$_probe_rc" -eq 0 ]]; then
                     TCC_GRANTED=1
                     green "  Existing bundle has valid TCC grants (TCC.db sudo probe) — straight to production"
@@ -1071,8 +1077,11 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0
     while true; do
         read -rp "  Press Enter when permissions are granted (Ctrl+C to leave in bootstrap mode): " _
         sleep 2  # give tccd a moment to commit the toggle
-        _probe_state="$(tcc_probe)"
-        _probe_rc=$?
+        # See keep-path comment: bash 3.2 + set -euo pipefail trips on
+        # `var="$(fn)"; rc=$?` when fn returns non-zero. Use the if-form
+        # to put the call in conditional context.
+        _probe_rc=0
+        if _probe_state="$(tcc_probe)"; then :; else _probe_rc=$?; fi
         case "$_probe_rc" in
             0)
                 green "  Both grants confirmed via TCC.db (sudo) — switching to production mode."
