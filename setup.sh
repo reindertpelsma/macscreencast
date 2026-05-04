@@ -115,6 +115,24 @@ else
     green "    permissions to this app only, not the Python interpreter"
 fi
 
+# SSH-vs-local detection. Drives the VNC-fallback decision later: only
+# offer VNC when running over SSH (no physical screen access). Local
+# terminals on the Mac's own display assume the user can grant TCC at
+# the keyboard.
+RUNNING_FROM_SSH=0
+if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]]; then
+    RUNNING_FROM_SSH=1
+fi
+
+# Display detection — used for the no-display + no-VNC frozen-screen
+# warning. Best-effort; system_profiler is slow on first call so we cache
+# the result.
+DISPLAY_ATTACHED=0
+if command -v system_profiler >/dev/null 2>&1 \
+        && system_profiler SPDisplaysDataType 2>/dev/null | grep -q "Resolution:"; then
+    DISPLAY_ATTACHED=1
+fi
+
 # ── Step 2: Find the best Python ──────────────────────────────────────────────
 step "Finding Python 3.9+"
 
