@@ -678,8 +678,11 @@ ensure_screensharingd() {
 # (sudo) — runs unconditionally if this flag is set, no second prompt.
 # screensharingd doesn't expose a bind-address knob (its launchd plist is
 # SIP-protected), so the clean way to restrict external access is a pf anchor:
-#   block in quick proto tcp from any to any port 5900
 #   pass  in quick proto tcp from 127.0.0.0/8 to any port 5900
+#   block in quick proto tcp from any to any port 5900
+# Order matters: 'quick' decides immediately. Loopback pass MUST come
+# first or the block-quick line fires for everything including loopback,
+# severing the bundle's VNC bridge to screensharingd.
 # Our bundle's VNC bridge connects to 127.0.0.1:5900 anyway — losing nothing
 # functionally, removing the cloud-Mac brute-force attack surface.
 WANT_PF_LOCKDOWN=0
@@ -691,7 +694,13 @@ apply_pf_lockdown_5900() {
     [[ -z "$MACOS_PASS" ]] && { yellow "  No password — skipping pf rule"; return 0; }
 
     yellow "  Writing ${PF_ANCHOR_PATH} (sudo) and updating /etc/pf.conf..."
-    local _anchor_body=$'block in quick proto tcp from any to any port 5900\npass in quick proto tcp from 127.0.0.0/8 to any port 5900\n'
+    # pf rule ordering matters: 'quick' makes a decision and stops further
+    # evaluation. With block-quick BEFORE pass-quick, ALL traffic to :5900
+    # hits the block first and gets dropped — including loopback. The
+    # bundle's VNC bridge then can't reach screensharingd and times out.
+    # Pass loopback FIRST (quick → match-and-stop), then block everything
+    # else. Verified live on Scaleway: wrong order broke VNC bridge.
+    local _anchor_body=$'pass in quick proto tcp from 127.0.0.0/8 to any port 5900\nblock in quick proto tcp from any to any port 5900\n'
     if ! echo "$MACOS_PASS" | sudo -S tee "$PF_ANCHOR_PATH" >/dev/null <<<"$_anchor_body"; then
         yellow "  Failed to write anchor file — skipping"
         return 0
