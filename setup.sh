@@ -406,13 +406,19 @@ ensure_screensharingd() {
     yellow "  screensharingd is configured but stopped (port 5900 closed)."
     yellow "  Reason it's needed: $reason"
     yellow "  Will run: sudo launchctl kickstart -k system/com.apple.screensharing"
-    yellow "  IMPORTANT: respects on-disk bind config (typically 0.0.0.0:5900)."
-    yellow "  Cloud-provider firewalls should block external 5900 if you rely on that."
-    read -rp "  Start screensharingd now? [y/N] " _ans
-    if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
-        unset _ans
-        return 1
-    fi
+    yellow "  Note: screensharingd binds to 0.0.0.0:5900 (system default; macOS"
+    yellow "  doesn't expose a bind-addr knob). Our bundle only connects via"
+    yellow "  127.0.0.1, so external :5900 is just brute-force surface area."
+    yellow "    y  = start it (rely on cloud-provider firewall to block external)"
+    yellow "    l  = start AND lock down :5900 to localhost via pf (recommended"
+    yellow "         on cloud Macs without a security group)"
+    yellow "    N  = skip"
+    read -rp "  Start screensharingd now? [y/N/l] " _ans
+    case "$_ans" in
+        [Ll]*) WANT_PF_LOCKDOWN=1 ;;
+        [Yy]*) WANT_PF_LOCKDOWN=0 ;;
+        *)     unset _ans; return 1 ;;
+    esac
     unset _ans
     if [[ -n "$MACOS_PASS" ]]; then
         echo "$MACOS_PASS" | sudo -S launchctl kickstart -k system/com.apple.screensharing 2>&1 | head -2
@@ -427,6 +433,46 @@ ensure_screensharingd() {
     fi
     yellow "  screensharingd didn't come up — skipping"
     return 1
+}
+
+# ── Optional :5900 lock-down via pf ──────────────────────────────────────────
+# Set to 1 by ensure_screensharingd() when the user picks 'l' at the start
+# prompt. apply_pf_lockdown_5900() is called once we have a verified password
+# (sudo) — runs unconditionally if this flag is set, no second prompt.
+# screensharingd doesn't expose a bind-address knob (its launchd plist is
+# SIP-protected), so the clean way to restrict external access is a pf anchor:
+#   block in quick proto tcp from any to any port 5900
+#   pass  in quick proto tcp from 127.0.0.0/8 to any port 5900
+# Our bundle's VNC bridge connects to 127.0.0.1:5900 anyway — losing nothing
+# functionally, removing the cloud-Mac brute-force attack surface.
+WANT_PF_LOCKDOWN=0
+PF_ANCHOR_PATH="/etc/pf.anchors/com.macvncstream"
+PF_CONF_MARKER="# anchor \"com.macvncstream\" -- mac-vnc-stream"
+apply_pf_lockdown_5900() {
+    [[ "$WANT_PF_LOCKDOWN" -eq 1 ]] || return 0
+    command -v pfctl >/dev/null 2>&1 || { yellow "  pfctl missing — skipping pf rule"; return 0; }
+    [[ -z "$MACOS_PASS" ]] && { yellow "  No password — skipping pf rule"; return 0; }
+
+    yellow "  Writing ${PF_ANCHOR_PATH} (sudo) and updating /etc/pf.conf..."
+    local _anchor_body=$'block in quick proto tcp from any to any port 5900\npass in quick proto tcp from 127.0.0.0/8 to any port 5900\n'
+    if ! echo "$MACOS_PASS" | sudo -S tee "$PF_ANCHOR_PATH" >/dev/null <<<"$_anchor_body"; then
+        yellow "  Failed to write anchor file — skipping"
+        return 0
+    fi
+    if ! echo "$MACOS_PASS" | sudo -S grep -qF "$PF_CONF_MARKER" /etc/pf.conf 2>/dev/null; then
+        echo "$MACOS_PASS" | sudo -S tee -a /etc/pf.conf >/dev/null <<EOF
+
+${PF_CONF_MARKER}
+anchor "com.macvncstream"
+load anchor "com.macvncstream" from "${PF_ANCHOR_PATH}"
+EOF
+    fi
+    if echo "$MACOS_PASS" | sudo -S pfctl -ef /etc/pf.conf 2>&1 | grep -qE "Token|enabled|already enabled|loaded"; then
+        green "  pf rule installed — external :5900 now blocked, localhost still works"
+    else
+        yellow "  pfctl may have rejected the rule — check 'sudo pfctl -sr | grep 5900'"
+        yellow "  Anchor file remains at ${PF_ANCHOR_PATH} for manual inspection."
+    fi
 }
 
 # ── Step 7: VNC fallback decision ────────────────────────────────────────────
@@ -484,6 +530,7 @@ if [[ "$NEEDS_VNC_FOR_GRANT" -eq 1 || "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 ]]; t
                     if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
                         VNC_FALLBACK=1
                         green "  Password verified — VNC bootstrap enabled"
+                        apply_pf_lockdown_5900
                         break
                     fi
                     _attempts=$((_attempts + 1))
