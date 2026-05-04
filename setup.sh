@@ -488,53 +488,83 @@ if [[ -d "$APP_DEST" ]]; then
                 yellow "  --no-tcc-probe → skipping probe, treating grants as missing"
                 ;;
             *)
-                # Probe order:
-                #   1. tcc_probe (sudo+sqlite3 TCC.db) — authoritative when
-                #      MACOS_PASS available. Not subject to PyObjC quirks,
-                #      parent-shell inheritance, or CGPreflight optimism.
-                #   2. bundle's --tcc-check — fallback when no MACOS_PASS.
-                #      Less reliable (Tahoe block-signature bug, GH-runner
-                #      bash-inheritance lying), but better than nothing.
-                #   3. Bundle predates --tcc-check entirely (no marker line):
-                #      assume grants valid (user picked keep, trust them).
-                # Capture rc + stdout WITHOUT triggering set -e on non-zero
-                # return (bash 3.2 — macOS default — propagates the function's
-                # non-zero exit code through `_var="$(fn)"; rc=$?` differently
-                # than bash 4+, and set -euo pipefail aborts the script).
-                # Calling inside `if` puts the function call in conditional
-                # context where set -e is suppressed.
+                # Keep path = trust the user's decision to preserve the
+                # existing bundle. setup.sh's job is to (re)start the
+                # service, NOT second-guess and re-run the bootstrap dance.
+                #
+                # Probe is informational only — never destructive. We do NOT
+                # tccutil-reset on keep, because:
+                #   • If grants are actually valid (most common), reset
+                #     wipes them and forces a re-grant — exactly what the
+                #     user said NO to by picking keep.
+                #   • Probes are imprecise: bundle --tcc-check from a shell
+                #     is unreliable on Tahoe (TCC.db's csreq encodes the
+                #     responsible-app chain — a grant made under launchd
+                #     doesn't satisfy a check made under bash; verified
+                #     live on Scaleway: TCC.db showed auth_value=2 but
+                #     bundle --tcc-check returned screen_recording=0).
+                #
+                # Override with --assume-tcc-granted (force-skip) or
+                # --no-tcc-probe (force-fail) when you want explicit control.
+                TCC_GRANTED=1
                 _probe_rc=0
                 if _probe_state="$(tcc_probe)"; then :; else _probe_rc=$?; fi
-                if [[ "$_probe_rc" -eq 0 ]]; then
-                    TCC_GRANTED=1
-                    green "  Existing bundle has valid TCC grants (TCC.db sudo probe) — straight to production"
-                elif [[ "$_probe_rc" -eq 1 ]]; then
-                    yellow "  TCC.db says grants missing/stale — will re-grant via bootstrap"
-                    NEEDS_TCC_RESET=1
-                else
-                    # _probe_rc == 2 — no MACOS_PASS, fall back to --tcc-check
-                    _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
-                    if echo "$_tcc_out" | grep -qE "screen_recording="; then
-                        if echo "$_tcc_out" | grep -q "screen_recording=1" \
-                                && echo "$_tcc_out" | grep -q "accessibility=1"; then
-                            TCC_GRANTED=1
-                            green "  Existing bundle has valid TCC grants (bundle --tcc-check) — straight to production"
-                        else
-                            yellow "  Bundle --tcc-check reports grants missing or stale"
-                            NEEDS_TCC_RESET=1
-                        fi
-                    else
-                        yellow "  Bundle predates --tcc-check (or probe failed on this OS version)."
-                        yellow "  Cannot verify TCC state via probe; assuming grants are valid as-is."
-                        yellow "  If the server doesn't work, re-run with --macos-pass for an"
-                        yellow "  authoritative TCC.db query, or pick [r]ebuild."
-                        TCC_GRANTED=1   # optimistic — user chose keep, trust them
-                    fi
-                    unset _tcc_out
-                fi
+                case "$_probe_rc" in
+                    0) green "  TCC.db sudo probe confirms both grants — trivial restart path" ;;
+                    1) yellow "  TCC.db sudo probe says grants missing/stale — but you picked keep."
+                       yellow "  Trusting your decision. If browser frames are black/frozen,"
+                       yellow "  re-run setup.sh and choose [r]ebuild for a clean re-grant ceremony." ;;
+                    2) green "  Trusting your keep — re-run with --macos-pass for an authoritative"
+                       green "  TCC.db sudo probe if you want explicit confirmation." ;;
+                esac
                 unset _probe_state _probe_rc
                 ;;
         esac
+
+        # Auto-populate MACOS_PASS and MVS_PASSWORD from the existing plist
+        # on keep, so the user doesn't re-enter the macOS password each run,
+        # AND the browser token doesn't churn between runs (which would
+        # invalidate any open browser sessions).
+        # Note: MVS_PASSWORD was already generated as a fresh random token
+        # in Step 4. We override it here on keep — existing plist's token
+        # takes precedence so the user's open browser tabs keep working.
+        # MACOS_PASS only auto-populates when the user didn't pass
+        # --macos-pass explicitly on the CLI (an explicit --macos-pass on
+        # the CLI always wins over what's in the plist).
+        _existing_plist="$HOME/Library/LaunchAgents/${LABEL}.plist"
+        if [[ -f "$_existing_plist" ]]; then
+            if [[ -z "$MACOS_PASS" ]]; then
+                _existing_pw=$(python3 -c "
+import plistlib, sys
+try:
+    with open(sys.argv[1], 'rb') as f:
+        p = plistlib.load(f)
+    print(p.get('EnvironmentVariables', {}).get('MACOS_PASS', ''))
+except Exception:
+    print('')
+" "$_existing_plist" 2>/dev/null || true)
+                if [[ -n "$_existing_pw" ]]; then
+                    MACOS_PASS="$_existing_pw"
+                    green "  Reusing macOS password from existing plist (no re-prompt)"
+                fi
+                unset _existing_pw
+            fi
+            _existing_token=$(python3 -c "
+import plistlib, sys
+try:
+    with open(sys.argv[1], 'rb') as f:
+        p = plistlib.load(f)
+    print(p.get('EnvironmentVariables', {}).get('MVS_PASSWORD', ''))
+except Exception:
+    print('')
+" "$_existing_plist" 2>/dev/null || true)
+            if [[ -n "$_existing_token" ]]; then
+                MVS_PASSWORD="$_existing_token"
+                green "  Reusing browser token from existing plist (open sessions stay valid)"
+            fi
+            unset _existing_token
+        fi
+        unset _existing_plist
     fi
 else
     REBUILD_NEEDED=1   # no bundle yet — fresh install. TCC_GRANTED stays 0;
