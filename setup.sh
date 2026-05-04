@@ -48,6 +48,7 @@ LOG_PATH="/tmp/macvncstream.log"
 PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+NO_LAUNCHAGENT=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)        PORT="$2"; shift 2 ;;
@@ -57,6 +58,7 @@ while [[ $# -gt 0 ]]; do
         --max-fps)     MAX_FPS="$2"; shift 2 ;;
         --codec)       CODEC="$2"; shift 2 ;;
         --headless)    HEADLESS=1; shift ;;
+        --no-launchagent) NO_LAUNCHAGENT=1; shift ;;
         -h|--help)
             cat <<HELP
 setup.sh — install mac-vnc-stream from this git checkout.
@@ -69,8 +71,17 @@ setup.sh — install mac-vnc-stream from this git checkout.
   --max-fps N        encoder fps cap (default 60)
   --codec NAME       h264 | h265 | jpeg (default h264)
   --headless         no prompts, sensible defaults (or MVS_HEADLESS=1)
+  --no-launchagent   skip the LaunchAgent install — build bundle (if SIP on)
+                     and write the plist template, but don't bootstrap. Useful
+                     for audit/preview, or when you'll launch the bundle manually.
 
 Reads MVS_HEADLESS, MACOS_PASS, MVS_PASSWORD from env if unset.
+
+Privileged-action policy: before every sudo command setup.sh announces what
+it's about to do (e.g. "Installing bundle to /Applications/ — requires sudo").
+You can Ctrl+C to abort at any point. The only actions that need root are
+(1) writing /Applications/mac-vnc-stream.app and (2) reading the MDM profile
+list for the informational TCC-policy detection.
 HELP
             exit 0 ;;
         *) die "unknown arg: $1" ;;
@@ -208,9 +219,85 @@ fi
 # entirely, write production plist, start. This is the GitHub-runner /
 # custom-image-Mac case — out-of-the-box working with zero prompts.
 WANTS_VNC=0
+# SSH-vs-local detection. If the user is running setup.sh from a terminal
+# open ON the Mac's actual display (not via SSH), they have physical screen
+# access and can grant TCC at the keyboard — no VNC bootstrap needed.
+RUNNING_FROM_SSH=0
+if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]]; then
+    RUNNING_FROM_SSH=1
+fi
+
+# Detect "screensharingd is installed/configured but currently stopped"
+# (e.g. cloud-Mac providers that ship it disabled for security). Distinct
+# from "screensharingd not installed at all" — the former is recoverable
+# with `sudo launchctl kickstart -k system/com.apple.screensharing` if the
+# user explicitly opts into VNC bootstrap.
+SSD_INSTALLED_BUT_OFF=0
+if [[ "$SIP_DISABLED" -eq 0 ]] && ! nc -z 127.0.0.1 5900 2>/dev/null; then
+    if [[ -r /Library/Application\ Support/com.apple.TCC/TCC.db ]] \
+            && [[ -n "${MACOS_PASS:-}" ]]; then
+        yellow "  About to read /Library/Application Support/com.apple.TCC/TCC.db (read-only, requires sudo) to check screensharingd state..."
+        if echo "$MACOS_PASS" | sudo -S sqlite3 \
+                /Library/Application\ Support/com.apple.TCC/TCC.db \
+                "SELECT 1 FROM access WHERE client='com.apple.screensharing.agent' LIMIT 1" \
+                2>/dev/null | grep -q 1; then
+            SSD_INSTALLED_BUT_OFF=1
+        fi
+    fi
+fi
+
 if [[ "$SIP_DISABLED" -eq 1 ]]; then
     green "  Skipping VNC bootstrap (SIP off — TCC isn't enforcing, raw API path is fine)"
-elif nc -z 127.0.0.1 5900 2>/dev/null; then
+elif [[ "$RUNNING_FROM_SSH" -eq 0 ]]; then
+    green "  Skipping VNC bootstrap (running from local terminal — physical display assumed)"
+    green "  You'll grant Screen Recording / Accessibility at the keyboard after install."
+elif [[ "$SSD_INSTALLED_BUT_OFF" -eq 1 ]]; then
+    if [[ "$HEADLESS" -eq 1 ]]; then
+        yellow "  screensharingd appears configured but stopped (port 5900 is closed)."
+        yellow "  Headless mode — skipping VNC bootstrap. To enable manually:"
+        yellow "    sudo launchctl kickstart -k system/com.apple.screensharing"
+    else
+        echo
+        yellow "  screensharingd is configured but stopped (port 5900 is closed)."
+        yellow "  Cloud Mac providers sometimes disable it for security. Without it,"
+        yellow "  there's no way to grant Screen Recording on a headless cloud Mac"
+        yellow "  unless you have physical access to the keyboard."
+        yellow ""
+        yellow "  About to start screensharingd via:"
+        yellow "    sudo launchctl kickstart -k system/com.apple.screensharing"
+        yellow ""
+        yellow "  IMPORTANT: this restarts the service with whatever bind config"
+        yellow "  was already on disk — typically 0.0.0.0:5900. Make sure your"
+        yellow "  cloud provider's firewall blocks external 5900 access if you"
+        yellow "  rely on that for security. (We connect to 127.0.0.1:5900 only,"
+        yellow "  but other clients on the network could also connect once it's up.)"
+        echo
+        read -rp "  Start screensharingd now? [y/N] " _ans
+        if [[ "$_ans" =~ ^[Yy]$ ]]; then
+            yellow "  About to run sudo to start screensharingd..."
+            if [[ -n "$MACOS_PASS" ]]; then
+                echo "$MACOS_PASS" | sudo -S launchctl kickstart -k system/com.apple.screensharing 2>&1 | head -2
+            else
+                sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 | head -2
+            fi
+            sleep 3
+            if nc -z 127.0.0.1 5900 2>/dev/null; then
+                green "  screensharingd is now listening on :5900"
+            else
+                yellow "  screensharingd didn't come up. Skipping VNC bootstrap for this run."
+            fi
+        else
+            yellow "  Skipping. Run this command manually if you want VNC bootstrap:"
+            yellow "    sudo launchctl kickstart -k system/com.apple.screensharing"
+        fi
+        unset _ans
+    fi
+fi
+# After potentially starting screensharingd above, re-check the port. If it's
+# now up (or was up to begin with), enter the regular VNC-bootstrap prompt.
+if nc -z 127.0.0.1 5900 2>/dev/null && [[ "$WANTS_VNC" -eq 0 ]] \
+        && [[ "$SIP_DISABLED" -eq 0 ]] \
+        && [[ "$RUNNING_FROM_SSH" -eq 1 ]]; then
     if [[ "$HEADLESS" -eq 1 ]]; then
         # Headless: only enable VNC if MACOS_PASS came in via env.
         if [[ -n "$MACOS_PASS" ]]; then
@@ -262,8 +349,9 @@ fi
 # specific MDM is locked-down enough to require an allowlist that omits our
 # bundle, the user will see the grant fail to take effect; this note tells
 # them what to do.
-if [[ "$SIP_DISABLED" -eq 0 ]]; then
-    if echo "${MACOS_PASS:-}" | sudo -S profiles show 2>/dev/null \
+if [[ "$SIP_DISABLED" -eq 0 && -n "${MACOS_PASS:-}" ]]; then
+    yellow "  About to run 'sudo profiles show' (read-only, requires sudo) to check for MDM TCC management..."
+    if echo "$MACOS_PASS" | sudo -S profiles show 2>/dev/null \
             | grep -q "com.apple.TCC.configuration-profile-policy"; then
         yellow "  Note: an MDM TCC profile is installed. If your grants for"
         yellow "  mac-vnc-stream don't take effect, the MDM policy may need updating."
@@ -323,11 +411,19 @@ if [[ "$SIP_DISABLED" -eq 0 ]]; then
         [[ -d "$REPO_DIR/dist/mac-vnc-stream.app" ]] \
             || die "py2app did not produce dist/mac-vnc-stream.app"
         # Install to /Applications/ so the bundle has a stable, system-level path.
-        # /Applications/ is owned by root; sudo via cached creds.
-        echo "$MACOS_PASS" | sudo -S rm -rf "$APP_DEST" 2>/dev/null || true
+        # /Applications/ is owned by root; sudo via cached creds (or interactive
+        # prompt if MACOS_PASS isn't set, e.g. personal-Mac local install).
+        echo
+        yellow "  About to install bundle to /Applications/ — this REQUIRES SUDO:"
+        yellow "    sudo rm -rf $APP_DEST"
+        yellow "    sudo cp -R $REPO_DIR/dist/mac-vnc-stream.app $APP_DEST"
+        yellow "  (Press Ctrl+C to abort if you'd rather install elsewhere manually.)"
+        echo
         if [[ -n "$MACOS_PASS" ]]; then
+            echo "$MACOS_PASS" | sudo -S rm -rf "$APP_DEST" 2>/dev/null || true
             echo "$MACOS_PASS" | sudo -S cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
         else
+            sudo rm -rf "$APP_DEST" || true
             sudo cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
         fi
         APP_BUILT="$APP_DEST"
@@ -418,26 +514,34 @@ else
     green "  Plist: production mode — no VNC flag, no stored password"
 fi
 
-step "Starting mac-vnc-stream service"
-launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
-sleep 1
-if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1; then
-    LOAD_DOMAIN="gui/$(id -u)"
-    green "  Loaded into ${LOAD_DOMAIN}"
+if [[ "$NO_LAUNCHAGENT" -eq 1 ]]; then
+    step "Skipping LaunchAgent bootstrap (--no-launchagent)"
+    green "  Plist written to $PLIST_PATH but not loaded."
+    green "  Start it manually with:  launchctl bootstrap gui/\$(id -u) $PLIST_PATH"
+    green "  Or run the bundle directly:  $LAUNCHAGENT_BINARY"
+    LOAD_DOMAIN=""
 else
-    die "launchctl bootstrap into gui/$(id -u) failed.
+    step "Starting mac-vnc-stream service"
+    launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
+    sleep 1
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1; then
+        LOAD_DOMAIN="gui/$(id -u)"
+        green "  Loaded into ${LOAD_DOMAIN}"
+    else
+        die "launchctl bootstrap into gui/$(id -u) failed.
 This usually means there's no active console (Aqua) session yet. Either:
   • Log in via VNC at vnc://127.0.0.1:5900 once, then re-run setup.sh
   • Or attach a display + login locally"
-fi
+    fi
 
-echo -n "  Waiting for server"
-WAITED=0
-while [[ $WAITED -lt 15 ]]; do
-    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then echo; green "  Server up on :$PORT"; break; fi
-    sleep 1; WAITED=$((WAITED + 1)); echo -n "."
-done
-[[ $WAITED -ge 15 ]] && yellow "  Server slow to start — check $LOG_PATH"
+    echo -n "  Waiting for server"
+    WAITED=0
+    while [[ $WAITED -lt 15 ]]; do
+        if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then echo; green "  Server up on :$PORT"; break; fi
+        sleep 1; WAITED=$((WAITED + 1)); echo -n "."
+    done
+    [[ $WAITED -ge 15 ]] && yellow "  Server slow to start — check $LOG_PATH"
+fi
 
 # ── Step 9b: Bootstrap → production transition (interactive only) ────────────
 # When we just rebuilt the bundle AND VNC is acting as the bootstrap path,
