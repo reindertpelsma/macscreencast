@@ -268,74 +268,116 @@ fi
 
 # ── Step 6: Build .app bundle (SIP-enabled only) ──────────────────────────────
 LAUNCHAGENT_BINARY=""
-LAUNCHAGENT_ARGS=()
+APP_DEST="/Applications/mac-vnc-stream.app"
 APP_BUILT=""
+DID_REBUILD=0   # 1 if we just built/installed a fresh bundle (CDHash changed)
 
 if [[ "$SIP_DISABLED" -eq 0 ]]; then
-    # Skip the build entirely if install.sh already installed a pre-built
-    # release bundle into /Applications/ — it set MVS_PREBUILT_APP for us.
+    # Phase A: install.sh's release-download fast path may have already placed
+    # a pre-built bundle and exported MVS_PREBUILT_APP. Treat that as a fresh
+    # install (CDHash unknown to TCC).
     if [[ -n "${MVS_PREBUILT_APP:-}" && -d "$MVS_PREBUILT_APP" ]]; then
         APP_BUILT="$MVS_PREBUILT_APP"
-        green "  Using pre-built bundle (from install.sh release fast-path)"
-        green "  Bundle: $APP_BUILT"
+        DID_REBUILD=1
+        green "  Using pre-built bundle (install.sh release path): $APP_BUILT"
+    elif [[ -d "$APP_DEST" ]]; then
+        # Phase B: existing bundle in /Applications/. Prompt to keep or rebuild.
+        # Keep is the right default in headless mode (preserves existing TCC
+        # grants — bundle CDHash unchanged → grants stay valid).
+        if [[ "$HEADLESS" -eq 1 ]]; then
+            green "  Existing bundle at $APP_DEST — keeping (headless default)"
+            APP_BUILT="$APP_DEST"
+            DID_REBUILD=0
+        else
+            echo
+            yellow "  An existing mac-vnc-stream.app is installed at:"
+            yellow "    $APP_DEST"
+            yellow "  Keeping it preserves your existing TCC grants (CDHash unchanged)."
+            yellow "  Rebuilding picks up source changes but invalidates grants —"
+            yellow "  you'll need to re-toggle Screen Recording / Accessibility."
+            echo
+            read -rp "  [k]eep or [r]ebuild? [K/r] " _ans
+            if [[ "$_ans" =~ ^[Rr]$ ]]; then
+                DID_REBUILD=1
+            else
+                APP_BUILT="$APP_DEST"
+                DID_REBUILD=0
+            fi
+            unset _ans
+        fi
     else
+        DID_REBUILD=1   # no bundle yet — fresh install
+    fi
+
+    if [[ "$DID_REBUILD" -eq 1 && -z "$APP_BUILT" ]]; then
         step "Building .app bundle (com.macvncstream.server)"
         rm -rf "$REPO_DIR/build" "$REPO_DIR/dist"
-        (cd "$REPO_DIR" && "$PYTHON_BINARY" build_app.py py2app 2>&1 \
-                | tail -10)
-        APP_BUILT="$REPO_DIR/dist/mac-vnc-stream.app"
-        [[ -d "$APP_BUILT" ]] || die "py2app build did not produce $APP_BUILT"
-        green "  Bundle: $APP_BUILT"
-        green "  Bundle id: com.macvncstream.server  (TCC tracks this id, not com.apple.python3)"
+        (cd "$REPO_DIR" && "$PYTHON_BINARY" build_app.py py2app 2>&1 | tail -10)
+        [[ -d "$REPO_DIR/dist/mac-vnc-stream.app" ]] \
+            || die "py2app did not produce dist/mac-vnc-stream.app"
+        # Install to /Applications/ so the bundle has a stable, system-level path.
+        # /Applications/ is owned by root; sudo via cached creds.
+        echo "$MACOS_PASS" | sudo -S rm -rf "$APP_DEST" 2>/dev/null || true
+        if [[ -n "$MACOS_PASS" ]]; then
+            echo "$MACOS_PASS" | sudo -S cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
+        else
+            sudo cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
+        fi
+        APP_BUILT="$APP_DEST"
+        green "  Bundle installed at $APP_DEST (com.macvncstream.server, ad-hoc signed)"
     fi
 
     LAUNCHAGENT_BINARY="$APP_BUILT/Contents/MacOS/mac-vnc-stream"
 else
     step "SIP disabled — skipping .app bundle build"
     LAUNCHAGENT_BINARY="$PYTHON_BINARY"
-    LAUNCHAGENT_ARGS=("$REPO_DIR/server.py")
 fi
 
-# ── Step 7: Compose ProgramArguments ──────────────────────────────────────────
-# Always pass the basic config flags. Add --api-only when no VNC fallback
-# is wanted (server skips screensharingd entirely).
-LAUNCHAGENT_ARGS+=(
-    --listen "$LISTEN"
-    --port "$PORT"
-    --password "$MVS_PASSWORD"
-    --max-fps "$MAX_FPS"
-    --codec "$CODEC"
-)
-if [[ "$WANTS_VNC" -eq 1 ]]; then
-    # Server defaults to native APIs only (SCK + CGEvent, no VNC). Opt back
-    # in to the SCK→VNC and CGEvent→VNC auto-fallback paths for the headless
-    # cloud-Mac case where VNC also serves as the display warmer.
-    LAUNCHAGENT_ARGS+=(--enable-vnc-fallback)
+# ── Step 6b: Decide bootstrap vs production mode ──────────────────────────────
+# BOOTSTRAP mode (only when DID_REBUILD=1 AND VNC is available): write a
+# transient plist with --enable-vnc-fallback + MACOS_PASS in env. After the
+# user grants permissions, we rewrite the plist as production (no flag, no
+# password) and kickstart-restart. Production restarts thereafter never have
+# the password in the env.
+#
+# Production mode: clean plist, no --enable-vnc-fallback, no MACOS_PASS env.
+# Used when bundle is unchanged (grants still valid) OR when no VNC is wanted.
+BOOTSTRAP_MODE=0
+if [[ "$DID_REBUILD" -eq 1 && "$WANTS_VNC" -eq 1 ]]; then
+    BOOTSTRAP_MODE=1
 fi
 
-# Build PROG_ARGS_XML from the array.
-PROG_ARGS_XML=""
-PROG_ARGS_XML+="        <string>${LAUNCHAGENT_BINARY}</string>
-"
-for a in "${LAUNCHAGENT_ARGS[@]}"; do
-    PROG_ARGS_XML+="        <string>${a}</string>
-"
-done
+# ── Step 7: write_plist function (called once or twice depending on mode) ─────
+write_plist() {
+    local include_vnc="$1"   # 1 = include --enable-vnc-fallback + MACOS_PASS env
+    local args=(
+        "$LAUNCHAGENT_BINARY"
+    )
+    [[ "$SIP_DISABLED" -eq 1 ]] && args+=("$REPO_DIR/server.py")
+    args+=(
+        --listen "$LISTEN"
+        --port "$PORT"
+        --password "$MVS_PASSWORD"
+        --max-fps "$MAX_FPS"
+        --codec "$CODEC"
+    )
+    [[ "$include_vnc" -eq 1 ]] && args+=(--enable-vnc-fallback)
 
-# EnvironmentVariables — MACOS_PASS only when VNC fallback is enabled.
-ENV_BLOCK="        <key>MACOS_USER</key><string>${MACOS_USER}</string>
+    local prog_xml=""
+    for a in "${args[@]}"; do prog_xml+="        <string>${a}</string>
+"; done
+
+    local env_xml="        <key>MACOS_USER</key><string>${MACOS_USER}</string>
         <key>MVS_PASSWORD</key><string>${MVS_PASSWORD}</string>
 "
-if [[ "$WANTS_VNC" -eq 1 && -n "$MACOS_PASS" ]]; then
-    ENV_BLOCK+="        <key>MACOS_PASS</key><string>${MACOS_PASS}</string>
+    if [[ "$include_vnc" -eq 1 && -n "$MACOS_PASS" ]]; then
+        env_xml+="        <key>MACOS_PASS</key><string>${MACOS_PASS}</string>
 "
-fi
+    fi
 
-# ── Step 8: Write LaunchAgent plist ───────────────────────────────────────────
-step "Installing LaunchAgent: $PLIST_PATH"
-mkdir -p "$HOME/Library/LaunchAgents"
-PLIST_TMP="$(mktemp /tmp/mvs_plist_XXXXXX.plist)"
-cat > "$PLIST_TMP" <<PLIST
+    mkdir -p "$HOME/Library/LaunchAgents"
+    local tmp; tmp="$(mktemp /tmp/mvs_plist_XXXXXX.plist)"
+    cat > "$tmp" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -344,10 +386,10 @@ cat > "$PLIST_TMP" <<PLIST
     <string>${LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-${PROG_ARGS_XML}    </array>
+${prog_xml}    </array>
     <key>EnvironmentVariables</key>
     <dict>
-${ENV_BLOCK}    </dict>
+${env_xml}    </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key><string>${LOG_PATH}</string>
@@ -355,16 +397,20 @@ ${ENV_BLOCK}    </dict>
 </dict>
 </plist>
 PLIST
-mv "$PLIST_TMP" "$PLIST_PATH"
-chmod 600 "$PLIST_PATH"
-green "  Plist written (mode 0600)"
-if [[ "$WANTS_VNC" -eq 1 ]]; then
-    yellow "  Plist contains MACOS_PASS for VNC bootstrap (will be removed once SCK is granted)."
+    mv "$tmp" "$PLIST_PATH"
+    chmod 600 "$PLIST_PATH"
+}
+
+# ── Step 8: Write the appropriate plist + (re)load ────────────────────────────
+step "Installing LaunchAgent: $PLIST_PATH"
+write_plist "$BOOTSTRAP_MODE"
+if [[ "$BOOTSTRAP_MODE" -eq 1 ]]; then
+    yellow "  Plist: BOOTSTRAP mode — temporarily includes --enable-vnc-fallback"
+    yellow "  and MACOS_PASS env. Both are removed after you grant permissions."
 else
-    green "  Plist contains no credentials"
+    green "  Plist: production mode — no VNC flag, no stored password"
 fi
 
-# ── Step 9: (Re)load the LaunchAgent ──────────────────────────────────────────
 step "Starting mac-vnc-stream service"
 launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
 sleep 1
@@ -385,6 +431,63 @@ while [[ $WAITED -lt 15 ]]; do
     sleep 1; WAITED=$((WAITED + 1)); echo -n "."
 done
 [[ $WAITED -ge 15 ]] && yellow "  Server slow to start — check $LOG_PATH"
+
+# ── Step 9b: Bootstrap → production transition (interactive only) ────────────
+# When we just rebuilt the bundle AND VNC is acting as the bootstrap path,
+# pause here so the user can grant permissions to the new bundle (CDHash
+# changed → grants invalidated even if previously granted). Once they
+# confirm, rewrite the plist as production (no VNC flag, no MACOS_PASS env)
+# and kickstart-restart. Production restarts thereafter never expose the
+# password.
+#
+# Headless mode: skip the interactive wait. The user re-runs setup.sh when
+# they're ready to transition (or the bootstrap state runs indefinitely
+# until they do — VNC stays available).
+if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 ]]; then
+    MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
+    URL="http://localhost:${PORT}/?token=${MVS_PASSWORD}"
+    if [[ "$LISTEN" == "127.0.0.1" ]]; then
+        TUNNEL_HINT="  ssh -L ${PORT}:127.0.0.1:${PORT} ${MACOS_USER}@${MAC_IP}"
+    else
+        TUNNEL_HINT=""
+    fi
+    echo
+    yellow "  ┌─ BOOTSTRAP MODE: GRANT PERMISSIONS THEN PRESS ENTER ──────────────┐"
+    yellow "  │  The bundle is running with VNC fallback so you can view the      │"
+    yellow "  │  desktop while you grant TCC permissions to the (new-CDHash)      │"
+    yellow "  │  bundle. Open the URL in your browser:                            │"
+    yellow "  │"
+    yellow "  │    $URL"
+    if [[ -n "$TUNNEL_HINT" ]]; then
+        yellow "  │  Via SSH tunnel:"
+        yellow "  │$TUNNEL_HINT"
+    fi
+    yellow "  │"
+    yellow "  │  In System Settings ▸ Privacy & Security:"
+    yellow "  │    • Screen Recording → toggle ON for 'mac-vnc-stream'"
+    yellow "  │    • Accessibility    → toggle ON for 'mac-vnc-stream'"
+    yellow "  │"
+    yellow "  │  When done, press Enter to switch to production mode:"
+    yellow "  │    • drops --enable-vnc-fallback from the plist"
+    yellow "  │    • removes MACOS_PASS from the plist env"
+    yellow "  │    • restarts the bundle in pure --api-only (SCK + CGEvent)"
+    yellow "  └────────────────────────────────────────────────────────────────────┘"
+    echo
+    read -rp "  Press Enter when permissions are granted (or Ctrl+C to leave in bootstrap mode): " _
+
+    step "Switching to production mode"
+    write_plist 0   # production: no --enable-vnc-fallback, no MACOS_PASS env
+    green "  Plist rewritten — credentials removed"
+    launchctl kickstart -k "gui/$(id -u)/${LABEL}" 2>&1 || true
+    sleep 4
+    if grep -E "capture=SCK|InProcessSCK: stream active" "$LOG_PATH" 2>/dev/null | tail -1 | grep -q "."; then
+        green "  Production mode active — SCK capture confirmed"
+    else
+        yellow "  Switched to production plist; SCK status unconfirmed in log."
+        yellow "  Check $LOG_PATH — if it still says 'no displays' you may need"
+        yellow "  to re-run setup.sh with VNC fallback to keep the display alive."
+    fi
+fi
 
 # ── Step 10: TCC state check + final banner ───────────────────────────────────
 step "Connection info"
