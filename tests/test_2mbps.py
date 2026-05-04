@@ -178,10 +178,28 @@ async def main():
     # equilibrium. Using whole-window avg pulls in the controller's AIMD
     # ramp from the dip after the first drain event, which masks whether
     # it eventually saturated.
+    #
+    # Bandwidth-bar exemption: when CPU is saturated or runner-capped, the
+    # source can't produce frames fast enough to fill the link. Bandwidth
+    # is bytes-per-frame × frames-per-second, so a CPU-bound runner has
+    # both lower fps AND lower link usage simultaneously. We already exempt
+    # the fps bar in that case; same exemption applies here for the same
+    # reason. Without this, GH macos-latest runs flake whenever
+    # WindowServer happens to peak high (~90%) under the saturation animation.
     if MIN_MBPS > 0 and tail_mbps < MIN_MBPS:
-        failures.append(f"tail link {tail_mbps:.2f}Mbps < {MIN_MBPS}Mbps minimum "
-                        f"(controller didn't reach equilibrium near link cap; "
-                        f"whole-window avg was {avg_mbps:.2f}Mbps)")
+        if cpu.saturated:
+            print(f"  NOTE: tail link {tail_mbps:.2f}Mbps < {MIN_MBPS} but CPU "
+                  f"saturated ({cpu.summary()}) — runner couldn't generate enough "
+                  "frames to fill the link. Bandwidth bar exempted.")
+        elif cpu.runner_capped:
+            print(f"  NOTE: tail link {tail_mbps:.2f}Mbps < {MIN_MBPS} but CPU "
+                  f"runner-capped ({cpu.summary()}) — runner SCK/compositor "
+                  "couldn't keep up. Bandwidth bar exempted.")
+        else:
+            failures.append(f"tail link {tail_mbps:.2f}Mbps < {MIN_MBPS}Mbps minimum "
+                            f"(controller didn't reach equilibrium near link cap; "
+                            f"whole-window avg was {avg_mbps:.2f}Mbps; "
+                            f"CPU: {cpu.summary()})")
 
     if failures:
         print(f"\nFAIL:")
