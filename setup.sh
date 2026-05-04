@@ -1566,13 +1566,29 @@ if [[ "$ACTUAL_MODE" == "sck" ]]; then
     green "  Bundle id: ${LABEL} — TCC has honored your grants. Production path."
 elif [[ "$ACTUAL_MODE" == "vnc" ]]; then
     yellow "  Mode: VNC fallback — for granting permissions only."
-    yellow "  Once you grant Screen Recording + Accessibility (instructions"
-    yellow "  below), the bundle auto-upgrades to SCK 60fps within ~30s."
     yellow "  The current VNC bridge runs slowly (often feels like ~5fps —"
     yellow "  macOS's screensharingd is the bottleneck, not our code). It's"
     yellow "  fine for the one-time grant ceremony, NOT the daily-use"
-    yellow "  experience this project ships. Grant the permissions and the"
-    yellow "  upgrade to 60fps SCK happens automatically."
+    yellow "  experience this project ships."
+    if [[ "${FOREGROUND_MODE:-0}" -eq 1 ]]; then
+        # Foreground bundle was spawned with --vnc-only (no auto-upgrade
+        # path; SCK is disabled at the flag level). User MUST re-run
+        # setup.sh after granting to switch into LaunchAgent + auto mode.
+        yellow "  Path to 60fps SCK on this install (foreground bundle):"
+        yellow "    1. Grant Screen Recording + Accessibility in Settings (browser)"
+        yellow "    2. Re-run install.sh / setup.sh — it'll attempt the LaunchAgent"
+        yellow "       install with --enable-vnc-fallback (auto mode), and once"
+        yellow "       SCK can capture the bundle upgrades to 60fps."
+        yellow "  This foreground process does NOT auto-upgrade — it's pinned to"
+        yellow "  --vnc-only because spawning the SCK keepalive subprocess from"
+        yellow "  outside an Aqua session triggers macOS launch-failure dialogs."
+    else
+        # LaunchAgent path — bundle is in capture=auto mode, will
+        # auto-upgrade to SCK as soon as Screen Recording is granted.
+        yellow "  Once you grant Screen Recording + Accessibility (instructions"
+        yellow "  below), the bundle auto-upgrades to SCK 60fps within ~30s. No"
+        yellow "  restart needed — the running server polls for the grant."
+    fi
 else
     yellow "  Mode: signed bundle starting up — log doesn't show a capture"
     yellow "  mode yet. Run 'tail -f $LOG_PATH' to watch progress."
