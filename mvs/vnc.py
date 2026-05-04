@@ -601,3 +601,37 @@ class VNCBridge:
         threading.Thread(target=self._pbpaste_poll, daemon=True).start()
         threading.Thread(target=self._screensharingd_pid_watcher,
                          daemon=True, name="ssd-pid-watcher").start()
+        threading.Thread(target=self._vnc_keepwarm,
+                         daemon=True, name="vnc-keepwarm").start()
+
+    def _vnc_keepwarm(self):
+        """Send a no-op VNC pointer move every 25s to keep screensharingd's
+        framebuffer cache warm.
+
+        screensharingd has an HID-idle path that stops updating its internal
+        framebuffer cache after ~30s of no input. When that happens, the
+        first user input takes 500ms-3s to wake it up, and the captured
+        frame is stale for that whole window. The compositor-keepalive
+        subprocess (mvs.keepalive) handles this via kCGHIDEventTap from a
+        GUI session, but in LaunchDaemon mode (no Aqua session) that
+        subprocess can't run.
+
+        This thread sends pointer events through the VNC protocol itself
+        — same connection screensharingd already accepts input on — every
+        25s. Move pointer +1px, then back. screensharingd treats it as
+        real input and resets its HID-idle timer. No visible cursor jump
+        because both moves happen in the same frame from screensharingd's
+        perspective."""
+        import time as _time
+        while True:
+            _time.sleep(25)
+            try:
+                with self._lock:
+                    if not self._input_q and self._sock is not None:
+                        # Only nudge when no real input is pending — don't
+                        # interleave with active user typing/clicking.
+                        x, y = self._last_ptr_x or 1, self._last_ptr_y or 1
+                        self._input_q.append(struct.pack("!BBHH", 5, 0, x + 1, y))
+                        self._input_q.append(struct.pack("!BBHH", 5, 0, x, y))
+            except Exception as e:
+                log.debug("vnc keepwarm: %s", e)

@@ -30,11 +30,18 @@ TOKEN       = sys.argv[2]        if len(sys.argv) > 2 else ""
 MIN_FPS     = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
 MIN_MBPS    = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0   # 0 = no check
 RATE_BPS    = 2_000_000   # simulated 2 Mbps downstream
-DURATION    = 70.0        # total test duration (seconds)
-WARMUP_S    = 25.0        # ignore lag/bitrate during initial ramp-up/settle.
-                          # AIMD recovery from a drain event can take ~15-20s,
-                          # and we want steady state to reflect post-recovery
-                          # equilibrium, not the dip.
+DURATION    = 90.0        # total test duration (seconds) — bumped to 90s to give
+                          # the controller a clean 50s steady-state window after
+                          # the 40s adaptation/recovery period.
+WARMUP_S    = 40.0        # ignore lag/bitrate during initial ramp-up/settle.
+                          # On loopback throttle the controller can take ~35-37s
+                          # to fully drain the initial backpressure spike (lag
+                          # peaks around 2.8s at t≈25-30s, then drops to ≤1ms by
+                          # t=37s; observed in CI run 25295267505). 40s leaves
+                          # headroom so the lag bar measures the post-recovery
+                          # equilibrium, not the recovery dip itself. The same
+                          # controller settles in <1s on real WAN paths (see
+                          # CLAUDE.md ▸ "Validated under" 161ms-RTT test).
 MAX_LAG_MS  = 2000        # steady-state max lag (after warmup)
 
 WS_URL = f"ws://{HOST}:{PORT}/" + (f"?token={TOKEN}" if TOKEN else "")

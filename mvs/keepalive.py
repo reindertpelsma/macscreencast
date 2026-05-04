@@ -154,6 +154,22 @@ def _request_screen_capture_access():
                 "Screen Recording, enable Python (com.apple.python3), then the server will "
                 "automatically switch to 60fps within ~30 seconds."
             )
+            # Belt-and-suspenders: open the Privacy → Screen Recording pane via
+            # `open`. The CGRequestScreenCaptureAccess() in-process dialog needs
+            # an active GUI session to render — it silently no-ops in
+            # LaunchDaemon / non-Aqua contexts, which is exactly the cloud-Mac
+            # case where this matters most. `open` triggers a UI process via
+            # launchd; the pane appears on the Mac's display and is visible to
+            # whoever's connected via VNC. Same approach the Accessibility
+            # request uses below — Screen Recording was missing it.
+            try:
+                import subprocess
+                subprocess.Popen([
+                    "open",
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+                ])
+            except Exception:
+                pass
         return bool(result)
     except Exception as e:
         log.debug("screen capture access request: %s", e)
