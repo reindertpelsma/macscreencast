@@ -155,19 +155,29 @@ def _request_screen_capture_access():
                 "automatically switch to 60fps within ~30 seconds."
             )
             # Belt-and-suspenders: open the Privacy → Screen Recording pane via
-            # `open`. The CGRequestScreenCaptureAccess() in-process dialog needs
+            # `open`. CGRequestScreenCaptureAccess()'s in-process dialog needs
             # an active GUI session to render — it silently no-ops in
             # LaunchDaemon / non-Aqua contexts, which is exactly the cloud-Mac
             # case where this matters most. `open` triggers a UI process via
             # launchd; the pane appears on the Mac's display and is visible to
-            # whoever's connected via VNC. Same approach the Accessibility
-            # request uses below — Screen Recording was missing it.
+            # whoever's connected via VNC.
+            #
+            # The URL anchor changed across macOS releases:
+            #   - macOS 12-14: Privacy_ScreenCapture
+            #   - macOS 15-26: Privacy_ScreenCapture *or* Privacy_ScreenRecording
+            #     depending on minor version
+            # Try both anchors, then fall back to the top-level Privacy &
+            # Security pane (no anchor) — that works on every macOS version
+            # but requires the user to scroll to find Screen Recording.
             try:
                 import subprocess
-                subprocess.Popen([
-                    "open",
-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
-                ])
+                for anchor in ("Privacy_ScreenCapture",
+                               "Privacy_ScreenRecording",
+                               ""):  # final fallback: pane root, no anchor
+                    url = "x-apple.systempreferences:com.apple.preference.security"
+                    if anchor:
+                        url += "?" + anchor
+                    subprocess.Popen(["open", url])
             except Exception:
                 pass
         return bool(result)
