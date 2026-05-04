@@ -306,20 +306,48 @@ async def client_session(ws, cfg, bridge):
                             if (mac_rev is not None
                                     and mac_rev != bridge.server_clipboard_seq):
                                 continue  # client's view of Mac clipboard is stale — ignore
-                        if text:
-                            # pbcopy is more reliable than VNC ClientCutText on macOS 15+
-                            # (ClientCutText may be silently ignored by screensharingd)
-                            try:
-                                proc = await asyncio.create_subprocess_exec(
-                                    'pbcopy', stdin=asyncio.subprocess.PIPE)
-                                proc.stdin.write(text.encode('utf-8', errors='replace'))
-                                proc.stdin.close()
-                                await asyncio.wait_for(proc.wait(), timeout=2.0)
-                            except Exception:
-                                bridge.send_clipboard(text)  # fallback
-                        if t == "paste" and text:
-                            # Release any held modifiers, then send Cmd+V
-                            if _cge._cg_kb_ok:
+                        if t == "paste" and text and not _cge._cg_kb_ok:
+                            # VNC-only mode: pbcopy needs a user-context pasteboard
+                            # server (often unavailable from a LaunchDaemon), and VNC
+                            # ClientCutText is silently dropped by screensharingd on
+                            # macOS 15+. The reliable path that works regardless of
+                            # daemon context is to TYPE the text — character by
+                            # character via VNC keysyms. Slower (~5ms/char) but
+                            # deterministic. The "Paste on Mac" dock button is the
+                            # only path that hits this; native Cmd+V keystrokes are
+                            # forwarded as keystrokes (they paste the remote Mac's
+                            # current clipboard, same as a native Cmd+V).
+                            for ch in text:
+                                if ch == '\n':
+                                    ks = 0xFF0D  # XK_Return
+                                elif ch == '\t':
+                                    ks = 0xFF09  # XK_Tab
+                                elif ch == '\r':
+                                    continue    # ignore CR in CRLF; LF handled above
+                                elif ord(ch) < 0x80:
+                                    ks = ord(ch)  # ASCII keysym = ASCII codepoint
+                                else:
+                                    # Non-ASCII Unicode: VNC has X11 keysym mappings
+                                    # for these but the table is large; skip for now
+                                    # (covers shell commands and code, the typical
+                                    # bootstrap paste use case).
+                                    continue
+                                bridge.send_key(True, ks)
+                                bridge.send_key(False, ks)
+                                await asyncio.sleep(0.005)  # screensharingd queue safety
+                        else:
+                            # SCK / CGEvent path: pbcopy + Cmd+V — the proper
+                            # newer-API behaviour.
+                            if text:
+                                try:
+                                    proc = await asyncio.create_subprocess_exec(
+                                        'pbcopy', stdin=asyncio.subprocess.PIPE)
+                                    proc.stdin.write(text.encode('utf-8', errors='replace'))
+                                    proc.stdin.close()
+                                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                                except Exception:
+                                    bridge.send_clipboard(text)  # fallback
+                            if t == "paste" and text and _cge._cg_kb_ok:
                                 try:
                                     import Quartz as _Q
                                     _cge._cg_mod_held.clear()
@@ -334,16 +362,6 @@ async def client_session(ws, cfg, bridge):
                                         _Q.CGEventPost(_Q.kCGHIDEventTap, _e2)
                                 except Exception:
                                     pass
-                            else:
-                                for ks in [KEYSYM["ShiftLeft"], KEYSYM["ShiftRight"],
-                                           KEYSYM["Control"], KEYSYM["ControlRight"],
-                                           KEYSYM["Alt"], KEYSYM["AltRight"],
-                                           KEYSYM["MetaLeft"], KEYSYM["MetaRight"]]:
-                                    bridge.send_key(False, ks)
-                                bridge.send_key(True,  KEYSYM["MetaLeft"])
-                                bridge.send_key(True,  0x76)
-                                bridge.send_key(False, 0x76)
-                                bridge.send_key(False, KEYSYM["MetaLeft"])
                     elif t == "dbg_result":
                         log.info("DBG[%s]: %s", ev.get("id","?"), ev.get("result",""))
                 except Exception:

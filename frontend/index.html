@@ -1007,13 +1007,14 @@ ki.addEventListener('keydown',async e=>{
     e.preventDefault(); // prevent browser Ctrl+key shortcuts (zoom, find, etc.)
     return;
   }
-  // Ctrl+V / Cmd+V: let the browser fire a native paste event on ki (no permission needed).
-  // document paste listener captures e.clipboardData and sends {t:"paste"} to Mac.
-  // Crucially: do NOT call e.preventDefault() here — that would block the paste event.
-  if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){
-    _suppressedKd.add(e.code); // suppress matching keyup
-    return; // don't send V to VNC; paste event handles the rest
-  }
+  // Cmd+V / Ctrl+V used to be intercepted here so the browser's native paste
+  // event would fire and we'd forward e.clipboardData as {t:"paste"}. That
+  // entangled "paste this browser text" with "fire the Cmd+V shortcut on the
+  // remote" — the same browser key produced two server behaviors depending on
+  // capture mode. Now Cmd+V is just a forwarded keystroke (server posts native
+  // Cmd+V which pastes whatever's currently in the remote Mac's clipboard,
+  // same as a real Mac keypress would). Use the dock "Paste on Mac" button
+  // when you specifically want to push browser-side text into the remote.
   // Cmd+C / Ctrl+C: forward to Mac (so the remote app copies its selection
   // into the Mac clipboard) AND let the native copy event fire on ki so
   // the document copy listener can populate Safari's local clipboard with
@@ -1039,20 +1040,18 @@ ki.addEventListener('keyup',e=>{
   // Suppress keyup for any key whose keydown was intercepted (e.g. V after Ctrl+V paste).
   // Must check e.code (physical key) not key, because modifier state may have changed.
   if(_suppressedKd.has(e.code)){_suppressedKd.delete(e.code);e.preventDefault();_syncMods(e);return;}
-  // Belt-and-suspenders: also suppress if modifier still held (catches cases where
-  // the keydown wasn't tracked but modifier is clearly still active).
-  if((e.ctrlKey||e.metaKey)&&key.toLowerCase()==='v'){e.preventDefault();_syncMods(e);return;}
+  // (No V-suppression anymore — Cmd+V is now a transparent keystroke; see
+  //  the matching note in the keydown handler above.)
   send({t:'ku',k:key,code:code});
   e.preventDefault();
   _syncMods(e);
 });
 
-// Document-level paste fallback (when dock or other UI has focus)
-document.addEventListener('paste',e=>{
-  if(document.activeElement===clipTA)return; // let user paste into clipboard textarea
-  const text=(e.clipboardData||window.clipboardData||{}).getData('text/plain');
-  if(text&&wsOpen){sendPasteText(text);e.preventDefault();}
-});
+// (Document-level paste handler removed: Cmd+V is now a transparent keystroke
+//  that pastes the remote Mac's current clipboard, the same as a native
+//  Cmd+V press would. To push browser-side text into the remote — including
+//  in VNC bootstrap mode where the system clipboard isn't bridged — use the
+//  dock's "Paste on Mac" button.)
 
 // Refocus hidden textarea on canvas click and window focus so keyboard events route correctly.
 // On window focus: if clipboard is synced, immediately push browser clipboard to Mac so the
