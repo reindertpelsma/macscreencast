@@ -89,48 +89,48 @@ def parse_args():
     # with TCC, which is exactly what we want as a side effect — first-run
     # registration so the bundle id appears in System Settings.
     if args.tcc_check:
-        import sys as _sys, ctypes as _ct
+        import sys as _sys, ctypes as _ct, time as _time, threading as _th
         try:
-            cg = _ct.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
             ax = _ct.cdll.LoadLibrary(
                 "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
             ax.AXIsProcessTrusted.restype = _ct.c_bool
 
-            # Screen Recording: use CGWindowListCreateImage as a real probe
-            # rather than CGPreflightScreenCaptureAccess. CGPreflight is
-            # known to return True optimistically even when TCC actually
-            # denies — observed on GH macos-latest runners reporting
-            # screen_recording=1 with NO grants in TCC.db, leading
-            # setup.sh to skip VNC bootstrap and the server to immediately
-            # hit SCStreamErrorDomain -3801 ("user declined TCCs").
-            # CGWindowListCreateImage uses the same kernel ScreenRecording
-            # gate that SCK uses, so its result agrees with runtime SCK:
-            # non-NULL CGImageRef = TCC granted + capturable display
-            # available; NULL = either TCC denied OR no display backend.
-            # For our use case both failure modes are equivalent ("SCK
-            # won't work, fall back to VNC bootstrap"), so a single bool
-            # is the right signal.
-            class _CGPoint(_ct.Structure):
-                _fields_ = [("x", _ct.c_double), ("y", _ct.c_double)]
-            class _CGSize(_ct.Structure):
-                _fields_ = [("width", _ct.c_double), ("height", _ct.c_double)]
-            class _CGRect(_ct.Structure):
-                _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
-            cg.CGWindowListCreateImage.restype = _ct.c_void_p
-            cg.CGWindowListCreateImage.argtypes = [
-                _CGRect, _ct.c_uint32, _ct.c_uint32, _ct.c_uint32]
-            rect = _CGRect()
-            rect.origin.x = 0.0; rect.origin.y = 0.0
-            rect.size.width = 1.0; rect.size.height = 1.0
-            # kCGWindowListOptionOnScreenOnly=1, kCGNullWindowID=0,
-            # kCGWindowImageDefault=0
-            img = cg.CGWindowListCreateImage(rect, 1, 0, 0)
-            sr_ok = bool(img)
-            if sr_ok:
-                cf = _ct.CDLL(
-                    "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
-                cf.CFRelease.argtypes = [_ct.c_void_p]
-                cf.CFRelease(img)
+            # Screen Recording: probe via SCShareableContent — the SAME kernel
+            # TCC path that SCK uses at runtime. We previously tried
+            # CGPreflightScreenCaptureAccess and CGWindowListCreateImage; both
+            # walk the responsible-app chain, so on GH macos-latest runners
+            # they return True (because /bin/bash itself has Screen Recording
+            # auth_value=2 in TCC.db) even though our bundle's row has
+            # auth_value=0 (denied). SCK's kernel check ignores parent
+            # inheritance and looks ONLY at our bundle's row → -3801. The
+            # only probe whose result matches runtime SCK is SCShareableContent.
+            import objc as _objc
+            from Foundation import NSRunLoop, NSDate, NSDefaultRunLoopMode
+            SCK = _objc.loadBundle(
+                "ScreenCaptureKit",
+                globals(),
+                bundle_path=_objc.pathForFramework(
+                    "/System/Library/Frameworks/ScreenCaptureKit.framework"))
+
+            _ev = _th.Event()
+            _err = [None]
+            _content = [None]
+            def _cb(content, err):
+                _content[0] = content
+                _err[0] = err
+                _ev.set()
+            try:
+                SCShareableContent.getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+                    False, True, _cb)
+            except (NameError, AttributeError):
+                SCShareableContent.getExcludingDesktopWindows_onScreenWindowsOnly_completionHandler_(
+                    False, True, _cb)
+            t0 = _time.time()
+            while not _ev.is_set() and _time.time() - t0 < 5.0:
+                NSRunLoop.mainRunLoop().runMode_beforeDate_(
+                    NSDefaultRunLoopMode,
+                    NSDate.dateWithTimeIntervalSinceNow_(0.1))
+            sr_ok = (_ev.is_set() and _err[0] is None and _content[0] is not None)
 
             ax_ok = bool(ax.AXIsProcessTrusted())
             print("screen_recording=" + ("1" if sr_ok else "0"))
