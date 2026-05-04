@@ -760,11 +760,17 @@ if [[ "$TCC_GRANTED" -eq 0 ]] \
    && { [[ "$RUNNING_FROM_SSH" -eq 1 ]] || [[ "$DISPLAY_ATTACHED" -eq 0 ]]; }; then
     NEEDS_VNC_FOR_GRANT=1
 fi
-# NEEDS_VNC_AS_DISPLAY_WARMER — only matters when SCK has no real display
-# backend. A physical display (or HDMI dongle) gives SCK its own backend;
-# headless cloud Macs without a dongle need the VNC connection to keep
-# screensharingd's virtual display rendered.
-if [[ "$DISPLAY_ATTACHED" -eq 0 ]]; then
+# NEEDS_VNC_AS_DISPLAY_WARMER — keeps an active VNC client connection to
+# screensharingd so its virtual display backend stays awake. Fires when
+# the user is remote (SSH'd in OR no display attached): even a Mac with a
+# real-looking display attached often has it asleep when no one's at the
+# keyboard, and a sleeping display means SCK captures stale frames =
+# frozen browser. Verified live: Scaleway with AOC display attached, after
+# bootstrap → production transition without VNC bridge, browser froze.
+# Scaleway's display had `Display Asleep: Yes` in system_profiler.
+# Same OR as NEEDS_VNC_FOR_GRANT — "remote user can't see screen locally"
+# is the meaningful signal, not "is display hardware attached".
+if [[ "$RUNNING_FROM_SSH" -eq 1 ]] || [[ "$DISPLAY_ATTACHED" -eq 0 ]]; then
     NEEDS_VNC_AS_DISPLAY_WARMER=1
 fi
 VNC_FALLBACK=0
@@ -1171,11 +1177,26 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 && "$NO_BOOTSTRAP_WAIT" -eq 0
     step "Switching to production mode"
     # Post-grant production plist:
     #  • include_vnc_flag: keep --enable-vnc-fallback if NEEDS_VNC_AS_DISPLAY_WARMER
-    #    (headless host still needs VNC connection to keep screensharingd's
-    #    virtual display rendered). Drop it on hosts with a physical display.
-    #  • include_password: 0 unconditionally (production never stores password).
-    write_plist "$NEEDS_VNC_AS_DISPLAY_WARMER" 0
-    green "  Plist rewritten — credentials removed"
+    #    (remote/headless host still needs VNC connection to keep
+    #    screensharingd's virtual display awake — a sleeping display means
+    #    SCK captures stale frames, browser shows frozen image).
+    #  • include_password: same as include_vnc_flag. The bundle's VNC bridge
+    #    requires MACOS_PASS to authenticate to screensharingd; without it,
+    #    --enable-vnc-fallback is set but VNC connection fails — bundle
+    #    crash-loops on auth error. So password MUST persist whenever
+    #    --enable-vnc-fallback persists. The security trade-off:
+    #      • Personal Mac (DISPLAY=1, !SSH): include_vnc=0, password=0 — clean.
+    #      • Remote/headless: include_vnc=1, password=1 — password persists in
+    #        plist (mode 600, user-owned) for the lifetime of the install.
+    #    Acceptable because the user is the only one with file access on
+    #    a single-user Mac, and the alternative (frozen screen) is broken.
+    write_plist "$NEEDS_VNC_AS_DISPLAY_WARMER" "$NEEDS_VNC_AS_DISPLAY_WARMER"
+    if [[ "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 ]]; then
+        yellow "  Plist rewritten — keeping --enable-vnc-fallback + MACOS_PASS for"
+        yellow "  display warming (you're remote / no local display visibility)."
+    else
+        green "  Plist rewritten — credentials removed (local display, no VNC needed)"
+    fi
     # bootout + bootstrap (NOT kickstart -k). kickstart -k just SIGTERMs the
     # process; KeepAlive then restarts it with the CACHED service definition,
     # so the previous --enable-vnc-fallback flag and MACOS_PASS env survive
