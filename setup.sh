@@ -51,6 +51,7 @@ REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NO_LAUNCHAGENT=0
 BUILD_FROM_SOURCE=0
+ASSUME_TCC=""    # "granted" | "denied" | "" (probe normally)
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)        PORT="$2"; shift 2 ;;
@@ -62,6 +63,8 @@ while [[ $# -gt 0 ]]; do
         --headless)    HEADLESS=1; shift ;;
         --no-launchagent) NO_LAUNCHAGENT=1; shift ;;
         --build-from-source) BUILD_FROM_SOURCE=1; shift ;;
+        --assume-tcc-granted) ASSUME_TCC="granted"; shift ;;
+        --no-tcc-probe|--assume-tcc-not-granted) ASSUME_TCC="denied"; shift ;;
         -h|--help)
             cat <<HELP
 setup.sh — install mac-vnc-stream from this git checkout.
@@ -77,8 +80,24 @@ setup.sh — install mac-vnc-stream from this git checkout.
   --no-launchagent   skip the LaunchAgent install — build bundle and write
                      the plist template, but don't bootstrap. Useful for audit
                      /preview, or when you'll launch the bundle manually.
+  --assume-tcc-granted    skip the keep-path TCC probe; assume bundle has
+                          valid TCC grants. Use when grants are known-warm
+                          (e.g. just granted, re-running setup.sh shortly
+                          after).
+  --no-tcc-probe          skip the keep-path TCC probe; assume bundle does
+                          NOT have valid grants. Forces VNC bootstrap path.
+                          Safe default for headless / scripted use.
+                          (Alias: --assume-tcc-not-granted)
 
 Reads MVS_HEADLESS, MACOS_PASS, MVS_PASSWORD from env if unset.
+
+TCC probe policy: --tcc-check is ONLY run on the keep path (existing
+bundle whose grants might still be valid). After a rebuild the CDHash is
+new → any prior grants are invalidated by csreq mismatch → no point
+probing. setup.sh assumes "not granted" and offers VNC bootstrap. The
+probe is also skipped on hosts where parent-shell inheritance fools it
+(e.g. GitHub macos runners pre-grant /bin/bash); use the override flags
+above to bypass.
 
 Privileged-action policy: before every sudo command setup.sh announces what
 it's about to do (e.g. "Installing bundle to /Applications/ — requires sudo").
@@ -339,33 +358,52 @@ if [[ -d "$APP_DEST" ]]; then
     if [[ "$REBUILD_NEEDED" -eq 0 ]]; then
         APP_BUILT="$APP_DEST"
         LAUNCHAGENT_BINARY="$APP_DEST/Contents/MacOS/mac-vnc-stream"
-        # Probe TCC via the bundle's --tcc-check.
-        #   exit 0 + screen_recording=1 + accessibility=1 → grants valid
-        #   exit 1 + screen_recording=0/1 + accessibility=0/1 → stale/missing
-        #   exit 2+ OR no 'screen_recording=' marker → bundle predates the
-        #     --tcc-check flag (built before commit 702d4ca). Can't verify;
-        #     trust the user's "keep" decision and skip the reset+bootstrap
-        #     dance — otherwise we'd nuke their working grants.
-        _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
-        if echo "$_tcc_out" | grep -qE "screen_recording="; then
-            if echo "$_tcc_out" | grep -q "screen_recording=1" \
-                    && echo "$_tcc_out" | grep -q "accessibility=1"; then
+        # TCC probe (keep-path only — rebuild path leaves TCC_GRANTED=0
+        # because new CDHash invalidates any prior grants by csreq
+        # mismatch, no point probing). Override with --assume-tcc-granted
+        # or --no-tcc-probe when the probe is unreliable on this host.
+        case "$ASSUME_TCC" in
+            granted)
                 TCC_GRANTED=1
-                green "  Existing bundle has valid TCC grants — straight to production mode"
-            else
-                yellow "  Existing bundle is missing or has stale TCC grants"
-                NEEDS_TCC_RESET=1   # stale-CDHash-on-keep → reset before re-grant
-            fi
-        else
-            yellow "  Existing bundle predates --tcc-check (built before that flag was added)."
-            yellow "  Cannot verify TCC state via probe; assuming grants are valid as-is."
-            yellow "  If the server doesn't work, re-run setup.sh and choose [r]ebuild."
-            TCC_GRANTED=1   # optimistic — user chose keep, trust them
-        fi
-        unset _tcc_out
+                green "  --assume-tcc-granted → skipping probe, treating grants as valid"
+                ;;
+            denied)
+                TCC_GRANTED=0
+                NEEDS_TCC_RESET=1
+                yellow "  --no-tcc-probe → skipping probe, treating grants as missing"
+                ;;
+            *)
+                # Probe via the bundle's --tcc-check:
+                #   exit 0 + screen_recording=1 + accessibility=1 → grants valid
+                #   exit 1 + screen_recording=0/1 + accessibility=0/1 → stale/missing
+                #   exit 2+ OR no 'screen_recording=' marker → bundle predates
+                #     the --tcc-check flag (built before commit 702d4ca). Can't
+                #     verify; trust the user's "keep" decision and skip the
+                #     reset+bootstrap dance — otherwise we'd nuke working grants.
+                _tcc_out="$("$LAUNCHAGENT_BINARY" --tcc-check 2>&1 || true)"
+                if echo "$_tcc_out" | grep -qE "screen_recording="; then
+                    if echo "$_tcc_out" | grep -q "screen_recording=1" \
+                            && echo "$_tcc_out" | grep -q "accessibility=1"; then
+                        TCC_GRANTED=1
+                        green "  Existing bundle has valid TCC grants — straight to production mode"
+                    else
+                        yellow "  Existing bundle is missing or has stale TCC grants"
+                        NEEDS_TCC_RESET=1   # stale-CDHash-on-keep → reset before re-grant
+                    fi
+                else
+                    yellow "  Existing bundle predates --tcc-check (built before that flag was added)."
+                    yellow "  Cannot verify TCC state via probe; assuming grants are valid as-is."
+                    yellow "  If the server doesn't work, re-run setup.sh and choose [r]ebuild."
+                    TCC_GRANTED=1   # optimistic — user chose keep, trust them
+                fi
+                unset _tcc_out
+                ;;
+        esac
     fi
 else
-    REBUILD_NEEDED=1   # no bundle yet — fresh install
+    REBUILD_NEEDED=1   # no bundle yet — fresh install. TCC_GRANTED stays 0;
+                       # the rebuild path will enforce that and skip the
+                       # final-banner probe — see notes around final banner.
 fi
 
 # ── Step 6: ensure_screensharingd helper (memoized) ──────────────────────────
@@ -443,12 +481,35 @@ ensure_screensharingd() {
     yellow "    l  = start AND lock down :5900 to localhost via pf (recommended"
     yellow "         on cloud Macs without a security group)"
     yellow "    N  = skip"
-    read -rp "  Start screensharingd now? [y/N/l] " _ans
+    # Default-to-Y on hosts where VNC is essential (no display + SSH). On
+    # those hosts, pressing Enter to skip would trap the user in api-only
+    # mode with no way to grant TCC remotely. Default-to-N on other hosts
+    # (personal Mac with display) where the user has alternative paths.
+    local _vnc_essential=0
+    if [[ "$DISPLAY_ATTACHED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
+        _vnc_essential=1
+    fi
+    local _start_prompt
+    if [[ "$_vnc_essential" -eq 1 ]]; then
+        _start_prompt="[Y/n/l]   (default Y on this headless+SSH host)"
+    else
+        _start_prompt="[y/N/l]"
+    fi
+    read -rp "  Start screensharingd now? $_start_prompt " _ans
     case "$_ans" in
         [Ll]*) WANT_PF_LOCKDOWN=1 ;;
         [Yy]*) WANT_PF_LOCKDOWN=0 ;;
-        *)     unset _ans; return 1 ;;
+        [Nn]*) unset _ans _vnc_essential _start_prompt; return 1 ;;
+        "")
+            if [[ "$_vnc_essential" -eq 1 ]]; then
+                WANT_PF_LOCKDOWN=0   # Enter = Y on essential-VNC hosts
+            else
+                unset _ans _vnc_essential _start_prompt; return 1
+            fi
+            ;;
+        *) unset _ans _vnc_essential _start_prompt; return 1 ;;
     esac
+    unset _vnc_essential _start_prompt
     unset _ans
     if [[ -n "$MACOS_PASS" ]]; then
         echo "$MACOS_PASS" | sudo -S launchctl kickstart -k system/com.apple.screensharing 2>&1 | head -2
@@ -854,11 +915,13 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 ]]; then
         if ! echo "$_tcc_out" | grep -qE "screen_recording="; then
             yellow "  --tcc-check unsupported by this bundle — accepting your Enter as confirmation."
             green "  Switching to production mode."
+            TCC_GRANTED=1   # trust user
             break
         fi
         if echo "$_tcc_out" | grep -q "screen_recording=1" \
                 && echo "$_tcc_out" | grep -q "accessibility=1"; then
             green "  Both grants confirmed — switching to production mode."
+            TCC_GRANTED=1
             break
         fi
         _missing=""
@@ -907,14 +970,15 @@ fi
 step "Connection info"
 MAC_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<mac-ip>')"
 
-# Detect if SCK + AX are granted FOR THIS BUNDLE. Use the bundle's own
-# --tcc-check exclusively — running CGPreflight via the host's python3 here
-# would check setup.sh's identity (bash) which doesn't match com.macvncstream.server,
-# so the result would always be False even when the bundle's grants ARE valid.
-TCC_OK=0
-if [[ -n "$APP_BUILT" ]] && "$APP_BUILT/Contents/MacOS/mac-vnc-stream" --tcc-check 2>/dev/null; then
-    TCC_OK=1
-fi
+# Final-banner TCC state: trust TCC_GRANTED (set by either the keep-path
+# probe or the bootstrap-Enter loop). Re-running --tcc-check here would
+# double-jeopardise on hosts where the probe is unreliable (e.g. GH macos
+# runners pre-grant /bin/bash, parent-shell inheritance fools CG/SCSC
+# probes into reporting "granted" even when our bundle's TCC.db row is
+# auth_value=0 — the kernel SCStream call still fails -3801). After a
+# rebuild without bootstrap-Enter, TCC_GRANTED stays 0 and the banner
+# correctly steers the user to the manual-grant path.
+TCC_OK="$TCC_GRANTED"
 
 echo
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
