@@ -596,12 +596,38 @@ ensure_screensharingd() {
     DID_WE_CHECKED_SCREENSHARINGD=1
     # Pre-check decided we DO want screensharingd. Now: is it actually up?
     if nc -z 127.0.0.1 5900 2>/dev/null; then
-        # Already running — common on provisioned cloud Macs (provider
-        # enables screensharingd for their own management). No start prompt
-        # to fold the [y/N/l] choice into; offer the lockdown as a single
-        # one-line prompt with cloud-heuristic default. On personal LAN
-        # Macs default-N so we don't break Apple Screen Sharing.app over LAN.
-        if [[ "$HEADLESS" -eq 0 ]]; then
+        # Already running — common on provisioned cloud Macs.
+        #
+        # Decide whether to ask the lockdown question, or carry over the
+        # user's previous answer. Live state is the source of truth:
+        #   • pf anchor file with our content + rule loaded in pf
+        #     → user previously chose lockdown. Silently keep it.
+        #   • --start-screensharingd=lockdown|yes flag passed
+        #     → respect explicit flag, no prompt.
+        #   • Headless mode → no prompt (defaults).
+        #   • Otherwise → prompt once with cloud-heuristic default.
+        #
+        # State is detected from real pf rules, not a stamp file. This
+        # means user can still toggle on/off externally and we'll respect
+        # the latest state on next run.
+        local _pf_already_locked=0
+        if [[ -n "${MACOS_PASS:-}" ]] && [[ -f "$PF_ANCHOR_PATH" ]]; then
+            if echo "$MACOS_PASS" | sudo -S pfctl -a com.macvncstream -sr 2>/dev/null \
+                    | grep -qE '5900'; then
+                _pf_already_locked=1
+            fi
+        fi
+
+        if [[ "$_pf_already_locked" -eq 1 ]]; then
+            WANT_PF_LOCKDOWN=1   # already there — carry over silently
+            green "  pf rule already locks external :5900 (carry-over from previous run)"
+        elif [[ "$START_SSD_MODE" == "lockdown" ]]; then
+            WANT_PF_LOCKDOWN=1
+            green "  --start-screensharingd=lockdown → enabling pf lockdown"
+        elif [[ "$START_SSD_MODE" == "yes" ]]; then
+            WANT_PF_LOCKDOWN=0
+            green "  --start-screensharingd=yes → no pf lockdown"
+        elif [[ "$HEADLESS" -eq 0 ]]; then
             local _primary_ip _default_y _prompt
             _primary_ip="$(ipconfig getifaddr en0 2>/dev/null \
                           || ipconfig getifaddr en1 2>/dev/null || echo '')"
@@ -626,6 +652,7 @@ ensure_screensharingd() {
             esac
             unset _ans _primary_ip _default_y _prompt
         fi
+        unset _pf_already_locked
         return 0   # SCREENSHARINGD_PRESENT already 1 from pre-check
     fi
     # Port 5900 closed. Screensharingd is installed on this Mac (pre-check
