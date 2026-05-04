@@ -508,6 +508,26 @@ if [[ "$SIP_DISABLED" -eq 0 ]]; then
         fi
         APP_BUILT="$APP_DEST"
         green "  Bundle installed at $APP_DEST (com.macvncstream.server, ad-hoc signed)"
+
+        # CDHash changed → any prior TCC grants are tied to the OLD CDHash and
+        # will be silently denied by tccd even though System Settings shows
+        # "Allowed". Resetting forces a fresh registration on the new bundle's
+        # next SCK / AX call, and the user's grant after that records the
+        # current CDHash. Without this, we end up in the loop the user just
+        # hit: Settings says granted, but every actual SCK call returns -3801.
+        echo
+        yellow "  About to reset stale TCC grants for com.macvncstream.server"
+        yellow "  (CDHash just changed — old grants don't apply to the new bundle):"
+        yellow "    sudo tccutil reset ScreenCapture com.macvncstream.server"
+        yellow "    sudo tccutil reset Accessibility com.macvncstream.server"
+        if [[ -n "$MACOS_PASS" ]]; then
+            echo "$MACOS_PASS" | sudo -S tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1
+            echo "$MACOS_PASS" | sudo -S tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1
+        else
+            sudo tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1
+            sudo tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1
+        fi
+        green "  TCC reset — your next toggle in Settings will record the new CDHash"
     fi
 
     LAUNCHAGENT_BINARY="$APP_BUILT/Contents/MacOS/mac-vnc-stream"
@@ -602,8 +622,15 @@ if [[ "$NO_LAUNCHAGENT" -eq 1 ]]; then
     LOAD_DOMAIN=""
 else
     step "Starting mac-vnc-stream service"
+    # Belt-and-suspenders cleanup: bootout the LaunchAgent if loaded, then
+    # pkill any stray bundle processes (could be from a prior `open -a`,
+    # direct binary launch, or a bootout that didn't fully tear down).
+    # Without this, the new bootstrap can race with a stale process for
+    # port 6081 and fail with EADDRINUSE.
     launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
-    sleep 1
+    pkill -9 -f "/Applications/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
+    pkill -9 -f "${REPO_DIR}/dist/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
+    sleep 2
     if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1; then
         LOAD_DOMAIN="gui/$(id -u)"
         green "  Loaded into ${LOAD_DOMAIN}"
@@ -669,7 +696,15 @@ if [[ "$BOOTSTRAP_MODE" -eq 1 && "$HEADLESS" -eq 0 ]]; then
     step "Switching to production mode"
     write_plist 0   # production: no --enable-vnc-fallback, no MACOS_PASS env
     green "  Plist rewritten — credentials removed"
-    launchctl kickstart -k "gui/$(id -u)/${LABEL}" 2>&1 || true
+    # bootout + bootstrap (NOT kickstart -k). kickstart -k just SIGTERMs the
+    # process; KeepAlive then restarts it with the CACHED service definition,
+    # so the previous --enable-vnc-fallback flag and MACOS_PASS env survive
+    # even though the plist on disk no longer has them. bootout + bootstrap
+    # forces launchd to re-parse the plist from disk.
+    launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
+    pkill -9 -f "/Applications/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
+    sleep 2
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1 | head -2
     sleep 4
     if grep -E "capture=SCK|InProcessSCK: stream active" "$LOG_PATH" 2>/dev/null | tail -1 | grep -q "."; then
         green "  Production mode active — SCK capture confirmed"
