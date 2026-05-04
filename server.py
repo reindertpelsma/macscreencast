@@ -80,6 +80,14 @@ def parse_args():
                         "and exit 0 if both granted, 1 otherwise. Used by setup.sh "
                         "to decide whether the keep-existing-bundle path needs the "
                         "VNC bootstrap fallback (= grants missing).")
+    p.add_argument("--vnc-prime", action="store_true",
+                   help="Brief VNC handshake against 127.0.0.1:5900 with --macos-user "
+                        "and --macos-pass. screensharingd authenticates the user and, "
+                        "as a side effect, creates the gui/$UID Aqua session — needed "
+                        "before launchctl bootstrap gui/$UID can succeed on a Mac with "
+                        "no active console session. Exits cleanly after handshake; does "
+                        "not open ports or start the server. Used by setup.sh on "
+                        "first-install on remote-only Macs (Scaleway pattern).")
 
     args = p.parse_args()
 
@@ -139,6 +147,90 @@ def parse_args():
             _sys.exit(0 if (sr_ok and ax_ok) else 1)
         except Exception as e:
             print("tcc_check_error=" + str(e))
+            _sys.exit(2)
+
+    # --vnc-prime short-circuit. Authenticates against screensharingd's
+    # AppleVNC server using Apple Diffie-Hellman (RFB security type 30).
+    # Side effect: screensharingd creates the gui/$UID Aqua session for the
+    # authenticated user, which is the prerequisite for setup.sh's later
+    # `launchctl bootstrap gui/$UID` to succeed on a Mac with no active
+    # console session (Scaleway / cloud-Mac fresh-install pattern, where
+    # the user has only SSH access — no physical login, no prior VNC
+    # client, so gui/$UID didn't exist yet).
+    #
+    # Exits cleanly after handshake. Does not open ports, does not start
+    # the server, does not change capture/input mode. Pure session-prime.
+    if args.vnc_prime:
+        import sys as _sys, socket as _sock, struct as _st, hashlib as _h, os as _os
+        try:
+            user = args.macos_user
+            pw = args.macos_pass
+            if not user or not pw:
+                print("vnc_prime_error=missing_macos_user_or_macos_pass")
+                _sys.exit(2)
+
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            from cryptography.hazmat.backends import default_backend
+
+            def _recv_all(s, n):
+                buf = b""
+                while len(buf) < n:
+                    c = s.recv(n - len(buf))
+                    if not c:
+                        raise ConnectionError("VNC closed mid-handshake")
+                    buf += c
+                return buf
+
+            s = _sock.create_connection(("127.0.0.1", 5900), timeout=10)
+            s.settimeout(10)
+            _recv_all(s, 12)                      # server protocol version
+            s.send(b"RFB 003.008\n")              # client protocol version
+            n = _recv_all(s, 1)[0]
+            if n == 0:
+                msg_len = _st.unpack("!I", _recv_all(s, 4))[0]
+                reason = _recv_all(s, msg_len).decode("utf-8", "replace")
+                print(f"vnc_prime_error=server_rejected: {reason}")
+                _sys.exit(1)
+            types = list(_recv_all(s, n))
+
+            # Apple DH (type 30) — full-control auth, creates gui/$UID
+            # for the authenticated user. Required on macOS 15+; the
+            # legacy VNC password (type 2) is read-only on modern macOS.
+            if 30 not in types:
+                print(f"vnc_prime_error=apple_dh_unavailable: {types}")
+                _sys.exit(1)
+            s.send(bytes([30]))
+            g = _st.unpack("!H", _recv_all(s, 2))[0]
+            kl = _st.unpack("!H", _recv_all(s, 2))[0]
+            prime = int.from_bytes(_recv_all(s, kl), "big")
+            spub = int.from_bytes(_recv_all(s, kl), "big")
+            cpriv = int.from_bytes(_os.urandom(kl), "big") % (prime - 2) + 1
+            cpub = pow(g, cpriv, prime)
+            shared = pow(spub, cpriv, prime)
+            aes_key = _h.md5(shared.to_bytes(kl, "big")).digest()
+            payload = (user.encode("utf-8")[:64].ljust(64, b"\x00")
+                       + pw.encode("utf-8")[:64].ljust(64, b"\x00"))
+            enc = Cipher(algorithms.AES(aes_key), modes.ECB(),
+                         backend=default_backend()).encryptor()
+            ciphertext = enc.update(payload) + enc.finalize()
+            s.send(ciphertext + cpub.to_bytes(kl, "big"))
+            status = _st.unpack("!I", _recv_all(s, 4))[0]
+            if status != 0:
+                print(f"vnc_prime_error=auth_failed: status={status}")
+                _sys.exit(1)
+            # Auth succeeded. Send ClientInit and briefly receive ServerInit
+            # to ensure screensharingd has fully spawned AppleVNCServer for
+            # this user (the spawn is what creates gui/$UID).
+            s.send(b"\x01")  # shared=1
+            try:
+                _recv_all(s, 4)   # framebuffer width+height (just confirms server is alive)
+            except Exception:
+                pass
+            s.close()
+            print("vnc_prime_ok=apple_dh_auth")
+            _sys.exit(0)
+        except Exception as e:
+            print("vnc_prime_error=" + str(e).replace("\n", " "))
             _sys.exit(2)
 
     # Apply shortcuts.

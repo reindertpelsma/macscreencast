@@ -1171,15 +1171,58 @@ else
     pkill -9 -f "/Applications/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
     pkill -9 -f "${REPO_DIR}/dist/mac-vnc-stream.app/Contents/MacOS/mac-vnc-stream" 2>/dev/null || true
     sleep 2
-    if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1; then
+
+    # Try the bootstrap. If it fails with "Domain does not support specified
+    # action" (rc=125), gui/$UID doesn't exist — this happens on cloud Macs
+    # where the user has only SSH access, no prior physical / VNC login,
+    # and no other LaunchAgent is keeping gui/$UID alive. Fix: do a brief
+    # VNC handshake against screensharingd ourselves; the auth-as-side-effect
+    # creates gui/$UID. Then retry.
+    _bootstrap_out="$(launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1 || true)"
+    _bootstrap_rc=$?
+    if launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
         LOAD_DOMAIN="gui/$(id -u)"
         green "  Loaded into ${LOAD_DOMAIN}"
+    elif echo "$_bootstrap_out" | grep -qiE "Domain does not support|125:"; then
+        # gui/$UID needs to be conjured. We have MACOS_USER + MACOS_PASS
+        # (verified earlier in the password-prompt block). Use the bundle
+        # binary's --vnc-prime mode to do RFB Apple-DH auth against
+        # screensharingd → screensharingd creates gui/$UID for our user.
+        if [[ -n "$MACOS_PASS" ]] && [[ -x "$LAUNCHAGENT_BINARY" ]]; then
+            yellow "  gui/$(id -u) not present — priming via VNC handshake against"
+            yellow "  screensharingd to create the Aqua session..."
+            _prime_out="$( "$LAUNCHAGENT_BINARY" --vnc-prime \
+                --macos-user "$MACOS_USER" --macos-pass "$MACOS_PASS" 2>&1 || true)"
+            if echo "$_prime_out" | grep -q "vnc_prime_ok"; then
+                green "  $(echo "$_prime_out" | grep vnc_prime_ok)"
+                sleep 2  # let screensharingd finish spawning AppleVNCServer
+                if launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH" 2>&1; then
+                    LOAD_DOMAIN="gui/$(id -u)"
+                    green "  Loaded into ${LOAD_DOMAIN} (after VNC-prime)"
+                else
+                    die "launchctl bootstrap retry failed even after VNC-prime —
+gui/$(id -u) may still be unavailable. Check screensharingd:
+  sudo launchctl print system/com.apple.screensharing | head"
+                fi
+            else
+                die "VNC-prime failed: ${_prime_out}
+Cannot auto-create gui/$(id -u) without working VNC auth. Either:
+  • Log in via Apple Screen Sharing.app from another Mac to vnc://$(ipconfig getifaddr en0):5900
+  • Or attach a display + login locally
+Then re-run setup.sh."
+            fi
+            unset _prime_out
+        else
+            die "launchctl bootstrap into gui/$(id -u) failed (no Aqua session).
+No --macos-pass available to auto-prime via VNC handshake. Either:
+  • Re-run setup.sh with --macos-pass=<your-password> so we can prime VNC
+  • Or log in via Apple Screen Sharing once to vnc://$(ipconfig getifaddr en0):5900
+    then re-run setup.sh"
+        fi
     else
-        die "launchctl bootstrap into gui/$(id -u) failed.
-This usually means there's no active console (Aqua) session yet. Either:
-  • Log in via VNC at vnc://127.0.0.1:5900 once, then re-run setup.sh
-  • Or attach a display + login locally"
+        die "launchctl bootstrap into gui/$(id -u) failed: $_bootstrap_out"
     fi
+    unset _bootstrap_out _bootstrap_rc
 
     echo -n "  Waiting for server"
     WAITED=0
