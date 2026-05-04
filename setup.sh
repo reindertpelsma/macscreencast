@@ -392,6 +392,36 @@ ensure_screensharingd() {
     DID_WE_CHECKED_SCREENSHARINGD=1
     # Pre-check decided we DO want screensharingd. Now: is it actually up?
     if nc -z 127.0.0.1 5900 2>/dev/null; then
+        # Already running — common on provisioned cloud Macs (provider
+        # enables screensharingd for their own management). No start prompt
+        # to fold the [y/N/l] choice into; offer the lockdown as a single
+        # one-line prompt with cloud-heuristic default. On personal LAN
+        # Macs default-N so we don't break Apple Screen Sharing.app over LAN.
+        if [[ "$HEADLESS" -eq 0 ]]; then
+            local _primary_ip _default_y _prompt
+            _primary_ip="$(ipconfig getifaddr en0 2>/dev/null \
+                          || ipconfig getifaddr en1 2>/dev/null || echo '')"
+            _default_y=0
+            if [[ -n "$_primary_ip" ]] \
+               && [[ ! "$_primary_ip" =~ ^10\. ]] \
+               && [[ ! "$_primary_ip" =~ ^192\.168\. ]] \
+               && [[ ! "$_primary_ip" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]] \
+               && [[ ! "$_primary_ip" =~ ^169\.254\. ]]; then
+                _default_y=1
+            fi
+            if [[ "$_default_y" -eq 1 ]]; then _prompt="[Y/n]"; else _prompt="[y/N]"; fi
+            echo
+            yellow "  screensharingd already running on 0.0.0.0:5900. The bundle"
+            yellow "  only connects via 127.0.0.1; external :5900 is brute-force"
+            yellow "  surface area. Primary IP: ${_primary_ip:-<none>} ($([[ $_default_y -eq 1 ]] && echo public-looking || echo LAN-internal))."
+            read -rp "  Lock external :5900 via pf rule? $_prompt " _ans
+            case "$_ans" in
+                [Yy]*) WANT_PF_LOCKDOWN=1 ;;
+                [Nn]*) ;;
+                "")    [[ "$_default_y" -eq 1 ]] && WANT_PF_LOCKDOWN=1 ;;
+            esac
+            unset _ans _primary_ip _default_y _prompt
+        fi
         return 0   # SCREENSHARINGD_PRESENT already 1 from pre-check
     fi
     # Port 5900 closed. Screensharingd is installed on this Mac (pre-check
