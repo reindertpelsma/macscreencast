@@ -202,8 +202,15 @@ fi
 # Cloud Macs (any cloud provider): provide password → bundle keeps VNC
 # alive permanently as the display warmer; SCK becomes the capture
 # path once granted.
+#
+# Short-circuit when SIP is disabled: TCC isn't enforcing, no bundle is being
+# built, no permissions need granting. The simplest possible path: skip VNC
+# entirely, write production plist, start. This is the GitHub-runner /
+# custom-image-Mac case — out-of-the-box working with zero prompts.
 WANTS_VNC=0
-if nc -z 127.0.0.1 5900 2>/dev/null; then
+if [[ "$SIP_DISABLED" -eq 1 ]]; then
+    green "  Skipping VNC bootstrap (SIP off — TCC isn't enforcing, raw API path is fine)"
+elif nc -z 127.0.0.1 5900 2>/dev/null; then
     if [[ "$HEADLESS" -eq 1 ]]; then
         # Headless: only enable VNC if MACOS_PASS came in via env.
         if [[ -n "$MACOS_PASS" ]]; then
