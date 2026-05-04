@@ -49,6 +49,7 @@ PLIST_PATH="$HOME/Library/LaunchAgents/${LABEL}.plist"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 NO_LAUNCHAGENT=0
+BUILD_FROM_SOURCE=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --port)        PORT="$2"; shift 2 ;;
@@ -59,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --codec)       CODEC="$2"; shift 2 ;;
         --headless)    HEADLESS=1; shift ;;
         --no-launchagent) NO_LAUNCHAGENT=1; shift ;;
+        --build-from-source) BUILD_FROM_SOURCE=1; shift ;;
         -h|--help)
             cat <<HELP
 setup.sh — install mac-vnc-stream from this git checkout.
@@ -273,338 +275,202 @@ if [[ -z "$MVS_PASSWORD" ]]; then
     green "  Generated web token: $MVS_PASSWORD"
 fi
 
-# ── Step 5: Decide on optional VNC bootstrap fallback ─────────────────────────
-# VNC fallback serves two roles, both important on headless cloud Macs:
-#
-#   1. BOOTSTRAP — let the user view the desktop via VNC long enough to
-#      grant Screen Recording / Accessibility in System Settings.
-#   2. DISPLAY WARMER — on a Mac with NO physical display attached
-#      (Scaleway, AWS EC2 Mac without HDMI dongle), SCK reports "no
-#      displays" unless something is keeping screensharingd's virtual
-#      display rendered. Our own VNC connection counts. Without it,
-#      SCK frames go stale even when TCC is granted ("frozen screen"
-#      pattern verified 2026-05-04 on Scaleway M2 Tahoe).
-#
-# Logic: if screensharingd is listening on :5900 AND user provides a
-# password (or MACOS_PASS is set in env), enable VNC. Empty password =
-# "I have a physical display, no VNC needed" — bundle runs --api-only.
-#
-# Personal Macs with physical display: empty password → --api-only.
-# Cloud Macs (any cloud provider): provide password → bundle keeps VNC
-# alive permanently as the display warmer; SCK becomes the capture
-# path once granted.
-#
-# Short-circuit when SIP is disabled: TCC isn't enforcing, no bundle is being
-# built, no permissions need granting. The simplest possible path: skip VNC
-# entirely, write production plist, start. This is the GitHub-runner /
-# custom-image-Mac case — out-of-the-box working with zero prompts.
-WANTS_VNC=0
-# SSH-vs-local detection. If the user is running setup.sh from a terminal
-# open ON the Mac's actual display (not via SSH), they have physical screen
-# access and can grant TCC at the keyboard — no VNC bootstrap needed.
-RUNNING_FROM_SSH=0
-if [[ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]]; then
-    RUNNING_FROM_SSH=1
-fi
-
-# Detect "screensharingd is installed/configured but currently stopped"
-# (e.g. cloud-Mac providers that ship it disabled for security). Distinct
-# from "screensharingd not installed at all" — the former is recoverable
-# with `sudo launchctl kickstart -k system/com.apple.screensharing` if the
-# user explicitly opts into VNC bootstrap.
-SSD_INSTALLED_BUT_OFF=0
-if [[ "$SIP_DISABLED" -eq 0 ]] && ! nc -z 127.0.0.1 5900 2>/dev/null; then
-    if [[ -r /Library/Application\ Support/com.apple.TCC/TCC.db ]] \
-            && [[ -n "${MACOS_PASS:-}" ]]; then
-        yellow "  About to read /Library/Application Support/com.apple.TCC/TCC.db (read-only, requires sudo) to check screensharingd state..."
-        if echo "$MACOS_PASS" | sudo -S sqlite3 \
-                /Library/Application\ Support/com.apple.TCC/TCC.db \
-                "SELECT 1 FROM access WHERE client='com.apple.screensharing.agent' LIMIT 1" \
-                2>/dev/null | grep -q 1; then
-            SSD_INSTALLED_BUT_OFF=1
-        fi
-    fi
-fi
+# ── Step 5: Bundle decision ───────────────────────────────────────────────────
+# Done BEFORE the VNC decision because the bundle's TCC state determines
+# whether VNC bootstrap is even needed. Keep + valid grants → trivial happy
+# path: skip VNC entirely, just (re-)bootstrap the LaunchAgent.
+LAUNCHAGENT_BINARY=""
+APP_BUILT=""
+APP_DEST="/Applications/mac-vnc-stream.app"
+REBUILD_NEEDED=0
+TCC_GRANTED=0
+NEEDS_TCC_RESET=0
+DID_WE_CHECKED_SCREENSHARINGD=0
+SCREENSHARINGD_PRESENT=0
 
 if [[ "$SIP_DISABLED" -eq 1 ]]; then
-    green "  Skipping VNC bootstrap (SIP off — TCC isn't enforcing, raw API path is fine)"
-elif [[ "$RUNNING_FROM_SSH" -eq 0 ]]; then
-    green "  Skipping VNC bootstrap (running from local terminal — physical display assumed)"
-    green "  You'll grant Screen Recording / Accessibility at the keyboard after install."
-elif [[ "$SSD_INSTALLED_BUT_OFF" -eq 1 ]]; then
+    # SIP off: TCC isn't enforcing. Run server.py directly, no bundle.
+    TCC_GRANTED=1
+    REBUILD_NEEDED=0
+    LAUNCHAGENT_BINARY="$PYTHON_BINARY"
+    green "  SIP off → no bundle needed, raw LaunchAgent path"
+elif [[ -d "$APP_DEST" ]]; then
+    step "Existing bundle"
+    yellow "  Found: $APP_DEST"
+    yellow "  Keep preserves grants (CDHash unchanged); rebuild picks up source"
+    yellow "  changes but invalidates grants."
     if [[ "$HEADLESS" -eq 1 ]]; then
-        yellow "  screensharingd appears configured but stopped (port 5900 is closed)."
-        yellow "  Headless mode — skipping VNC bootstrap. To enable manually:"
-        yellow "    sudo launchctl kickstart -k system/com.apple.screensharing"
+        green "  Headless mode — keeping (default)"
+        REBUILD_NEEDED=0
+    elif [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
+        yellow "  --build-from-source given — forcing rebuild"
+        REBUILD_NEEDED=1
     else
-        echo
-        yellow "  screensharingd is configured but stopped (port 5900 is closed)."
-        yellow "  Cloud Mac providers sometimes disable it for security. Without it,"
-        yellow "  there's no way to grant Screen Recording on a headless cloud Mac"
-        yellow "  unless you have physical access to the keyboard."
-        yellow ""
-        yellow "  About to start screensharingd via:"
-        yellow "    sudo launchctl kickstart -k system/com.apple.screensharing"
-        yellow ""
-        yellow "  IMPORTANT: this restarts the service with whatever bind config"
-        yellow "  was already on disk — typically 0.0.0.0:5900. Make sure your"
-        yellow "  cloud provider's firewall blocks external 5900 access if you"
-        yellow "  rely on that for security. (We connect to 127.0.0.1:5900 only,"
-        yellow "  but other clients on the network could also connect once it's up.)"
-        echo
-        read -rp "  Start screensharingd now? [y/N] " _ans
-        if [[ "$_ans" =~ ^[Yy]$ ]]; then
-            yellow "  About to run sudo to start screensharingd..."
-            if [[ -n "$MACOS_PASS" ]]; then
-                echo "$MACOS_PASS" | sudo -S launchctl kickstart -k system/com.apple.screensharing 2>&1 | head -2
-            else
-                sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 | head -2
-            fi
-            sleep 3
-            if nc -z 127.0.0.1 5900 2>/dev/null; then
-                green "  screensharingd is now listening on :5900"
-            else
-                yellow "  screensharingd didn't come up. Skipping VNC bootstrap for this run."
-            fi
-        else
-            yellow "  Skipping. Run this command manually if you want VNC bootstrap:"
-            yellow "    sudo launchctl kickstart -k system/com.apple.screensharing"
-        fi
+        read -rp "  [k]eep or [r]ebuild? [K/r] " _ans
+        [[ "$_ans" =~ ^[Rr]$ ]] && REBUILD_NEEDED=1
         unset _ans
     fi
+    if [[ "$REBUILD_NEEDED" -eq 0 ]]; then
+        APP_BUILT="$APP_DEST"
+        LAUNCHAGENT_BINARY="$APP_DEST/Contents/MacOS/mac-vnc-stream"
+        # Probe TCC. --tcc-check exit 0 = both grants valid AND CDHash matches.
+        if "$LAUNCHAGENT_BINARY" --tcc-check >/dev/null 2>&1; then
+            TCC_GRANTED=1
+            green "  Existing bundle has valid TCC grants — straight to production mode"
+        else
+            yellow "  Existing bundle is missing or has stale TCC grants"
+            NEEDS_TCC_RESET=1   # stale-CDHash-on-keep → reset before re-grant
+        fi
+    fi
+else
+    REBUILD_NEEDED=1   # no bundle yet — fresh install
 fi
-# After potentially starting screensharingd above, re-check the port. If it's
-# now up (or was up to begin with), enter the regular VNC-bootstrap prompt.
-if nc -z 127.0.0.1 5900 2>/dev/null && [[ "$WANTS_VNC" -eq 0 ]] \
-        && [[ "$SIP_DISABLED" -eq 0 ]] \
-        && [[ "$RUNNING_FROM_SSH" -eq 1 ]]; then
+
+# ── Step 6: ensure_screensharingd helper (memoized) ──────────────────────────
+ensure_screensharingd() {
+    # Returns 0 (true) if screensharingd is running on :5900, non-zero otherwise.
+    # Memoized: subsequent calls return the cached result without re-prompting.
+    # If port 5900 is closed but screensharingd is configured (TCC-known), prompts
+    # the user to start it, with a one-line $1 reason.
+    local reason="${1:-keep the screen alive}"
+    if [[ "$DID_WE_CHECKED_SCREENSHARINGD" -eq 1 ]]; then
+        return $((1 - SCREENSHARINGD_PRESENT))
+    fi
+    DID_WE_CHECKED_SCREENSHARINGD=1
+    if nc -z 127.0.0.1 5900 2>/dev/null; then
+        SCREENSHARINGD_PRESENT=1; return 0
+    fi
+    # Configured-but-stopped detection requires sudo to read TCC.db.
+    local ssd_known=0
+    if [[ -n "${MACOS_PASS:-}" ]] && \
+       echo "$MACOS_PASS" | sudo -S sqlite3 \
+           /Library/Application\ Support/com.apple.TCC/TCC.db \
+           "SELECT 1 FROM access WHERE client='com.apple.screensharing.agent' LIMIT 1" \
+           2>/dev/null | grep -q 1; then
+        ssd_known=1
+    fi
+    if [[ "$ssd_known" -eq 0 ]]; then
+        return 1   # not configured, can't start
+    fi
     if [[ "$HEADLESS" -eq 1 ]]; then
-        # Headless: only enable VNC if MACOS_PASS came in via env.
-        if [[ -n "$MACOS_PASS" ]]; then
-            WANTS_VNC=1
-            green "  VNC fallback: enabled (MACOS_PASS provided in env)"
-        else
-            green "  VNC fallback: skipped (headless, no MACOS_PASS in env)"
-        fi
+        yellow "  screensharingd configured but stopped. Headless — skipping."
+        yellow "  Start manually: sudo launchctl kickstart -k system/com.apple.screensharing"
+        return 1
+    fi
+    echo
+    yellow "  screensharingd is configured but stopped (port 5900 closed)."
+    yellow "  Reason it's needed: $reason"
+    yellow "  Will run: sudo launchctl kickstart -k system/com.apple.screensharing"
+    yellow "  IMPORTANT: respects on-disk bind config (typically 0.0.0.0:5900)."
+    yellow "  Cloud-provider firewalls should block external 5900 if you rely on that."
+    read -rp "  Start screensharingd now? [y/N] " _ans
+    if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
+        unset _ans
+        return 1
+    fi
+    unset _ans
+    if [[ -n "$MACOS_PASS" ]]; then
+        echo "$MACOS_PASS" | sudo -S launchctl kickstart -k system/com.apple.screensharing 2>&1 | head -2
     else
+        sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 | head -2
+    fi
+    sleep 3
+    if nc -z 127.0.0.1 5900 2>/dev/null; then
+        SCREENSHARINGD_PRESENT=1
+        green "  screensharingd is now listening on :5900"
+        return 0
+    fi
+    yellow "  screensharingd didn't come up — skipping"
+    return 1
+}
+
+# ── Step 7: VNC fallback decision (only when needed) ─────────────────────────
+# VNC fallback is needed when ALL THREE are true:
+#   • SIP enabled (TCC is enforcing)
+#   • TCC not granted yet (so we need a way for the user to grant)
+#   • Running over SSH (no physical screen access)
+# Otherwise the user can just grant at the keyboard.
+VNC_FALLBACK=0
+if [[ "$SIP_DISABLED" -eq 0 && "$TCC_GRANTED" -eq 0 && "$RUNNING_FROM_SSH" -eq 1 ]]; then
+    if ensure_screensharingd "to view the desktop while granting Screen Recording / Accessibility"; then
         echo
-        yellow "  Optional VNC bootstrap — needed only if you have NO physical access"
-        yellow "  to this Mac and will grant Screen Recording via a VNC viewer."
-        yellow "  Skip with empty password if you have physical screen access."
-        echo
-        if [[ -z "$MACOS_PASS" ]]; then
-            read -rsp "  macOS login password (Enter to skip VNC bootstrap): " MACOS_PASS
-            echo
-        fi
-        if [[ -n "$MACOS_PASS" ]]; then
-            # Validate up to 3 attempts.
-            _attempts=0
-            while true; do
-                if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
-                    WANTS_VNC=1
-                    green "  Password verified — VNC bootstrap enabled"
-                    break
-                fi
-                _attempts=$((_attempts + 1))
-                if [[ $_attempts -ge 3 ]]; then
-                    yellow "  Three attempts failed — installing without VNC fallback"
-                    MACOS_PASS=""
-                    break
-                fi
-                yellow "  Password rejected. Try again, or press Enter to skip."
-                read -rsp "  macOS login password: " MACOS_PASS
-                echo
-                [[ -z "$MACOS_PASS" ]] && { yellow "  Skipping VNC bootstrap"; break; }
-            done
-            unset _attempts
+        yellow "  Optional VNC bootstrap. Provides a live desktop view in your browser"
+        yellow "  while you grant TCC permissions. Skip with empty password if you'll"
+        yellow "  grant via another method (physical screen, Apple Screen Sharing.app)."
+        if [[ "$HEADLESS" -eq 1 ]]; then
+            [[ -n "$MACOS_PASS" ]] && VNC_FALLBACK=1
         else
-            green "  No password — VNC bootstrap skipped (assumes physical screen access)"
+            if [[ -z "$MACOS_PASS" ]]; then
+                read -rsp "  macOS login password (Enter to skip): " MACOS_PASS
+                echo
+            fi
+            if [[ -n "$MACOS_PASS" ]]; then
+                _attempts=0
+                while true; do
+                    if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
+                        VNC_FALLBACK=1
+                        green "  Password verified — VNC bootstrap enabled"
+                        break
+                    fi
+                    _attempts=$((_attempts + 1))
+                    if [[ $_attempts -ge 3 ]]; then
+                        yellow "  Three attempts failed — skipping VNC"
+                        MACOS_PASS=""
+                        break
+                    fi
+                    yellow "  Password rejected. Try again, or press Enter to skip."
+                    read -rsp "  macOS login password: " MACOS_PASS
+                    echo
+                    [[ -z "$MACOS_PASS" ]] && { yellow "  Skipping VNC bootstrap"; break; }
+                done
+                unset _attempts
+            else
+                green "  No password — skipping VNC (assumes physical screen access)"
+            fi
         fi
     fi
 fi
 
-# Optional friendly note about MDM TCC (informational only — no auto-removal).
-# With our own bundle id, MDM TCC policies generally don't block us by default
-# (most policies are subtractive against named apps, not allowlists). If a
-# specific MDM is locked-down enough to require an allowlist that omits our
-# bundle, the user will see the grant fail to take effect; this note tells
-# them what to do.
+# Optional MDM TCC profile detection (informational only — no auto-action).
 if [[ "$SIP_DISABLED" -eq 0 && -n "${MACOS_PASS:-}" ]]; then
-    yellow "  About to run 'sudo profiles show' (read-only, requires sudo) to check for MDM TCC management..."
+    yellow "  About to run 'sudo profiles show' (read-only) to check for MDM TCC management..."
     if echo "$MACOS_PASS" | sudo -S profiles show 2>/dev/null \
             | grep -q "com.apple.TCC.configuration-profile-policy"; then
-        yellow "  Note: an MDM TCC profile is installed. If your grants for"
-        yellow "  mac-vnc-stream don't take effect, the MDM policy may need updating."
-        yellow "  Some MDMs allowlist by bundle id — ask your admin to allowlist"
-        yellow "  '${LABEL}'. As a last resort: 'sudo profiles -R -p <enrollment-id>'"
-        yellow "  removes the MDM entirely (reversible — provider re-enrolls)."
+        yellow "  Note: MDM TCC profile installed. If grants don't take effect, ask"
+        yellow "  admin to allowlist '${LABEL}', or remove enrollment as last resort:"
+        yellow "    sudo profiles -R -p <enrollment-id-from 'sudo profiles show'>"
     fi
 fi
 
-# ── Step 6: Build .app bundle (SIP-enabled only) ──────────────────────────────
-LAUNCHAGENT_BINARY=""
-APP_DEST="/Applications/mac-vnc-stream.app"
-APP_BUILT=""
-DID_REBUILD=0   # 1 if we just built/installed a fresh bundle (CDHash changed)
-
-if [[ "$SIP_DISABLED" -eq 0 ]]; then
-    # Phase A: install.sh's release-download fast path may have already placed
-    # a pre-built bundle and exported MVS_PREBUILT_APP. Treat that as a fresh
-    # install (CDHash unknown to TCC).
-    if [[ -n "${MVS_PREBUILT_APP:-}" && -d "$MVS_PREBUILT_APP" ]]; then
-        APP_BUILT="$MVS_PREBUILT_APP"
-        DID_REBUILD=1
-        green "  Using pre-built bundle (install.sh release path): $APP_BUILT"
-    elif [[ -d "$APP_DEST" ]]; then
-        # Phase B: existing bundle in /Applications/. Prompt to keep or rebuild.
-        # Keep is the right default in headless mode (preserves existing TCC
-        # grants — bundle CDHash unchanged → grants stay valid).
-        if [[ "$HEADLESS" -eq 1 ]]; then
-            green "  Existing bundle at $APP_DEST — keeping (headless default)"
-            APP_BUILT="$APP_DEST"
-            DID_REBUILD=0
-        else
-            echo
-            yellow "  An existing mac-vnc-stream.app is installed at:"
-            yellow "    $APP_DEST"
-            yellow "  Keeping it preserves your existing TCC grants (CDHash unchanged)."
-            yellow "  Rebuilding picks up source changes but invalidates grants —"
-            yellow "  you'll need to re-toggle Screen Recording / Accessibility."
-            echo
-            read -rp "  [k]eep or [r]ebuild? [K/r] " _ans
-            if [[ "$_ans" =~ ^[Rr]$ ]]; then
-                DID_REBUILD=1
-            else
-                APP_BUILT="$APP_DEST"
-                DID_REBUILD=0
-            fi
-            unset _ans
-        fi
+# ── Step 8: Build/install bundle if needed ────────────────────────────────────
+if [[ "$REBUILD_NEEDED" -eq 1 && "$SIP_DISABLED" -eq 0 ]]; then
+    step "Building .app bundle (com.macvncstream.server)"
+    rm -rf "$REPO_DIR/build" "$REPO_DIR/dist"
+    (cd "$REPO_DIR" && "$PYTHON_BINARY" build_app.py py2app 2>&1 | tail -10)
+    [[ -d "$REPO_DIR/dist/mac-vnc-stream.app" ]] \
+        || die "py2app did not produce dist/mac-vnc-stream.app"
+    echo
+    yellow "  About to install bundle to /Applications/ — REQUIRES SUDO:"
+    yellow "    sudo rm -rf $APP_DEST"
+    yellow "    sudo cp -R $REPO_DIR/dist/mac-vnc-stream.app $APP_DEST"
+    if [[ -n "$MACOS_PASS" ]]; then
+        echo "$MACOS_PASS" | sudo -S rm -rf "$APP_DEST" 2>/dev/null || true
+        echo "$MACOS_PASS" | sudo -S cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
     else
-        DID_REBUILD=1   # no bundle yet — fresh install
+        sudo rm -rf "$APP_DEST" || true
+        sudo cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
     fi
-
-    if [[ "$DID_REBUILD" -eq 1 && -z "$APP_BUILT" ]]; then
-        step "Building .app bundle (com.macvncstream.server)"
-        rm -rf "$REPO_DIR/build" "$REPO_DIR/dist"
-        (cd "$REPO_DIR" && "$PYTHON_BINARY" build_app.py py2app 2>&1 | tail -10)
-        [[ -d "$REPO_DIR/dist/mac-vnc-stream.app" ]] \
-            || die "py2app did not produce dist/mac-vnc-stream.app"
-        # Install to /Applications/ so the bundle has a stable, system-level path.
-        # /Applications/ is owned by root; sudo via cached creds (or interactive
-        # prompt if MACOS_PASS isn't set, e.g. personal-Mac local install).
-        echo
-        yellow "  About to install bundle to /Applications/ — this REQUIRES SUDO:"
-        yellow "    sudo rm -rf $APP_DEST"
-        yellow "    sudo cp -R $REPO_DIR/dist/mac-vnc-stream.app $APP_DEST"
-        yellow "  (Press Ctrl+C to abort if you'd rather install elsewhere manually.)"
-        echo
-        if [[ -n "$MACOS_PASS" ]]; then
-            echo "$MACOS_PASS" | sudo -S rm -rf "$APP_DEST" 2>/dev/null || true
-            echo "$MACOS_PASS" | sudo -S cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
-        else
-            sudo rm -rf "$APP_DEST" || true
-            sudo cp -R "$REPO_DIR/dist/mac-vnc-stream.app" "$APP_DEST"
-        fi
-        APP_BUILT="$APP_DEST"
-        green "  Bundle installed at $APP_DEST (com.macvncstream.server, ad-hoc signed)"
-        # tccutil reset is unconditional on rebuild (CDHash definitely
-        # changed → grants definitely stale). The keep-path equivalent
-        # is handled later, gated on the --tcc-check probe result.
-        NEEDS_TCC_RESET=1
-    else
-        # Keep path. Whether we need a TCC reset depends on whether the
-        # existing bundle's grants actually work — set later, after the
-        # --tcc-check probe.
-        NEEDS_TCC_RESET=0
-    fi
-
+    APP_BUILT="$APP_DEST"
     LAUNCHAGENT_BINARY="$APP_BUILT/Contents/MacOS/mac-vnc-stream"
-else
-    step "SIP disabled — skipping .app bundle build"
-    LAUNCHAGENT_BINARY="$PYTHON_BINARY"
+    green "  Bundle installed at $APP_DEST (com.macvncstream.server, ad-hoc signed)"
+    NEEDS_TCC_RESET=1   # CDHash changed → grants invalidated
+    TCC_GRANTED=0
 fi
 
-# ── Step 6b: Decide bootstrap vs production mode ──────────────────────────────
-# BOOTSTRAP mode: write a transient plist with --enable-vnc-fallback +
-# MACOS_PASS in env. After the user grants permissions, we rewrite the plist
-# as production (no flag, no password) and bootstrap-restart. Production
-# restarts thereafter never have the password.
-#
-# Production mode: clean plist, no --enable-vnc-fallback, no MACOS_PASS env.
-#
-# Bootstrap is needed when EITHER:
-#   (a) we just rebuilt the bundle (CDHash changed → grants invalidated)
-#   (b) we kept the existing bundle but TCC isn't actually granted yet
-#       — common case: user re-runs setup.sh after a previous incomplete
-#       attempt where they hadn't toggled in Settings.
-# In both cases, VNC fallback is needed iff the user provided MACOS_PASS
-# (otherwise we assume physical-display access and the user grants at the
-# keyboard).
-BOOTSTRAP_MODE=0
-TCC_ALREADY_OK=0
-if [[ "$SIP_DISABLED" -eq 1 ]]; then
-    TCC_ALREADY_OK=1   # SIP off → TCC isn't enforcing → effectively granted
-elif [[ "$DID_REBUILD" -eq 0 && -n "$LAUNCHAGENT_BINARY" && -x "$LAUNCHAGENT_BINARY" ]]; then
-    # Keep path: probe the existing bundle's TCC state by running it with
-    # --tcc-check. Exit 0 = both granted with valid CDHash match;
-    # non-zero = needs bootstrap. CGPreflight returns False not just for
-    # "no TCC entry" but also for "TCC entry exists but its csreq CDHash
-    # list doesn't include the binary's current CDHash" — so this catches
-    # both fresh-install and stale-grant scenarios in one probe.
-    if "$LAUNCHAGENT_BINARY" --tcc-check >/dev/null 2>&1; then
-        TCC_ALREADY_OK=1
-        green "  Existing bundle has valid TCC grants — production mode"
-    else
-        yellow "  Existing bundle is missing or stale TCC grants — bootstrap mode"
-        # Stale grant detected → reset so the next user toggle records the
-        # CURRENT CDHash. Without this, the user re-toggles in Settings but
-        # tccd just rewrites the same CDHash-mismatched entry.
-        NEEDS_TCC_RESET=1
-    fi
-fi
-if [[ "$TCC_ALREADY_OK" -eq 0 && "$WANTS_VNC" -eq 1 ]]; then
-    BOOTSTRAP_MODE=1
-fi
-
-# Detect "headless mac mini with no physical display attached AND no VNC".
-# SCK requires at least one renderable display; on a headless Mac the only
-# way to get one is an attached HDMI/Thunderbolt display, a "headless dongle"
-# (a fake HDMI plug that reports a connected display), or an active VNC
-# session via screensharingd. Without any of these, even fully-granted SCK
-# returns stale frames or "no displays" errors. Detect this state and warn
-# the user before they hit it as a frozen browser.
-DISPLAY_ATTACHED=0
-if command -v system_profiler >/dev/null 2>&1; then
-    # Resolution: appears once per attached display in system_profiler output.
-    if system_profiler SPDisplaysDataType 2>/dev/null | grep -q "Resolution:"; then
-        DISPLAY_ATTACHED=1
-    fi
-fi
-if [[ "$SIP_DISABLED" -eq 0 && "$DISPLAY_ATTACHED" -eq 0 && "$WANTS_VNC" -eq 0 ]]; then
+# ── Step 9: tccutil reset if needed (rebuild OR stale-CDHash-on-keep) ────────
+if [[ "$NEEDS_TCC_RESET" -eq 1 && "$SIP_DISABLED" -eq 0 ]]; then
     echo
-    yellow "  ⚠  No physical display detected AND no VNC bootstrap configured."
-    yellow "     SCK requires at least one renderable display — without a"
-    yellow "     monitor / HDMI dongle / VNC session, the server will start"
-    yellow "     but frames will be stale (frozen browser)."
-    yellow "     Options:"
-    yellow "       • Attach a 'headless display dongle' (~\$10 fake-HDMI plug),"
-    yellow "       • Or re-run setup.sh and provide the macOS password to"
-    yellow "         enable VNC fallback (which keeps the virtual display alive),"
-    yellow "       • Or skip if you've already done one of the above and just"
-    yellow "         haven't told this script."
-    echo
-fi
-
-# Apply the TCC reset (fires on rebuild OR on stale-grant detection).
-# Doing it here, AFTER the keep/rebuild decision but BEFORE the plist
-# write + bootstrap, means the bundle's first launch in bootstrap mode
-# triggers fresh TCC registration against the current CDHash.
-if [[ "${NEEDS_TCC_RESET:-0}" -eq 1 && "$SIP_DISABLED" -eq 0 ]]; then
-    echo
-    yellow "  About to reset TCC grants for com.macvncstream.server"
-    yellow "  (CDHash mismatch — stale entries would be silently denied even"
-    yellow "  though System Settings shows them as granted):"
+    yellow "  Resetting TCC for com.macvncstream.server (CDHash mismatch)..."
     yellow "    sudo tccutil reset ScreenCapture com.macvncstream.server"
     yellow "    sudo tccutil reset Accessibility com.macvncstream.server"
     if [[ -n "$MACOS_PASS" ]]; then
@@ -614,8 +480,19 @@ if [[ "${NEEDS_TCC_RESET:-0}" -eq 1 && "$SIP_DISABLED" -eq 0 ]]; then
         sudo tccutil reset ScreenCapture com.macvncstream.server 2>&1 | head -1
         sudo tccutil reset Accessibility com.macvncstream.server 2>&1 | head -1
     fi
-    green "  TCC reset — next toggle in Settings will record the current CDHash"
+    green "  TCC reset — next toggle in Settings records current CDHash"
 fi
+
+# ── Step 10: Bootstrap mode flag ─────────────────────────────────────────────
+# Bootstrap = transient plist with --enable-vnc-fallback + MACOS_PASS env.
+# Used only when TCC is not granted AND VNC fallback is enabled. Otherwise
+# straight to production plist (and if TCC is also not granted, the user
+# grants manually after install — see final banner).
+BOOTSTRAP_MODE=0
+if [[ "$VNC_FALLBACK" -eq 1 && "$TCC_GRANTED" -eq 0 ]]; then
+    BOOTSTRAP_MODE=1
+fi
+
 
 # ── Step 7: write_plist function (called once or twice depending on mode) ─────
 write_plist() {
