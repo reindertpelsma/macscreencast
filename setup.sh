@@ -163,7 +163,32 @@ fi
 
 echo "  User: $MACOS_USER"
 
-if [[ "$VNC_PRESEEDED" -eq 1 ]]; then
+# TCC pre-check: if Python already has both Screen Recording AND Accessibility,
+# skip VNC bootstrap entirely. No password prompt, no daemon, no MACOS_PASS in
+# any plist — install LaunchAgent in --api-only and we're done.
+TCC_BOTH_GRANTED=0
+if command -v python3 >/dev/null 2>&1; then
+    if python3 - <<'PYEOF' 2>/dev/null
+import ctypes, sys
+try:
+    cg = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    cg.CGPreflightScreenCaptureAccess.restype = ctypes.c_bool
+    ax = ctypes.cdll.LoadLibrary(
+        "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+    ax.AXIsProcessTrusted.restype = ctypes.c_bool
+    sys.exit(0 if (cg.CGPreflightScreenCaptureAccess() and ax.AXIsProcessTrusted()) else 1)
+except Exception:
+    sys.exit(1)
+PYEOF
+    then
+        TCC_BOTH_GRANTED=1
+        green "  Screen Recording + Accessibility already granted to Python."
+        green "  Skipping VNC bootstrap → installing LaunchAgent in --api-only mode."
+        green "  (No password will be prompted or stored.)"
+    fi
+fi
+
+if [[ "$VNC_PRESEEDED" -eq 1 && "$TCC_BOTH_GRANTED" -eq 0 ]]; then
     # Cloud Mac: password needed for sudo (enable/restart screensharingd) and VNC auth.
     if [[ -z "$MACOS_PASS" ]]; then
         echo
@@ -181,8 +206,11 @@ if [[ "$VNC_PRESEEDED" -eq 1 ]]; then
         yellow "  │  CGEvent — 60 fps, ≤200 ms input latency, no modifier issues,    │"
         yellow "  │  no stored password. That's the real product.                    │"
         yellow "  │                                                                  │"
-        yellow "  │  Plan: open Safari to the URL setup prints, click Allow on the   │"
-        yellow "  │  Screen Recording prompt, re-run setup.sh, done.                 │"
+        yellow "  │  Plan: open the URL setup prints in any modern browser           │"
+        yellow "  │  (Chrome / Safari / Firefox / Edge — all tested). Click Allow    │"
+        yellow "  │  on the Screen Recording AND Accessibility prompts. Then come    │"
+        yellow "  │  back here and re-run setup.sh. The script auto-detects both     │"
+        yellow "  │  permissions and skips this whole bootstrap on the second run.   │"
         yellow "  │                                                                  │"
         red    "  └──────────────────────────────────────────────────────────────────┘"
         echo
@@ -414,7 +442,13 @@ rm -f "$PROBE_PLIST"
 # the user has a console session, re-running setup.sh promotes to LaunchAgent
 # (gui/$UID) and drops these flags.
 EXTRA_ARGS=()
-if [[ "$USE_DAEMON" -eq 1 ]]; then
+if [[ "$TCC_BOTH_GRANTED" -eq 1 ]]; then
+    # Both permissions granted at install time → run --api-only, no
+    # screensharingd contact at all. Best end-state: no stored password,
+    # no VNC, SCK + CGEvent from first boot.
+    EXTRA_ARGS=(--api-only)
+    USE_DAEMON=0
+elif [[ "$USE_DAEMON" -eq 1 ]]; then
     EXTRA_ARGS=(--capture vnc --input vnc)
 fi
 
@@ -454,6 +488,16 @@ if [[ "$USE_DAEMON" -eq 1 ]]; then
 "
 fi
 
+# Only embed MACOS_PASS in the plist when VNC/screensharingd auth is actually
+# needed at runtime. In --api-only mode the server never contacts
+# screensharingd, so storing a password serves no purpose.
+MACOS_PASS_ENTRY=""
+if [[ -n "$MACOS_PASS" && "$TCC_BOTH_GRANTED" -ne 1 ]]; then
+    MACOS_PASS_ENTRY="
+        <key>MACOS_PASS</key>
+        <string>${MACOS_PASS}</string>"
+fi
+
 PLIST_TMP="$(mktemp /tmp/mvs_plist_XXXXXX)"
 cat > "$PLIST_TMP" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -471,9 +515,7 @@ ${PROG_ARGS_XML}
     <key>EnvironmentVariables</key>
     <dict>
 ${HOME_USER_BLOCK}        <key>MACOS_USER</key>
-        <string>${MACOS_USER}</string>
-        <key>MACOS_PASS</key>
-        <string>${MACOS_PASS}</string>
+        <string>${MACOS_USER}</string>${MACOS_PASS_ENTRY}
         <key>MVS_PASSWORD</key>
         <string>${MVS_PASSWORD}</string>
     </dict>
