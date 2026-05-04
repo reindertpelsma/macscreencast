@@ -28,16 +28,30 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/reindertpelsma/mac-vnc-stream"
-RELEASES_API="https://api.github.com/repos/reindertpelsma/mac-vnc-stream/releases/latest"
-CLONE_DIR="$HOME/mac-vnc-stream"
-APP_DEST="/Applications/mac-vnc-stream.app"
-
 green()  { printf '\033[32m%s\033[0m\n' "$*"; }
 yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
 red()    { printf '\033[31m%s\033[0m\n' "$*"; }
 step()   { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die()    { red "ERROR: $*"; exit 1; }
+
+# ── OS guard ─────────────────────────────────────────────────────────────────
+# This is the macOS-only repo. Linux/Windows users get a friendly
+# redirect to the (forthcoming) sibling repo instead of confusing
+# error messages from py2app / sudo / launchctl on a non-macOS host.
+_OS="$(uname -s 2>/dev/null || echo unknown)"
+if [[ "$_OS" != "Darwin" ]]; then
+    red "  This repo is macOS only — detected: $_OS"
+    yellow "  For Linux / Windows browser remote-desktop, use the sibling repo:"
+    yellow "    https://github.com/reindertpelsma/browser-screencast   (forthcoming)"
+    yellow "  (We're shipping macscreencast first; cross-platform port is on the roadmap.)"
+    exit 1
+fi
+unset _OS
+
+REPO_URL="https://github.com/reindertpelsma/mac-vnc-stream"
+RELEASES_API="https://api.github.com/repos/reindertpelsma/mac-vnc-stream/releases/latest"
+CLONE_DIR="$HOME/mac-vnc-stream"
+APP_DEST="/Applications/mac-vnc-stream.app"
 
 # Headless / opt-out parsing.
 HEADLESS="${MVS_HEADLESS:-0}"

@@ -137,6 +137,20 @@ HELP
     esac
 done
 
+# ── OS guard ─────────────────────────────────────────────────────────────────
+# This is the macOS-only repo. Linux/Windows users get a friendly
+# redirect to the (forthcoming) sibling repo instead of confusing errors
+# from py2app / launchctl / codesign on a non-macOS host.
+_OS="$(uname -s 2>/dev/null || echo unknown)"
+if [[ "$_OS" != "Darwin" ]]; then
+    red "ERROR: This repo is macOS only — detected: $_OS"
+    yellow "For Linux / Windows browser remote-desktop, use the sibling repo:"
+    yellow "  https://github.com/reindertpelsma/browser-screencast   (forthcoming)"
+    yellow "(We're shipping macscreencast first; cross-platform port is on the roadmap.)"
+    exit 1
+fi
+unset _OS
+
 # Re-open /dev/tty so prompts work when piped via curl|bash.
 if [[ ! -t 0 ]] && [[ -e /dev/tty ]] && [[ "$HEADLESS" -eq 0 ]]; then
     exec </dev/tty
