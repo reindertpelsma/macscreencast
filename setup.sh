@@ -793,7 +793,7 @@ else
     yellow "  │  restart needed. The browser will auto-switch from the placeholder │"
     yellow "  │  message to the live screen.                                      │"
     yellow "  └────────────────────────────────────────────────────────────────────┘"
-    if [[ "$WANTS_VNC" -eq 1 ]]; then
+    if [[ "$VNC_FALLBACK" -eq 1 ]]; then
         green "  VNC bootstrap is active — you can already see the desktop in your"
         green "  browser. Use it to grant the permissions above."
     elif [[ "$DISPLAY_ATTACHED" -eq 1 ]]; then
