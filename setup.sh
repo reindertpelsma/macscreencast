@@ -832,9 +832,18 @@ if [[ "$NEEDS_VNC_FOR_GRANT" -eq 1 || "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 ]]; t
     fi
     if ensure_screensharingd "$_vnc_reason"; then
         echo
-        yellow "  Optional VNC bootstrap. Provides a live desktop view in your browser"
-        yellow "  while you grant TCC permissions. Skip with empty password if you'll"
-        yellow "  grant via another method (physical screen, Apple Screen Sharing.app)."
+        # Two distinct UX modes depending on whether grants are valid:
+        #   • TCC_GRANTED=0 → user is about to grant via VNC bootstrap.
+        #     Show the "Optional VNC bootstrap..." marketing copy.
+        #   • TCC_GRANTED=1 → grants already applied; VNC is just the
+        #     permanent display-warmer. Skip the marketing copy entirely
+        #     (it confuses users who picked keep — they think the script
+        #     is asking them to re-grant).
+        if [[ "$TCC_GRANTED" -eq 0 ]]; then
+            yellow "  Optional VNC bootstrap. Provides a live desktop view in your browser"
+            yellow "  while you grant TCC permissions. Skip with empty password if you'll"
+            yellow "  grant via another method (physical screen, Apple Screen Sharing.app)."
+        fi
         if [[ "$HEADLESS" -eq 1 ]]; then
             [[ -n "$MACOS_PASS" ]] && VNC_FALLBACK=1
         else
@@ -847,7 +856,11 @@ if [[ "$NEEDS_VNC_FOR_GRANT" -eq 1 || "$NEEDS_VNC_AS_DISPLAY_WARMER" -eq 1 ]]; t
                 while true; do
                     if echo "$MACOS_PASS" | sudo -S -v 2>/dev/null; then
                         VNC_FALLBACK=1
-                        green "  Password verified — VNC bootstrap enabled"
+                        if [[ "$TCC_GRANTED" -eq 1 ]]; then
+                            green "  macOS password verified for VNC display-warmer"
+                        else
+                            green "  Password verified — VNC bootstrap enabled"
+                        fi
                         apply_pf_lockdown_5900
                         break
                     fi
