@@ -202,7 +202,14 @@ def main():
 
     _request_screen_capture_access()
     _request_accessibility()
-    _start_compositor_keepalive()
+    # Compositor keepalive only matters for the VNC capture path (it keeps
+    # screensharingd's framebuffer cache warm). When running --api-only with
+    # SCK, SCStream delivers frames on its own schedule independent of the
+    # compositor refresh — the keepalive is unnecessary, AND it can't run at
+    # all from inside a py2app bundle (the embedded python binary's
+    # @executable_path-relative rpath breaks when subprocess.Popen'd).
+    if not cfg.api_only:
+        _start_compositor_keepalive()
 
     # Resolve initial CGEvent availability
     if not _check_cg_kb():
