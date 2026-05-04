@@ -187,30 +187,12 @@ try:
 
     cv.CVDisplayLinkStart(_link)
 
-    # Background thread: post a HID-level mouse micro-move every 25 seconds.
-    # screensharingd's HID-idle detector only responds to kCGHIDEventTap events
-    # (real hardware level), not the kCGSessionEventTap events that VNC injection
-    # uses. Without this, screensharingd enters HID-idle after ~30s of no physical
-    # activity and stops updating its framebuffer cache.
-    import threading as _threading
-    def _hid_keepalive():
-        while True:
-            time.sleep(25)
-            try:
-                mp = AppKit.NSEvent.mouseLocation()
-                sh = AppKit.NSScreen.mainScreen().frame().size.height
-                cy = sh - mp.y
-                e1 = Quartz.CGEventCreateMouseEvent(
-                    None, Quartz.kCGEventMouseMoved,
-                    Quartz.CGPoint(mp.x, cy + 1), Quartz.kCGMouseButtonLeft)
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, e1)
-                e2 = Quartz.CGEventCreateMouseEvent(
-                    None, Quartz.kCGEventMouseMoved,
-                    Quartz.CGPoint(mp.x, cy), Quartz.kCGMouseButtonLeft)
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, e2)
-            except Exception:
-                pass
-    _threading.Thread(target=_hid_keepalive, daemon=True).start()
+    # NOTE: a previous version posted an HID-level mouse micro-move every 25s
+    # to keep screensharingd's HID-idle detector awake. That was removed
+    # because (a) it teleported the cursor to (0,0) on headless cloud Macs
+    # where NSEvent.mouseLocation() returns origin, and (b) the same job is
+    # done more reliably by VNCBridge._vnc_keepwarm in mvs/vnc.py, which
+    # uses VNC pointer events that don't move the visible cursor.
 
     app.run()
     cv.CVDisplayLinkStop(_link)
