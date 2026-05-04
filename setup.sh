@@ -146,34 +146,90 @@ done
 
 if [[ -z "$PYTHON_BINARY" ]]; then
     # Most likely Xcode Command Line Tools isn't installed yet (common on a
-    # fresh-image cloud Mac). Offer to trigger the official installer rather
-    # than just dying — a one-line `xcode-select --install` pops the system
-    # GUI dialog where the user clicks Install. ~5 minute download.
+    # fresh-image cloud Mac). xcode-select --install pops a GUI dialog —
+    # useless when we're SSH-only with no Aqua session yet. Use the
+    # `softwareupdate` headless install path instead: works over plain SSH.
     yellow "  No Python 3.9+ found on this Mac."
-    yellow "  Most likely: Xcode Command Line Tools isn't installed yet —"
-    yellow "  Apple ships macOS without /usr/bin/python3 by default."
+    yellow "  Most likely: Xcode Command Line Tools isn't installed."
     echo
-    if [[ "$HEADLESS" -eq 1 ]]; then
-        die "Headless mode and no Python found. Install one of these manually:
-  • Xcode Command Line Tools:  xcode-select --install
-  • Homebrew Python:           brew install python@3.12
-Then re-run setup.sh."
-    fi
-    yellow "  About to run:  xcode-select --install"
-    yellow "  This pops the official Apple installer dialog on the Mac's display"
-    yellow "  (visible via VNC if you're remote). Click Install, agree to the"
-    yellow "  license, wait ~5 min for it to finish, then re-run setup.sh."
-    echo
-    read -rp "  Trigger the CLT installer now? [Y/n] " _ans
-    if [[ ! "$_ans" =~ ^[Nn]$ ]]; then
-        xcode-select --install 2>&1 | head -5 || true
+    if [[ "$HEADLESS" -eq 1 || "$RUNNING_FROM_SSH" -eq 1 ]]; then
+        # Headless / SSH path: use softwareupdate. xcode-select --install
+        # would just hang on a GUI dialog nobody can click.
+        yellow "  Installing Command Line Tools headlessly via softwareupdate."
+        yellow "  This needs sudo and downloads ~700 MB. Takes ~5–10 min."
+        yellow ""
+        yellow "  About to run (REQUIRES SUDO):"
+        yellow "    sudo touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress"
+        yellow "    sudo softwareupdate --list  (find CLT label)"
+        yellow "    sudo softwareupdate --install '<CLT label>'"
         echo
-        yellow "  CLT installer dialog launched."
-        yellow "  After it finishes (clicked Install + agree + Done), re-run:"
-        yellow "    bash setup.sh"
-        exit 0
+        if [[ "$HEADLESS" -ne 1 ]]; then
+            read -rp "  Proceed? [Y/n] " _ans
+            [[ "$_ans" =~ ^[Nn]$ ]] && die "User declined CLT install — re-run with python3 already installed."
+            unset _ans
+        fi
+        # The sentinel file makes CLT appear in `softwareupdate --list` output.
+        # Without it, CLT is hidden from the list (Apple expects xcode-select
+        # --install to be the entry point on GUI Macs).
+        if [[ -n "$MACOS_PASS" ]]; then
+            echo "$MACOS_PASS" | sudo -S touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+            CLT_LABEL=$(echo "$MACOS_PASS" | sudo -S softwareupdate --list 2>&1 \
+                | grep -E "^\s*\* (Label|Title): Command Line Tools" \
+                | head -1 | sed -E 's/.*Command Line Tools[^"]*"?([^"]*)"?.*/\1/' \
+                | sed -E 's/^.*: //; s/^\s+//; s/\s+$//')
+        else
+            sudo touch /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+            CLT_LABEL=$(sudo softwareupdate --list 2>&1 \
+                | grep -E "^\s*\* (Label|Title): Command Line Tools" \
+                | head -1 | sed -E 's/.*Command Line Tools[^"]*"?([^"]*)"?.*/\1/' \
+                | sed -E 's/^.*: //; s/^\s+//; s/\s+$//')
+        fi
+        if [[ -z "$CLT_LABEL" ]]; then
+            yellow "  Couldn't auto-detect CLT label. softwareupdate output:"
+            (echo "${MACOS_PASS:-}" | sudo -S softwareupdate --list 2>&1 || sudo softwareupdate --list 2>&1) | head -20
+            die "Find the 'Command Line Tools' label above and run manually:
+  sudo softwareupdate --install '<that label>'
+Then re-run setup.sh."
+        fi
+        yellow "  Found CLT package label: $CLT_LABEL"
+        yellow "  Installing... (this is the long one — ~5–10 min)"
+        if [[ -n "$MACOS_PASS" ]]; then
+            echo "$MACOS_PASS" | sudo -S softwareupdate --install "$CLT_LABEL" --verbose
+        else
+            sudo softwareupdate --install "$CLT_LABEL" --verbose
+        fi
+        # Cleanup the sentinel.
+        (echo "${MACOS_PASS:-}" | sudo -S rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress 2>/dev/null) \
+            || sudo rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress
+        green "  CLT install reports done. Re-running Python detection..."
+        # Re-scan candidates now that CLT is installed.
+        for cand in "${PY_CANDIDATES[@]}" "$(command -v python3 2>/dev/null)"; do
+            [[ -z "$cand" || ! -x "$cand" ]] && continue
+            if "$cand" -c "$_PYTHON_VER_CHECK" 2>/dev/null; then
+                PYTHON_BINARY="$cand"; break
+            fi
+        done
+        if [[ -z "$PYTHON_BINARY" ]]; then
+            die "CLT install ran but Python still not found. Try a manual install:
+  • Homebrew:  brew install python@3.12
+  • Or check:  xcode-select -p  (should print the CLT install path)
+Then re-run setup.sh."
+        fi
+    else
+        # Local terminal path: GUI installer dialog will actually be visible.
+        yellow "  About to run:  xcode-select --install"
+        yellow "  Pops the official Apple installer dialog on this Mac's display."
+        yellow "  Click Install, agree, wait ~5 min, then re-run setup.sh."
+        read -rp "  Trigger the CLT installer now? [Y/n] " _ans
+        if [[ ! "$_ans" =~ ^[Nn]$ ]]; then
+            xcode-select --install 2>&1 | head -5 || true
+            yellow "  CLT installer dialog launched. After it finishes, re-run:"
+            yellow "    bash setup.sh"
+            exit 0
+        fi
+        die "No Python — install CLT (xcode-select --install), Homebrew Python,
+or any python3 ≥3.9, then re-run setup.sh."
     fi
-    die "No Python — install CLT or Homebrew Python and re-run setup.sh."
 fi
 green "  Python: $PYTHON_BINARY"
 
