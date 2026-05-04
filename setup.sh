@@ -357,37 +357,67 @@ or any python3 ≥3.9, then re-run setup.sh."
 fi
 green "  Python: $PYTHON_BINARY"
 
-# ── Step 3: pip install dependencies ──────────────────────────────────────────
-step "Installing Python dependencies"
+# ── Step 3: pip install dependencies (only when building from source) ────────
+# When a bundle already exists at /Applications/mac-vnc-stream.app AND
+# we're not forcing rebuild (--build-from-source), all the host-side pip
+# install is wasted: the .app contains its own bundled Python.framework
+# + every PyObjC framework + py2app. We just need to install the
+# LaunchAgent — no host Python deps required for that.
+#
+# install.sh's fast path (downloads pre-built .app from a Release) leaves
+# the bundle in place before exec'ing setup.sh, so this short-circuit
+# saves ~5–10 min of pip install + pyobjc compile on what should be a
+# 10-second total install.
+#
+# Lazy-install: if the user later picks [r]ebuild interactively, the
+# rebuild block (Step 8) re-enters this code path before invoking py2app.
+NEED_BUILD_DEPS=0
+if [[ ! -d "/Applications/mac-vnc-stream.app" ]] || [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
+    NEED_BUILD_DEPS=1
+fi
 
+# pip flags computed regardless (used by the lazy-install path too).
 _PIP_FLAGS="--quiet --user"
 if "$PYTHON_BINARY" -m pip install --quiet --user --dry-run pip 2>&1 \
         | grep -q "externally-managed-environment"; then
     _PIP_FLAGS="--quiet --user --break-system-packages"
 fi
-
-"$PYTHON_BINARY" -m pip install $_PIP_FLAGS \
-    'websockets>=13.0' 'numpy>=1.24' 'Pillow>=10.0' 'cryptography>=41.0' \
-    || die "pip install failed — check network and pip"
-
-if "$PYTHON_BINARY" -m pip install $_PIP_FLAGS 'av>=12.0' 2>/dev/null; then
-    green "  av (PyAV/H.264): installed"
-else
-    yellow "  av not installed — falling back to JPEG (lower quality)"
-    CODEC="jpeg"
-fi
-
-yellow "  Installing PyObjC frameworks (5 packages, can take 5–10 min on a fresh Mac)..."
 _PYOBJC_FLAGS="${_PIP_FLAGS//--quiet/}"
-"$PYTHON_BINARY" -m pip install $_PYOBJC_FLAGS \
-    pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz \
-    pyobjc-framework-AVFoundation pyobjc-framework-ScreenCaptureKit \
-    || yellow "  PyObjC partial install — SCK may be limited"
 
-# py2app is always required — the bundle is the only install path.
-"$PYTHON_BINARY" -m pip install $_PYOBJC_FLAGS 'py2app>=0.28' setuptools \
-    || die "py2app install failed — required for the .app bundle build"
-green "  Dependencies ready"
+# install_build_deps() is callable both from Step 3 (eager) and from
+# Step 8 (lazy when user picks rebuild interactively after we deferred).
+install_build_deps() {
+    "$PYTHON_BINARY" -m pip install $_PIP_FLAGS \
+        'websockets>=13.0' 'numpy>=1.24' 'Pillow>=10.0' 'cryptography>=41.0' \
+        || die "pip install failed — check network and pip"
+
+    if "$PYTHON_BINARY" -m pip install $_PIP_FLAGS 'av>=12.0' 2>/dev/null; then
+        green "  av (PyAV/H.264): installed"
+    else
+        yellow "  av not installed — falling back to JPEG (lower quality)"
+        CODEC="jpeg"
+    fi
+
+    yellow "  Installing PyObjC frameworks (5 packages, can take 5–10 min on a fresh Mac)..."
+    "$PYTHON_BINARY" -m pip install $_PYOBJC_FLAGS \
+        pyobjc-core pyobjc-framework-Cocoa pyobjc-framework-Quartz \
+        pyobjc-framework-AVFoundation pyobjc-framework-ScreenCaptureKit \
+        || yellow "  PyObjC partial install — SCK may be limited"
+
+    "$PYTHON_BINARY" -m pip install $_PYOBJC_FLAGS 'py2app>=0.28' setuptools \
+        || die "py2app install failed — required for the .app bundle build"
+}
+
+if [[ "$NEED_BUILD_DEPS" -eq 1 ]]; then
+    step "Installing Python dependencies (build-from-source path)"
+    install_build_deps
+    green "  Dependencies ready"
+else
+    step "Skipping Python dependencies"
+    green "  Existing bundle found at /Applications/mac-vnc-stream.app —"
+    green "  pip install not needed (deps live inside the .app)."
+    green "  Will lazy-install if you later pick [r]ebuild."
+fi
 
 # ── Step 4: Web UI access token ───────────────────────────────────────────────
 if [[ -z "$MVS_PASSWORD" ]]; then
@@ -473,7 +503,14 @@ if [[ -d "$APP_DEST" ]]; then
     yellow "  Found: $APP_DEST"
     yellow "  Keep preserves grants (CDHash unchanged); rebuild picks up source"
     yellow "  changes but invalidates grants."
-    if [[ "$HEADLESS" -eq 1 ]]; then
+    if [[ -n "${MVS_PREBUILT_APP:-}" ]]; then
+        # install.sh just dropped a fresh pre-built .app and exec'd us.
+        # No source on disk to rebuild from anyway; auto-keep without
+        # prompting. The user explicitly chose the fast path by piping
+        # install.sh; we'd be undoing that choice if we asked them again.
+        green "  Pre-built bundle from install.sh — using as-is (no prompt)"
+        REBUILD_NEEDED=0
+    elif [[ "$HEADLESS" -eq 1 ]]; then
         green "  Headless mode — keeping (default)"
         REBUILD_NEEDED=0
     elif [[ "$BUILD_FROM_SOURCE" -eq 1 ]]; then
@@ -956,6 +993,14 @@ fi
 HAD_PRIOR_BUNDLE=0
 [[ -d "$APP_DEST" ]] && HAD_PRIOR_BUNDLE=1
 if [[ "$REBUILD_NEEDED" -eq 1 ]]; then
+    # Lazy-install build deps if Step 3 deferred them (existing bundle
+    # was found, but user picked [r]ebuild interactively).
+    if [[ "$NEED_BUILD_DEPS" -eq 0 ]]; then
+        step "Installing Python dependencies (lazy — needed for rebuild)"
+        install_build_deps
+        green "  Dependencies ready"
+        NEED_BUILD_DEPS=1
+    fi
     step "Building .app bundle (com.macvncstream.server)"
     rm -rf "$REPO_DIR/build" "$REPO_DIR/dist"
     (cd "$REPO_DIR" && "$PYTHON_BINARY" build_app.py py2app 2>&1 | tail -10)
