@@ -440,7 +440,7 @@ PROG_ARGS_XML="        <string>${PYTHON_BINARY}</string>
         <string>--max-fps</string><string>${MAX_FPS}</string>
         <string>--listen</string><string>${LISTEN}</string>
         <string>--port</string><string>${PORT}</string>"
-for a in "${EXTRA_ARGS[@]}"; do
+for a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
     PROG_ARGS_XML+="
         <string>${a}</string>"
 done
