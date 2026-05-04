@@ -864,11 +864,15 @@ canvas.addEventListener('touchend',e=>{
 // Keyboard — captured on hidden textarea
 // ---------------------------------------------------------------------------
 
-// Send text to Mac by typing it character-by-character (bypasses clipboard sync)
-function sendPasteText(text){
+// Send text to be pasted on the Mac. typeChars=true asks the server to type
+// the text character-by-character via VNC keysyms — set ONLY by the dock
+// "Paste on Mac" button. Server only honours the flag in VNC bootstrap mode
+// (no CGEvent); SCK/modern paste path is unchanged.
+function sendPasteText(text, typeChars){
   if(text&&wsOpen){
     _lastMacClipboard=text; // optimistic: prevent the server-echo from looping back
     const m={t:'paste',text};
+    if(typeChars)m.type_chars=true;
     if(_macClipboardSeq>=0)m.mac_rev=_macClipboardSeq; // let server reject stale pastes
     send(m);
   }
@@ -1256,7 +1260,12 @@ document.getElementById('sk-key-input').addEventListener('keydown',e=>{
 // Clipboard textarea — paste on Mac button
 document.getElementById('clip-paste').addEventListener('click',()=>{
   const text=clipTA.value;
-  if(text&&wsOpen){sendPasteText(text);st.textContent='Pasted '+text.length+' chars';}
+  // typeChars=true: server uses VNC-keysym typing fallback when CGEvent is
+  // unavailable (bootstrap mode). Has no effect on SCK/CGEvent installs —
+  // the server runs the standard pbcopy + Cmd+V path there. This is the
+  // ONLY caller that sets the flag; the canvas Cmd+V keystroke path leaves
+  // it unset so SCK paste is untouched.
+  if(text&&wsOpen){sendPasteText(text,true);st.textContent='Pasted '+text.length+' chars';}
   ki.focus();
 });
 document.getElementById('clip-clear').addEventListener('click',()=>{clipTA.value='';ki.focus();});

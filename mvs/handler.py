@@ -306,6 +306,28 @@ async def client_session(ws, cfg, bridge):
                             if (mac_rev is not None
                                     and mac_rev != bridge.server_clipboard_seq):
                                 continue  # client's view of Mac clipboard is stale — ignore
+                        # Dock-button VNC bootstrap fallback: type each char via
+                        # VNC keysyms when (a) the dock "Paste on Mac" button
+                        # set type_chars:true AND (b) we're in VNC mode (no
+                        # CGEvent). pbcopy + ClientCutText is unreliable from
+                        # the LaunchDaemon-context Cmd+V path; typing is the
+                        # only deterministic browser→remote injection on raw
+                        # screensharingd. Strictly additive: when type_chars
+                        # is absent (every Cmd+V keystroke path), execution
+                        # falls through to the unchanged pbcopy + Cmd+V flow
+                        # below — SCK/CGEvent paste behaviour is untouched.
+                        if (t == "paste" and text and ev.get("type_chars")
+                                and not _cge._cg_kb_ok):
+                            for ch in text:
+                                if   ch == '\n': ks = 0xFF0D  # XK_Return
+                                elif ch == '\t': ks = 0xFF09  # XK_Tab
+                                elif ch == '\r': continue
+                                elif ord(ch) < 0x80: ks = ord(ch)
+                                else: continue  # non-ASCII skipped (commands/code covered)
+                                bridge.send_key(True,  ks)
+                                bridge.send_key(False, ks)
+                                await asyncio.sleep(0.005)  # screensharingd queue safety
+                            continue
                         if text:
                             # pbcopy is more reliable than VNC ClientCutText on macOS 15+
                             # (ClientCutText may be silently ignored by screensharingd)
