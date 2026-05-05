@@ -31,4 +31,12 @@ These all go away on the SCK + CGEvent path.
 
 ## What "auto-upgrade" actually does
 
-The server polls the TCC database every 5 seconds. When it sees Screen Recording flip to granted, it switches the capture path live — no restart, no reconnect from the browser. Same for Accessibility flipping the input path from VNC to CGEvent. Worst case is a 30-second pause; in practice it's faster.
+The server polls the TCC database every 5 seconds. When it sees Screen Recording flip to granted, it switches the capture path live — **no server restart, no browser reconnect**, your tab stays open and the frame rate just jumps from ~20fps to 60fps. Same for Accessibility flipping the input path from VNC to CGEvent. Worst case is a 30-second pause; in practice it's faster. This is the user-visible payoff of the whole bootstrap design.
+
+## macOS 26 Tahoe: the `gui/$UID` gotcha
+
+On Tahoe, a Mac that has never had a console login refuses to create a `gui/$UID` LaunchAgent domain — even if you authenticate to `screensharingd` over RFB. `launchctl bootstrap gui/$UID` returns rc=125 ("Domain does not support specified action"), and the compositor-keepalive subprocess can't spawn. We can't software our way around that — Apple reserves the domain for an actual console-authenticated user.
+
+`setup.sh` detects this and falls back to **foreground `--vnc-only` mode**: the bundle runs as a child of the install shell, in the user's session domain (which exists), with VNC capture only. You get a working server immediately, but it doesn't survive the SSH session ending. To get the persistent LaunchAgent + auto-upgrade path, someone needs to log into the Mac console once (via Apple's Screen Sharing.app from another Mac, or via a hardware KVM-over-IP if the host provides one) — then re-run `setup.sh`.
+
+This is the one place the project genuinely cannot self-bootstrap on a fresh cloud Mac. Most cloud-Mac providers have already had a console login at provisioning time, so the issue is rarer than it sounds; it bites you on truly never-touched VMs.

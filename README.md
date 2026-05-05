@@ -29,7 +29,7 @@ A few cases where this matters:
 - **Linux, Windows, ChromeOS.** Apple's Screen Sharing is Mac-to-Mac only. This works from anything with a browser and an SSH client.
 - **Compliance-sensitive environments.** TeamViewer / AnyDesk / Chrome Remote Desktop all route through third-party servers. This doesn't — it runs inside your existing SSH.
 
-What's actually distinctive vs NoMachine / RustDesk / Apple Remote Desktop / Parsec: browser-only client, SSH-only transport, no relay, hardware-decoded video via WebCodecs, and a congestion controller tuned for SSH-tunnelled TCP. That last bit is what keeps it usable on a slow link, where most browser-VNC stacks fill the TCP buffer and stutter for several seconds.
+What's distinctive vs other browser-based macOS remote-desktop options: hardware-decoded H.264/H.265 video via WebCodecs (instead of ZRLE-in-JavaScript at 2fps), and a congestion controller tuned for SSH-tunnelled TCP. The latter is what keeps it usable on a slow link, where most browser-VNC stacks fill the TCP buffer and stutter for several seconds. NoMachine, Parsec, and RustDesk are good at what they do — they just aren't targeting this niche (browser-only, SSH-only, no relay, no installed client).
 
 ---
 
