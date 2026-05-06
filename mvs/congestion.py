@@ -163,7 +163,14 @@ class AdaptiveController:
         # The ping-gradient signal handles sustained RTT rises; write_buf handles
         # actual TCP backpressure.  Suppress age-only backoff when wb == 0.
         if write_buf == 0:
-            if age_ms > 0 and age_ms < budget:
+            # age > budget*3: queue is sitting in the wifi/path layer, not visible via wb.
+            # Soft backoff to reduce I-frame sizes rather than silently absorbing the spike.
+            if age_ms > budget * 3:
+                log.info("on_lag: age=%.0fms wb=0 budget=%.0fms — path-layer queue, soft backoff",
+                         age_ms, budget)
+                with self._lock:
+                    self._backoff(False)
+            elif age_ms > 0 and age_ms < budget:
                 with self._lock:
                     self._last_clear_t = time.monotonic()
             else:
