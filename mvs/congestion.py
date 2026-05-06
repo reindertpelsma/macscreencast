@@ -107,25 +107,34 @@ class AdaptiveController:
         Priority: cut bitrate (quality) first — preserves fps (input responsiveness).
         fps is only reduced as a last resort when bitrate is already at the floor.
         fps floor is derived from lag_budget_ms so it never goes below one frame per
-        budget period — e.g. at 50ms budget, min fps = 20 (not 5)."""
+        budget period — e.g. at 50ms budget, min fps = 20 (not 5).
+
+        _last_slow is ONLY updated when something actually changes. When both bitrate
+        and fps are already at their floors, calling _backoff is a no-op and must not
+        poison the settle timer — otherwise on_fresh() can never ramp after congestion
+        clears while the controller is pinned at the floor."""
         now = time.monotonic()
         if now - self._last_slow < 0.3:
             return
-        self._last_slow = now
-        self._last_fast = 0.0
         factor = 0.5 if severe else 0.75
         # fps floor: never slower than one frame per budget window
         min_fps = max(self._min_fps, 1000.0 / self.lag_budget_ms())
+        changed = False
         if self.bitrate > self._min_br:
             # Save congestion point before reducing — this is the network ceiling (SSTHRESH).
             # On recovery, ramp fast back to here, probe slowly above.
             self._ceil_bitrate = self.bitrate
             self.bitrate = max(self._min_br, int(self.bitrate * factor))
             self.jpeg_quality = max(10, int(self.jpeg_quality * factor))
+            changed = True
         elif self.fps > min_fps:
             self.fps = max(min_fps, self.fps * factor)
-        log.debug("backoff: fps=%.1f br=%dk ceil=%dk severe=%s min_fps=%.1f",
-                  self.fps, self.bitrate // 1000, self._ceil_bitrate // 1000, severe, min_fps)
+            changed = True
+        if changed:
+            self._last_slow = now
+            self._last_fast = 0.0
+        log.debug("backoff: fps=%.1f br=%dk ceil=%dk severe=%s min_fps=%.1f changed=%s",
+                  self.fps, self.bitrate // 1000, self._ceil_bitrate // 1000, severe, min_fps, changed)
 
     def lag_budget_ms(self):
         """Allowed in-flight delay before congestion backoff fires.
