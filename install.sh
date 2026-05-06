@@ -56,8 +56,7 @@ _OS="$(uname -s 2>/dev/null || echo unknown)"
 if [[ "$_OS" != "Darwin" ]]; then
     red "  This repo is macOS only — detected: $_OS"
     yellow "  For Linux / Windows browser remote-desktop, use the sibling repo:"
-    yellow "    https://github.com/reindertpelsma/browser-screencast   (forthcoming)"
-    yellow "  (We're shipping macscreencast first; cross-platform port is on the roadmap.)"
+    yellow "    bash <(curl -fsSL https://raw.githubusercontent.com/reindertpelsma/browser-screencast/main/install.sh)"
     exit 1
 fi
 unset _OS
