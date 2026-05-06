@@ -94,9 +94,10 @@ class AdaptiveController:
         with self._lock:
             if self.cap_h > 0:
                 th = min(self.cap_h, native_h)
-            elif self.canvas_phys_h > 0:
-                th = min(self.canvas_phys_h, native_h)
             else:
+                # Auto: encode at native resolution. The browser scales the decoded
+                # frame to fit the canvas — no quality is lost when zooming in or
+                # going full-screen, and the explicit cap_h presets still work.
                 th = native_h
             tw = round(native_w * th / native_h) if native_h else native_w
             return (tw & ~1), (th & ~1)
