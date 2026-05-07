@@ -446,21 +446,26 @@ class VNCBridge:
                             # frames. The bundle's _vnc_keepwarm thread sends
                             # pointer events every 25s which SHOULD register
                             # as input + cause a cursor blink; if pixels still
-                            # haven't changed in 90s, the display is wedged
+                            # haven't changed in 35s, the display is wedged
                             # and a screensharingd kickstart unwedges it.
                             # Verified live on Scaleway: bundle showed
                             # vnc=0.0fps + fb_age=141s for 2.5 minutes; manual
                             # `launchctl kickstart -k system/com.apple.screensharing`
                             # restored fresh frames within 4s.
                             #
-                            # 5-minute cooldown between content-kick attempts
-                            # prevents a kickstart loop on a genuinely idle
-                            # Mac where pixels just legitimately don't change.
-                            if now_ms - _last_change_ms > 90_000 \
+                            # 35s threshold (was 90s): the keepwarm fires every
+                            # 25s; allowing one full keepwarm cycle + 10s buffer
+                            # distinguishes "genuinely idle desktop" from "wedged
+                            # display backend". On a truly idle screen the keepwarm
+                            # nudge will produce a cursor-blink pixel change within
+                            # 25s, so if nothing has changed after 35s we know the
+                            # backend is wedged. 5-minute cooldown between kick
+                            # attempts prevents loops on a genuinely static screen.
+                            if now_ms - _last_change_ms > 35_000 \
                                and now_ms - _last_content_kick_ms > 300_000:
                                 log.warning(
-                                    "VNC: pixels static for %ds despite keep-warm activity — "
-                                    "display backend likely wedged, kickstarting screensharingd",
+                                    "VNC: pixels static for %ds (keepwarm cycle=25s) — "
+                                    "display backend wedged, kickstarting screensharingd",
                                     (now_ms - _last_change_ms) // 1000)
                                 _last_content_kick_ms = now_ms
                                 self._restart_screensharingd()
@@ -643,14 +648,14 @@ class VNCBridge:
         pixels each time (the hash never changes). The existing cg_direct_capture
         path handles the keypress-triggered case (fires 150ms post-keypress), but
         a viewer watching a terminal or video stream gets a frozen picture until
-        the 90s watchdog fires and restarts screensharingd (~3s disruption).
+        the 35s watchdog fires and restarts screensharingd (~3s disruption).
 
         This thread runs a lightweight screencapture -x every 2s whenever the
         framebuffer has been stale for more than 3s and at least one browser client
         is connected. screencapture bypasses screensharingd entirely and always
         returns the correctly composited scene. Takes ~150-250ms on M1 so we sleep
         2s between runs; at worst the viewer sees a 2-3s refresh cadence on an idle
-        screen, which is far better than 90s of frozen desktop.
+        screen, which is far better than 35s of frozen desktop.
 
         When screencapture confirms the screen is unchanged (same hash as current
         framebuffer), the _cg_override_until window is extended to prevent VNC from
